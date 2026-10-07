@@ -1,0 +1,496 @@
+family,field_as_printed,page_location,cardinality,proposed,trace_contract_or_calc,classification,not_extracted_reason
+SpyGlass,Customer,p1 SIZING REPORT,per_document,no,,,Operator name; no contract. Well identity comes from Well.
+SpyGlass,Well,p1 SIZING REPORT,per_document,yes,join key -> well_id (all contracts),vendor input,
+SpyGlass,Sizing,p1 SIZING REPORT,per_document,yes,D31 alias evidence for pump_model_canonical,vendor input,
+SpyGlass,Date Generated,p1 SIZING REPORT,per_document,yes,D18 effective_from,vendor input,
+SpyGlass,Prepared by,p1 SIZING REPORT,per_document,no,,,Sizing engineer name; no contract.
+SpyGlass,PUMPS / HOUSINGS Pn <housings> / <stages> <manufacturer> / <model>,p2-4 Design Schematic,per_section,yes,C-NARROW + C-BEP + C-IDEAL + K-TIER1,vendor input,
+SpyGlass,stages (per Pn row),p2-4 Design Schematic,per_section,yes,C-IDEAL (stages) + K-TIER1,vendor input,
+SpyGlass,stages (string total next to PUMPS / HOUSINGS),p2-4 Design Schematic,per_document,yes,K-TIER1 cross-check on section stage sum,vendor derived,
+SpyGlass,INTAKES I1 I2,p2-4 Design Schematic,per_section,no,,,Not a pump body (D-scope: pump bodies only); no head contribution.
+SpyGlass,SEALS S1 S2,p2-4 Design Schematic,per_section,no,,,Not a pump body; no head contribution.
+SpyGlass,MOTOR LEAD EXTENSION,p2-4 Design Schematic,per_document,no,,,Cable component; no contract.
+SpyGlass,MOTOR Horsepower / Voltage / Amperage (catalog),p2-4 Design Schematic,per_document,yes,C-BHP nameplate context; amperage excluded (duplicates v2 motor_rated_amps),vendor input,
+SpyGlass,SENSOR,p2-4 Design Schematic,per_document,no,,,Equipment selection string; no contract.
+SpyGlass,CABLES description / weight / length,p2-4 Design Schematic,per_document,no,,,Cable selection; no contract.
+SpyGlass,VSD,p2-4 Design Schematic,per_document,no,,,Surface equipment selection; no contract.
+SpyGlass,Step Up Transformer,p2-4 Design Schematic,per_document,no,,,Surface equipment selection; no contract.
+SpyGlass,Surface Rate (STB/D),p2-4 Design Schematic,per_scenario,yes,C-BEP (design flow) + K-CURVEFIT scenario anchor,vendor input,
+SpyGlass,OIL / WATER (split of surface rate),p2-4 Design Schematic,per_scenario,yes,C-SG (water cut basis),vendor input,
+SpyGlass,SURFACE POWER REQUIRED @<f>hz kVA,p2-4 Design Schematic,per_scenario,no,,,Surface kVA; C-ENERGY needs motor kW which the Motor page gives directly.
+SpyGlass,Equipment Length,p2-4 Design Schematic,per_document,no,,,String geometry; no contract.
+SpyGlass,Tubing Length,p2-4 Design Schematic,per_document,no,,,Superseded by Intake Set Depth for C-HYD.
+SpyGlass,Tubing Pressure,p2-4 Design Schematic,per_scenario,no,,,Design-time setpoint; the app reads measured tubing pressure from telemetry (Direct).
+SpyGlass,Casing Pressure,p2-4 Design Schematic,per_scenario,no,,,Design-time setpoint; no contract input.
+SpyGlass,Liquid Above Pump (MD),p2-4 Design Schematic,per_scenario,no,,,Fluid level; no contract.
+SpyGlass,Discharge Pressure,p2-4 Design Schematic,per_scenario,yes,C-DISCH benchmark (D13),vendor derived,
+SpyGlass,Total Dynamic Head (TDH),p2-4 Design Schematic,per_scenario,yes,K-TIER1 / Test A benchmark,vendor derived,
+SpyGlass,Pump Intake Pressure (PIP),p2-4 Design Schematic,per_scenario,no,,,PIP excluded (D11) - design-time only.
+SpyGlass,Free Gas into Pump,p2-4 Design Schematic,per_scenario,yes,K-TIER2P (string-level alpha),vendor derived,
+SpyGlass,Intake Depth MD (PSD),p2-4 Design Schematic,per_document,yes,C-HYD + C-DPREC (well_depth_ft),vendor input,
+SpyGlass,Intake Depth (TVD),p2-4 Design Schematic,per_document,yes,C-HYD (true vertical column for hydrostatic),vendor input,
+SpyGlass,Motor HP @ <f> hz,p2-4 Design Schematic,per_scenario,yes,C-ENERGY benchmark (D13),vendor derived,
+SpyGlass,Motor Voltage,p2-4 Design Schematic,per_scenario,no,,,Duplicated on the Motor page with more context; taken there.
+SpyGlass,Motor Amperage,p2-4 Design Schematic,per_scenario,no,,,Would duplicate esp_well_configuration_v2.motor_rated_amps (D2).
+SpyGlass,Flow By Motor,p2-4 Design Schematic,per_scenario,no,,,Cooling-velocity check; no contract.
+SpyGlass,Sensor Pressure,p2-4 Design Schematic,per_scenario,no,,,Design-time sensor datum; no contract.
+SpyGlass,Bottom of Equipment MD,p2-4 Design Schematic,per_document,yes,C-HYD depth-provenance disambiguation (intake vs bottom vs perf),vendor input,
+SpyGlass,Perf Pressure,p2-4 Design Schematic,per_scenario,no,,,Reservoir-side pressure; no contract input.
+SpyGlass,Top Casing Size / Top Casing Length,p5 Design Overview,per_document,no,,,Wellbore geometry; no contract.
+SpyGlass,Top Tubing Size / Top Tubing Length / Total Tubing Length,p5 Design Overview,per_document,no,,,Wellbore geometry; no contract.
+SpyGlass,Intake Set Depth,p5 Design Overview,per_document,yes,C-HYD + C-DPREC (well_depth_ft),vendor input,
+SpyGlass,Top of Perfs Measured Depth / Vertical Depth,p5 Design Overview,per_document,yes,C-HYD depth-provenance disambiguation,vendor input,
+SpyGlass,Oil API,p5 Design Overview,per_scenario,yes,C-SG (sg_oil) + C-BUBBLE (API),vendor input,
+SpyGlass,Water Specific Gravity,p5 Design Overview,per_scenario,yes,C-SG (sg_water),vendor input,
+SpyGlass,Water Salinity,p5 Design Overview,per_scenario,no,,,Zero in every doc read (n=4); no contract consumes salinity.
+SpyGlass,Gas Specific Gravity,p5 Design Overview,per_scenario,yes,C-BUBBLE (gamma_g - replaces the 0.75 default),vendor input,
+SpyGlass,Oil Rate / Water Rate / Total Liquid Rate,p5 Design Overview,per_scenario,yes,C-SG (water cut) + C-BEP design flow,vendor input,
+SpyGlass,Productivity Index,p5 Design Overview,per_scenario,no,,,PI excluded (D11) - carries no information; equals rate / 1000 in every scenario.
+SpyGlass,Water Cut,p5 Design Overview,per_scenario,yes,C-SG (water_cut),vendor derived,
+SpyGlass,Gas Rate,p5 Design Overview,per_scenario,no,,,GOR is already Direct from production data; no upgrade.
+SpyGlass,Bubble Point,p5 Design Overview,per_scenario,yes,C-BUBBLE (selected_bubble_point_psi),vendor assumption,
+SpyGlass,Datum Point,p5 Design Overview,per_scenario,yes,C-BUBBLE pressure-reference provenance,vendor input,
+SpyGlass,Static Datum Pressure,p5 Design Overview,per_scenario,yes,C-BUBBLE provenance test (bubble point == static datum tell),vendor assumption,
+SpyGlass,Producing Datum Pressure,p5 Design Overview,per_scenario,no,,,Reservoir drawdown assumption; no contract input.
+SpyGlass,Surface Temperature,p5 Design Overview,per_scenario,yes,C-BUBBLE (T_f context - replaces the 150 F default with a gradient endpoint),vendor input,
+SpyGlass,Casing Pressure / Tubing Pressure / Desired Rate (Design Conditions),p5 Design Overview,per_scenario,no,,,Design-time setpoints; duplicated from Design Schematic.
+SpyGlass,Pump Intake Pressure (Design Conditions),p5 Design Overview,per_scenario,no,,,PIP excluded (D11).
+SpyGlass,Operating Frequency,p6 Theoretical Production Data,per_scenario,yes,K-AFFNORM (D10 as-printed frequency),vendor input,
+SpyGlass,Total System Efficiency,p6 Theoretical Production Data,per_scenario,yes,C-EFFPROXY + C-ENERGY benchmark (D13),vendor derived,
+SpyGlass,Monthly System Cost,p6 Theoretical Production Data,per_scenario,no,,,Economics; no contract.
+SpyGlass,Cables block (Volt Loss / Cable Motor Load / Cable Temperature / Cable Pwr Cost),p6 Theoretical Production Data,per_scenario,no,,,Cable engineering; no contract.
+SpyGlass,Name (Pumps page),p7 Pumps,per_section,yes,C-NARROW + D31 model grammar,vendor input,
+SpyGlass,Stage Type,p7 Pumps,per_section,no,,,Mixed/radial descriptor; no contract consumes stage type.
+SpyGlass,Stages (Pumps page),p7 Pumps,per_section,yes,C-IDEAL (stages) + K-CURVEFIT per-stage normalization,vendor input,
+SpyGlass,Q at Intake / Q at Discharge,p7 Pumps,per_section,yes,K-TIER1 (equal-flow assumption check across sections),vendor derived,
+SpyGlass,Pump Efficiency,p7 Pumps,per_section,yes,C-EFFPROXY benchmark + K-CURVEFIT (efficiency at design point),vendor derived,
+SpyGlass,% Free Gas at Inlet / % Free Gas at Discharge,p7 Pumps,per_section,yes,K-TIER2P (per-section alpha),vendor derived,
+SpyGlass,% Standard Shaft Load / % High Strength Shaft Load,p7 Pumps,per_section,no,,,Mechanical rating check; no contract.
+SpyGlass,Intakes block (names + shaft loads),p7 Intakes,per_section,no,,,Not a pump body; no head contribution.
+SpyGlass,Seals block,p8 Seals,per_section,no,,,Not a pump body; no head contribution.
+SpyGlass,Frequency (Motor page),p8 Motor,per_scenario,no,,,Duplicated from Theoretical Production Data.
+SpyGlass,Operating HP @ Design Hz,p8 Motor,per_scenario,yes,C-ENERGY benchmark (D13),vendor derived,
+SpyGlass,Motor Volts,p8 Motor,per_scenario,yes,C-BHP context (operating voltage behind the amp x volt proxy),vendor derived,
+SpyGlass,Operating Current,p8 Motor,per_scenario,no,,,Would duplicate v2 motor_rated_amps semantics (D2); telemetry supplies measured amps.
+SpyGlass,Motor Catalog HP Rating,p8 Motor,per_document,yes,C-ENERGY nameplate context,vendor input,
+SpyGlass,Motor Catalog Volts Rating,p8 Motor,per_document,yes,C-BHP nameplate context,vendor input,
+SpyGlass,Motor Input HP,p8 Motor,per_scenario,yes,C-ENERGY benchmark (electrical-to-shaft ratio),vendor derived,
+SpyGlass,Cable Power,p8 Motor,per_scenario,no,,,Cable loss term; no contract.
+SpyGlass,Motor Load / % Motor Shaft Load,p8 Motor,per_scenario,no,,,Loading check; no contract.
+SpyGlass,Required kVA @ Wellhead,p8 Motor,per_scenario,no,,,Surface sizing; C-ENERGY takes System Power @ Wellhead instead.
+SpyGlass,System Power @ Wellhead,p8 Motor,per_scenario,yes,C-ENERGY (motor_power_kw benchmark for the proxy path),vendor derived,
+SpyGlass,Motor Winding Temp,p8 Motor,per_scenario,no,,,Thermal check; no contract.
+SpyGlass,CO2 emissions (Metric Tons CO2e),p8 Motor,per_scenario,no,,,Emissions reporting; no contract.
+SpyGlass,Motor Power Factor,p8 Motor,per_scenario,yes,C-BHP (replaces default pf = 0.90) + C-AFFINITY power check,vendor derived,
+SpyGlass,Motor Efficieny Ratio,p8 Motor,per_scenario,yes,C-ENERGY benchmark (motor efficiency term),vendor derived,
+SpyGlass,Frequency (Hz) / Liquid Flow / TDH (Variable Frequency Analysis),p9-11 Multi-Frequency Head Curve,per_scenario,yes,K-AFFNORM + K-CURVEFIT (composite head at 6 frequencies),vendor derived,
+SpyGlass,Intake Pressure / Discharge Pressure (Variable Frequency Analysis),p9-11 Multi-Frequency Head Curve,per_scenario,no,,,Nodal-solution pressures; C-DISCH benchmark already taken from the schematic.
+SpyGlass,Q Oil / Q Water / Q Gas (Variable Frequency Analysis),p9-11 Multi-Frequency Head Curve,per_scenario,no,,,Rate split at off-design frequencies; no contract.
+SpyGlass,Operating HP Required (BHP Variable Frequency Analysis),p12-14 Multi-Frequency BHP Curve,per_scenario,yes,K-CURVEFIT (power at 6 frequencies - the design docs unique contribution per amendment 8),vendor derived,
+SpyGlass,Percent Motor Load / Operating Amps / Velocity Past Mtr / Surface Volts / Surface kVA / Percent VFD Load,p12-14 Multi-Frequency BHP Curve,per_scenario,no,,,Electrical sizing detail; no contract.
+SpyGlass,Pump (Single Pump Charts table),p15-17 Single Pump Charts,per_section,yes,D31 model grammar,vendor input,
+SpyGlass,ROR (bbl/d),p15-17 Single Pump Charts,per_section,yes,K-WINDOW (D29 intersection vs vendor value) + C-BEP,vendor derived,
+SpyGlass,Q - INT (bbl/d) / Q - DIS (bbl/d),p15-17 Single Pump Charts,per_section,yes,K-TIER1 equal-flow check,vendor derived,
+SpyGlass,Gas @ INT / Gas @ DIS,p15-17 Single Pump Charts,per_section,no,,,Duplicated from the Pumps page at the same grain.
+SpyGlass,Free Allowed Gas,p15-17 Single Pump Charts,per_section,yes,recorded under its own name as a model-level property (D12) - explicitly NOT mapped to NPSHr,vendor derived,
+SpyGlass,Lift (ft),p15-17 Single Pump Charts,per_section,yes,K-CURVEFIT (head per section; / stages gives ft/stage) + K-TIER1,vendor derived,
+SpyGlass,Density @ INT (lb/ft3) / Density @ DIS (lb/ft3),p15-17 Single Pump Charts,per_section,yes,C-SG benchmark (calc_mixture_sg check at section conditions),vendor derived,
+SpyGlass,% Shaft Load,p15-17 Single Pump Charts,per_section,no,,,Mechanical rating; no contract.
+SpyGlass,* denotes corrected viscosity rate,p15-17 Single Pump Charts,per_section,yes,K-CURVEFIT quality flag (viscosity-corrected observations must not enter a water-basis fit),vendor derived,
+SpyGlass,Best Efficiency (STB/D) Value,p15-17 Single Pump Charts,per_scenario,yes,C-BEP (bep_bpd) + K-CURVEFIT,vendor derived,
+SpyGlass,Q - Discharge (STB/D) Value,p15-17 Single Pump Charts,per_scenario,no,,,Duplicated from the per-section Q - DIS column.
+SpyGlass,Operating Range (STB/D) Min / Max,p15-17 Single Pump Charts,per_scenario,yes,C-BEP (min/max_recommended_bpd) + K-WINDOW,vendor derived,
+SpyGlass,ROR Min / ROR Bep / ROR Max (Flow Rate + Head pairs),p18 Multiscenario Pump Curve,per_scenario,yes,Test A composite benchmark + K-CURVEFIT (3 composite points per scenario),vendor derived,
+SpyGlass,Multifrequency Tapered Pumps: per-section Intake/Discharge Flow Rate + TDH,p19-21 Multifrequency Tapered Pumps,per_section,yes,K-TIER1 (the vendor performing the composite decomposition) + K-CURVEFIT,vendor derived,
+SpyGlass,Gas Curve (% free gas vs stage),p22-23 Gas Curve,per_scenario,no,,,Rendered plot only; per-section alpha already captured numerically on the Pumps page.
+SpyGlass,Motor Performance page (Efficiency / Power Factor / Percent Current / Speed RPM vs % Load),optional page (Oryx Roan p20),per_scenario,yes,C-BHP (power factor at load) + C-ENERGY,vendor derived,
+SpyGlass,Cable Temperature page,optional page (Oryx Roan p23-24),per_scenario,no,,,Cable thermal check; no contract.
+SpyGlass,Cross Section Analysis page,optional page (Oryx Roan p25-28),per_section,no,,,Mechanical clearance; no contract.
+SpyGlass,Pressure Traverse page,optional page (Oryx Roan p29),per_scenario,no,,,Rendered plot only; no numeric values in the text layer.
+SpyGlass,IPR page,optional page (Oryx Roan p30),per_scenario,no,,,IPR/nodal analysis is out of scope for the physics contracts (see C-BUBBLE notes).
+SpyGlass,Correlations List (Bubble Point / Solution GOR / Oil FVF / Oil Density / Water FVF / Gas Compressibility / Tubing Flow / viscosities / Natural Gas Separation),optional page (Oryx Roan p31-32),per_scenario,yes,C-BUBBLE (names the correlation behind the printed bubble point - benchmarks the apps Standing implementation),vendor assumption,
+SpyGlass,VSD page (Input Data Set Up For VSD),optional page (Oryx Roan p33-34),per_scenario,no,,,Drive configuration; no contract.
+ChampionX,Customer / Well Name / Project Name,p1 header,per_document,yes,join key -> well_id (all contracts),vendor input,
+ChampionX,Formation,p1 header,per_document,no,,,Geologic label; no contract.
+ChampionX,ChampionX Representative / Customer Representative,p1 header,per_document,no,,,Contact names; no contract.
+ChampionX,Well API Number,p1 header,per_document,yes,join key hardening for well_id resolution,vendor input,
+ChampionX,Casing / Tubing (WELL DEPTHS block),p1 WELL DEPTHS,per_document,no,,,Wellbore geometry; no contract.
+ChampionX,Pump Setting MD,p1 WELL DEPTHS,per_document,yes,C-HYD + C-DPREC (well_depth_ft),vendor input,
+ChampionX,Pump Setting VD,p1 WELL DEPTHS,per_document,yes,C-HYD (true vertical column),vendor input,
+ChampionX,DATUM,p1 WELL DEPTHS,per_document,yes,C-BUBBLE pressure-reference provenance,vendor input,
+ChampionX,Casing Pressure / Tubing Pressure,p1 WELL DEPTHS,per_document,no,,,Design-time setpoints; telemetry supplies measured values.
+ChampionX,PI,p1 WELL/IPR,per_document,no,,,PI excluded (D11).
+ChampionX,Static BHP / Flowing BHP,p1 WELL/IPR,per_document,no,,,Reservoir-side pressures; no contract input.
+ChampionX,Static FL / Producing FL,p1 WELL/IPR,per_document,no,,,Fluid levels; no contract.
+ChampionX,Surface Voltage / Drive Amperage / Surface Power / Supply Voltage,p1 SURFACE ELECTRICAL,per_document,no,,,Surface electrical sizing; C-ENERGY takes kW from p7 instead.
+ChampionX,Production Rate / BOPD / BWPD / Gas Production,p1 OPERATING PERFORMANCE,per_document,yes,C-SG (water cut basis) + C-BEP design flow,vendor input,
+ChampionX,Operating Frequency,p1 OPERATING PERFORMANCE,per_document,yes,K-AFFNORM (D10 as-printed frequency),vendor input,
+ChampionX,FLOP,p1 OPERATING PERFORMANCE,per_document,no,,,Fluid over pump; no contract.
+ChampionX,PIP,p1 OPERATING PERFORMANCE,per_document,no,,,PIP excluded (D11).
+ChampionX,MAIN PUMP <model>  <n> Stages,p1 MAIN PUMP,per_section,yes,C-NARROW + C-IDEAL + K-TIER1 + D31 model grammar,vendor input,
+ChampionX,GAS HANDLER / GAS SEPARATOR / PROTECTOR / MOTOR / SENSOR / CONTROLLER / CABLE (p1 equipment strings),p1 equipment blocks,per_document,yes,pump-body rows only (GAS HANDLER carries head); the rest carry no head and are recorded as section context,vendor input,
+ChampionX,Regional PVT,p1 FLUID PROPERTIES,per_document,yes,C-BUBBLE provenance (names the PVT basis behind the printed bubble point),vendor assumption,
+ChampionX,Oil Api / SpGrOil,p1 FLUID PROPERTIES,per_document,yes,C-SG (sg_oil) + C-BUBBLE (API) - both printed together,vendor input,
+ChampionX,Water Gravity,p1 FLUID PROPERTIES,per_document,yes,C-SG (sg_water),vendor input,
+ChampionX,Water Cut,p1 FLUID PROPERTIES,per_document,yes,C-SG (water_cut),vendor input,
+ChampionX,Bottom Hole Temp,p1 FLUID PROPERTIES,per_document,yes,C-BUBBLE (T_f - replaces the 150 F default),vendor input,
+ChampionX,Surface Fluid Temp,p1 FLUID PROPERTIES,per_document,yes,C-BUBBLE (T_f gradient endpoint),vendor input,
+ChampionX,Gas Gravity,p1 FLUID PROPERTIES,per_document,yes,C-BUBBLE (gamma_g - replaces the 0.75 default),vendor input,
+ChampionX,Bubble Point,p1 FLUID PROPERTIES,per_document,yes,C-BUBBLE (selected_bubble_point_psi),vendor assumption,
+ChampionX,GOR,p1 FLUID PROPERTIES,per_document,no,,,Producing GOR is already Direct from production data; not lab R_so.
+ChampionX,GLR,p1 FLUID PROPERTIES,per_document,no,,,Derivable from GOR and water cut; no contract consumes GLR.
+ChampionX,Fluid Composite SG,p1 FLUID PROPERTIES,per_document,yes,C-SG benchmark (calc_mixture_sg check) + C-HEADDP (sg_for_dp candidate),vendor derived,
+ChampionX,Liquid Phase SG,p1 FLUID PROPERTIES,per_document,yes,C-SG benchmark (liquid-only SG vs the apps oil+water weighting),vendor derived,
+ChampionX,Total volume at intake / Oil Rate / Water Rate / Gas Rate (DOWNHOLE OPERATING PERFORMANCE),p1 DOWNHOLE block,per_document,yes,K-CURVEFIT (downhole flow at the design point - the curve x-axis),vendor derived,
+ChampionX,% Free gas at intake / % Free gas at main pump,p1 DOWNHOLE block,per_document,yes,K-TIER2P (alpha entering the pump),vendor derived,
+ChampionX,Required System TDH / Total System TDH,p1 DOWNHOLE block,per_document,yes,K-TIER1 / Test A benchmark,vendor derived,
+ChampionX,EO Tubing / ESP Btm Depth / Set Depth / KOP / ESP Length / MLE Length for Splice / Downhole ESP weight,p2 Summary,per_document,no,,,String geometry and running detail; no contract.
+ChampionX,Intake Set Depth,p2 Summary,per_document,yes,C-HYD depth-provenance disambiguation (intake vs pump setting vs sensor),vendor derived,
+ChampionX,Design Frequency / Startup Freq / Min Freq at Departure / Max Frequency,p2 Summary,per_document,yes,K-AFFNORM (frequency envelope for normalized observations),vendor input,
+ChampionX,Surf.Volts @ 65 Hz / Required Surface Power / VSD Drive / Transformer / Harmonic Filter,p2 Summary,per_document,no,,,Surface equipment selection; no contract.
+ChampionX,Cable + MLE Selection table,p2 Summary,per_document,no,,,Cable selection; no contract.
+ChampionX,PUMP MSC_<model>_<n> STG_... PN / Length / Weight / Set Depth,p2 Pump Series block,per_section,yes,K-TIER1 (per-housing stage counts and order) + C-IDEAL (stages),vendor input,
+ChampionX,Accessories Above ESP / Gas Handling / Gas Separator / Protectors / Motor / Sensors / De-Sander / Tail Pipe rows,p2 equipment blocks,per_section,yes,section ordering and role for pump_config; non-pump rows carried as context only,vendor input,
+ChampionX,Miscellaneous Equipment / Accessories Required,p2 Summary,per_document,no,,,Running accessories; no contract.
+ChampionX,Performance Curve: <model> / <n> Stages / <f> Hz,p3-4 Performance Curve,per_section,yes,K-CURVEFIT (names the model + stages + frequency the plotted curve belongs to),vendor input,
+ChampionX,Target Conditions: <q> bpd at <h> ft,p3-4 Performance Curve,per_document,yes,K-CURVEFIT (one composite design point) + Test A benchmark,vendor derived,
+ChampionX,Min Operating Flow / BEP Flow / Max Operating Flow markers,p3-4 Performance Curve,per_section,no,,,Rendered as plot annotations only - no numeric values in the text layer (n=5). Needs digitization; routed to the D7 fallback trigger.
+ChampionX,Casing / Tubing / Liner dimensions,p5,per_document,no,,,Wellbore geometry; no contract.
+ChampionX,Gas Separator / BOI block (Model No. / No. of separators / Free gas at intake / at discharge / Intake volume / Discharge volume / Pressure at intake / at discharge),p5,per_section,yes,K-TIER2P (separation stage in the alpha cascade),vendor derived,
+ChampionX,Gas Handler block: Model No. / No of Stages,p5,per_section,yes,C-IDEAL + K-TIER1 (gas handler is a head-producing body),vendor input,
+ChampionX,Gas Handler block: Lift / Stage,p5,per_section,yes,K-CURVEFIT (per-stage head - the only per-stage head ChampionX prints),vendor derived,
+ChampionX,Gas Handler block: BHP Gas Handler Only / Total Power,p5,per_section,yes,K-CURVEFIT (power - the design docs unique contribution per amendment 8),vendor derived,
+ChampionX,Gas Handler block: Efficiency,p5,per_section,yes,C-EFFPROXY benchmark,vendor derived,
+ChampionX,Gas Handler block: TDH,p5,per_section,yes,K-TIER1 (section head contribution),vendor derived,
+ChampionX,Gas Handler block: Type of Shaft / Shaft Loading,p5,per_section,no,,,Mechanical rating; no contract.
+ChampionX,Main Pump block: Model No. / No Of Stages,p5,per_section,yes,C-NARROW + C-IDEAL + K-TIER1,vendor input,
+ChampionX,Main Pump block: Intake volume / Discharge volume / Pressure at intake / at discharge,p5,per_section,yes,K-CURVEFIT (downhole flow at the design point) + K-TIER1,vendor derived,
+ChampionX,Main Pump block: Free gas at intake / at discharge,p5,per_section,yes,K-TIER2P (per-section alpha),vendor derived,
+ChampionX,Main Pump block: Shaft Load / Housing Type / Type of pump shaft,p5,per_section,no,,,Mechanical rating; no contract.
+ChampionX,Protector block,p5,per_document,no,,,Not a pump body; no head contribution.
+ChampionX,Oil Contraction (chamber operation / pull percentages),p6,per_document,no,,,Seal-chamber sizing; no contract.
+ChampionX,Motor block: Model No. / Nameplate power / Name plate voltage,p6,per_document,yes,C-ENERGY nameplate context,vendor input,
+ChampionX,Motor block: Name plate current,p6,per_document,no,,,Would duplicate esp_well_configuration_v2.motor_rated_amps (D2).
+ChampionX,Motor block: Operating Efficiency,p6,per_document,yes,C-ENERGY benchmark (motor efficiency term),vendor derived,
+ChampionX,Motor block: Operating Power Factor,p6,per_document,yes,C-BHP (replaces default pf = 0.90) + C-AFFINITY power check,vendor derived,
+ChampionX,Motor block: Total power demand / Operating Power / kW % @ <f> Hz,p6,per_document,yes,C-ENERGY (motor_power_kw benchmark for the proxy path),vendor derived,
+ChampionX,Motor block: Operating Current / Operating Voltage / Operating Temperature / Operating Speed / Motor load % / Motor OD / Fluid velocity past motor,p6,per_document,no,,,Operating detail and mechanical checks; no contract.
+ChampionX,Sensor / Cable blocks,p6,per_document,no,,,Equipment selection and cable losses; no contract.
+ChampionX,Cable Clearance Check,p7,per_document,no,,,Mechanical clearance; no contract.
+ChampionX,Surface Equipment: Power Factor,p7,per_document,yes,C-BHP disambiguation - surface PF is a different quantity from motor PF and must not be substituted for it,vendor derived,
+ChampionX,Surface Equipment: Required Surface Voltage / KVA Required / kW Required / Drive Amps / Controller Type / Percentage of Controller Load / Basic Electric Cost,p7,per_document,no,,,Surface sizing and economics; no contract.
+ChampionX,ESP Setting Depth Survey (KOP / Top of ESP Pump / Bottom of ESP Sensor / Max DLS / Transition Zone / Tail Pipe),p8,per_document,no,,,Running-speed and deviation planning; no contract.
+ChampionX,Notes (DLS intervals),p9,per_document,no,,,Running-speed advisory; no contract.
+SLB,Company / Well Number / Date,p1 Schematics Report header,per_document,yes,join key -> well_id + D18 effective_from,vendor input,
+SLB,Company Engineer / SLB Engineer / Project / Field / Country,p1 header,per_document,no,,,Contact and project labels; no contract.
+SLB,Item / Description / Length / Top Depth / Bottom Depth table - Pump: <model> <n> stages rows,p1 Schematics Report,per_section,yes,C-NARROW + C-IDEAL + K-TIER1 (section order and stage counts) + D31 model grammar,vendor input,
+SLB,Item table - AGH / MGH rows,p1 Schematics Report,per_section,yes,K-TIER1 (gas handler is a head-producing body) + K-TIER2P,vendor input,
+SLB,Item table - Casing / Producing Perforations / Tubing rows,p1 Schematics Report,per_document,yes,C-HYD depth-provenance disambiguation (perf depth vs intake depth),vendor input,
+SLB,Item table - Gas Separator / Protector / Motor / Sensor / Cable & MLE / Step Up Transformer / VSD / Junction Box rows,p1 Schematics Report,per_section,no,,,Not pump bodies; no head contribution.
+SLB,Comments / Comments-Purpose,p2 Case Comparison,per_scenario,yes,C-BUBBLE and C-SG provenance (records vendor overrides such as separation efficiency lowered to 60%),vendor assumption,
+SLB,Tubing Bottom MD,p2 Case Comparison,per_scenario,no,,,Superseded by Intake Depth for C-HYD.
+SLB,Wellhead Pressure / Wellhead Temperature,p2 Case Comparison,per_scenario,no,,,Design-time surface conditions; telemetry supplies measured values.
+SLB,Bottomhole Temperature,p2 Case Comparison,per_scenario,yes,C-BUBBLE (T_f - replaces the 150 F default),vendor input,
+SLB,Oil Gravity,p2 Case Comparison,per_scenario,yes,C-SG (sg_oil) + C-BUBBLE (API),vendor input,
+SLB,Water Spec. Gravity,p2 Case Comparison,per_scenario,yes,C-SG (sg_water),vendor input,
+SLB,Water Cut,p2 Case Comparison,per_scenario,yes,C-SG (water_cut),vendor input,
+SLB,GOR,p2 Case Comparison,per_scenario,no,,,Producing GOR is already Direct from production data.
+SLB,GLR,p2 Case Comparison,per_scenario,no,,,No contract consumes GLR.
+SLB,Method (Inflow) / PI,p2 Case Comparison,per_scenario,no,,,PI excluded (D11); IPR method out of scope.
+SLB,Static Bottomhole Pressure / Test Pressure / Test Flowrate,p2 Case Comparison,per_scenario,no,,,Reservoir-side test data; no contract input.
+SLB,Intake Depth,p2 Case Comparison,per_scenario,yes,C-HYD + C-DPREC (well_depth_ft),vendor input,
+SLB,Design Rate / Operation Rate,p2 Case Comparison,per_scenario,yes,C-BEP design flow,vendor input,
+SLB,Total Rate at Inlet / Liquid Rate at Inlet / Gas Rate into Pump,p2 Case Comparison,per_scenario,yes,K-CURVEFIT (downhole flow at the design point),vendor derived,
+SLB,Inlet Gas Volume Fraction / Gas Volume Fraction at Intake,p2 Case Comparison,per_scenario,yes,K-TIER2P (alpha entering the pump),vendor derived,
+SLB,Natural Separation Efficiency / Total Separation Efficiency,p2 Case Comparison,per_scenario,yes,K-TIER2P (separation stages in the alpha cascade),vendor derived,
+SLB,Total Dynamic Head,p2 Case Comparison,per_scenario,yes,K-TIER1 / Test A benchmark,vendor derived,
+SLB,Intake Pressure,p2 Case Comparison,per_scenario,no,,,PIP excluded (D11).
+SLB,Discharge Pressure,p2 Case Comparison,per_scenario,yes,C-DISCH benchmark (D13),vendor derived,
+SLB,Operating Frequency,p2 Case Comparison,per_scenario,yes,K-AFFNORM (D10 as-printed frequency),vendor input,
+SLB,Pump (Bottom) / Pump (Top) Information: Type,p2 Case Comparison,per_section,yes,C-NARROW + D31 model grammar (REDA 400 <model> form),vendor input,
+SLB,Pump (Bottom) / Pump (Top) Information: Number of Stages,p2 Case Comparison,per_section,yes,C-IDEAL (stages) + K-TIER1,vendor input,
+SLB,Pump (Bottom) / Pump (Top) Information: Required Power,p2 Case Comparison,per_section,yes,K-CURVEFIT (per-section power - the design docs unique contribution per amendment 8),vendor derived,
+SLB,Pump (Bottom) / Pump (Top) Information: Pump Efficiency,p2 Case Comparison,per_section,yes,C-EFFPROXY benchmark,vendor derived,
+SLB,Pump (Bottom) / Pump (Top) Information: Operation Speed,p2 Case Comparison,per_section,yes,K-AFFNORM (RPM cross-check on the printed frequency),vendor derived,
+SLB,Motor Information (Type / Motor Horse Power / Motor Speed / Motor Voltage),p2 Case Comparison,per_scenario,yes,C-ENERGY nameplate context,vendor input,
+SLB,Motor Information: Motor Amperage,p2 Case Comparison,per_scenario,no,,,Would duplicate esp_well_configuration_v2.motor_rated_amps (D2).
+SLB,Total Motor Load / Load Factor / Efficiency / Slip,p3 Case Comparison,per_scenario,yes,C-ENERGY benchmark (motor efficiency term); Slip and Load Factor not proposed,vendor derived,
+SLB,Heat Rise block (Fluid Temperature At Intake / Skin Temperature Rise / Winding temperatures / VSD heating),p3 Case Comparison,per_scenario,no,,,Thermal design; no contract.
+SLB,Electrical Information (Surface Voltage / Required kVA),p3 Case Comparison,per_scenario,no,,,Surface sizing; no contract.
+SLB,Emissions and Consumption (Monthly/Annual Power Consumption / Emissions / Electric Cost),p3 Case Comparison,per_scenario,no,,,Economics and emissions; no contract.
+SLB,General Information (Project / Prepared by / Date / Corporate Customer / Country / Well Name / Company Engineer / Contact / E-Mail),p4 General Report,per_document,no,,,Contact metadata; no contract. Date is taken from the p1 header.
+SLB,API Well Reg. #,p4 General Report,per_document,yes,join key hardening for well_id resolution,vendor input,
+SLB,Gas Specific Gravity,p5 Input Data,per_document,yes,C-BUBBLE (gamma_g - replaces the 0.75 default),vendor input,
+SLB,Bubble Point,p5 Input Data,per_document,yes,C-BUBBLE (selected_bubble_point_psi) - implausible at n=1 (19985.3 psig on Midway 2H) so it must carry a validator range check,vendor derived,
+SLB,Wellhead Temperature / Bottom Hole Temperature,p5 Input Data,per_document,yes,C-BUBBLE (T_f),vendor input,
+SLB,Perforation Depth,p5 Input Data,per_document,yes,C-HYD depth-provenance disambiguation,vendor input,
+SLB,Casing / Tubing tables (Length / OD / ID / Roughness / Weight / Flow Type),p5 Input Data,per_document,no,,,Wellbore geometry; no contract.
+SLB,Desired Operating Conditions (Intake Depth / Frequency / Design Rate / Wellhead Pressure / Pump Speed),p5 Input Data,per_document,yes,C-HYD (intake depth) + K-AFFNORM (frequency); wellhead pressure not proposed,vendor input,
+SLB,Pumping Conditions: Production Rate / TDH / Discharge Pressure / Pump Speed,p6 Equipment and Results,per_document,yes,K-TIER1 / Test A benchmark + C-DISCH benchmark,vendor derived,
+SLB,Pumping Conditions: Mixture Gradient (psi/ft),p6 Equipment and Results,per_document,yes,C-HYD benchmark - a direct psi/ft gradient is exactly what calc_hydrostatic_pressure_psi computes from SG; ambiguous at n=2 (0.433 on Midway 2H against an SG-implied 0.464),vendor derived,
+SLB,Pumping Conditions: Intake Pressure / Fluid Level / Separation Efficiency,p6 Equipment and Results,per_document,no,,,PIP excluded (D11); fluid level and separation efficiency duplicated from p2.
+SLB,Bottom / Top Pump Information: Device Information / Stages,p6 Equipment and Results,per_section,yes,C-NARROW + C-IDEAL + K-TIER1,vendor input,
+SLB,Bottom / Top Pump Information: Staging Configuration / Staging Type,p6 Equipment and Results,per_section,yes,D31 alias evidence (CR-CT vs C-CT distinguishes build variants of one model),vendor input,
+SLB,Gas Handler #1 / #2 Device Information,p6 Equipment and Results,per_section,yes,K-TIER1 (head-producing body) + D31 model grammar,vendor input,
+SLB,Gas Separators (Device Information / Power / Natural Separation Efficiency / Separator 1 and 2 Efficiency / Total Separation Efficiency),p6 Equipment and Results,per_section,yes,K-TIER2P (separation stages in the alpha cascade),vendor derived,
+SLB,Free Gas Into Pump,p6 Equipment and Results,per_document,yes,K-TIER2P (alpha entering the pump),vendor derived,
+SLB,Protector block (Thrust Bearing Type / Oil Type / Number of Seals / Configuration / Chambers / Components),p6 Equipment and Results,per_document,no,,,Not a pump body; no head contribution.
+SLB,Motor Nameplate Information (Device Information / Volts / Power / Speed / Rating Factor / Winding Number),p6 Equipment and Results,per_document,yes,C-ENERGY nameplate context; Amp excluded (duplicates v2 motor_rated_amps),vendor input,
+SLB,Motor Lead Extension / Cable Information / Sensor / VSD blocks,p6 Equipment and Results,per_document,no,,,Equipment selection; no contract.
+SLB,Conditions at Operating Frequency (Operating Frequency / Motor Amp / Total Motor Load / Volts @ Junction Box / KVA @ Junction Box / Motor Volts),p7 General Report,per_document,yes,C-ENERGY (total motor load); amps and kVA not proposed,vendor derived,
+SLB,Inflow Performance Curve,p8 General Report,per_document,no,,,Rendered plot only - no numeric values in the text layer (n=5).
+SLB,Inflow / Outflow Performance Curve,p9 General Report,per_document,no,,,Rendered plot only; no numeric values.
+SLB,TDH Curve,p10 General Report,per_document,no,,,Rendered plot only; no numeric values.
+SLB,VSD H-Q Curve,p11 General Report,per_document,no,,,Rendered plot only; no numeric values. Would be the SLB curve source if digitized (D7 fallback).
+SLB,Actual Bottom Pump Curve / Actual Top Pump Curve,p12-13 General Report,per_section,no,,,Rendered plot only; no numeric values. Per-section curve source if digitized (D7 fallback).
+SLB,Catalog Top Pump Curve,p14 General Report,per_section,no,,,Rendered plot only; no numeric values. The only catalog-basis curve SLB prints; D7 fallback candidate.
+ELS,Well Name / Project Name / company,p1 header,per_document,yes,join key -> well_id,vendor input,
+ELS,Email,p1 header,per_document,no,,,Placeholder contact field (literal 'Email' at n=3); no contract.
+ELS,Pumps Top / Bottom: Manufacture,p1 Pumps block,per_section,yes,D31 manufacturer resolution (ELS = Endurance Lift Solutions),vendor input,
+ELS,Pumps Top / Bottom: Series,p1 Pumps block,per_section,yes,D31 model grammar (400 series prefix is printed separately from the model),vendor input,
+ELS,Pumps Top / Bottom: Model,p1 Pumps block,per_section,yes,C-NARROW + C-IDEAL + D31 model grammar,vendor input,
+ELS,Pumps Top / Bottom: Nr Stages,p1 Pumps block,per_section,yes,C-IDEAL (stages) + K-TIER1,vendor input,
+ELS,Well Completion: Casing / Tubing,p1 Well Completion,per_document,no,,,Wellbore geometry; no contract.
+ELS,Well Completion: Pump Setting Depth,p1 Well Completion,per_document,yes,C-HYD + C-DPREC (well_depth_ft),vendor input,
+ELS,Operating Performance: Shaft-Rating,p1,per_document,no,,,Mechanical rating; no contract.
+ELS,Operating Performance: Operating Frequency,p1,per_document,yes,K-AFFNORM (D10 as-printed frequency),vendor input,
+ELS,Operating Performance: Intake Production Rate,p1,per_document,yes,K-CURVEFIT (downhole flow at the design point),vendor input,
+ELS,Operating Performance: Packer installed / Intake Section / Rot. Sep Efficiency,p1,per_document,yes,Rot. Sep Efficiency traces to K-TIER2P; packer and intake section not proposed,vendor input,
+ELS,Operating Performance: Wellhead Pressure / Casing Head Pressure,p1,per_document,no,,,Design-time surface conditions; telemetry supplies measured values.
+ELS,Fluid Properties: Oil Gravity,p1,per_document,yes,C-SG (sg_oil) + C-BUBBLE (API),vendor input,
+ELS,Fluid Properties: Water Gravity,p1,per_document,yes,C-SG (sg_water),vendor input,
+ELS,Fluid Properties: Gas Gravity,p1,per_document,yes,C-BUBBLE (gamma_g - replaces the 0.75 default),vendor input,
+ELS,Fluid Properties: Bottom Hole Temp,p1,per_document,yes,C-BUBBLE (T_f - replaces the 150 F default),vendor input,
+ELS,Fluid Properties: Surface Fluid Temp,p1,per_document,yes,C-BUBBLE (T_f gradient endpoint),vendor input,
+ELS,Fluid Properties: Calculated Pb (Yes/No),p1,per_document,yes,C-BUBBLE provenance - the only family that prints the input-vs-derived flag explicitly (D14),vendor input,
+ELS,Fluid Properties: Pb,p1,per_document,yes,C-BUBBLE (selected_bubble_point_psi); classification read off the Calculated Pb flag,vendor assumption,
+ELS,Fluid Properties: GLR,p1,per_document,no,,,No contract consumes GLR.
+ELS,Fluid Properties: Water Cut,p1,per_document,yes,C-SG (water_cut),vendor input,
+ELS,Fluid Properties: Pump Intake Pressure,p1,per_document,no,,,PIP excluded (D11).
+ELS,Protectors P1 P2 (Series / Model / Bearings / Shaft / Shaft Limit / Allowable Bearing Load),p1,per_section,no,,,Not pump bodies; no head contribution.
+ELS,Motor M1 (Series / Type / Hp / Amps / Volts / Shroud),p1,per_document,yes,C-ENERGY nameplate context; Amps excluded (duplicates v2 motor_rated_amps),vendor input,
+ELS,CABLE / MLE / Type / AWG / Cable Temperature Rating,p1,per_document,no,,,Cable selection; no contract.
+ELS,OPERATING PARAMETERS: Composite SG,p2,per_document,yes,C-SG benchmark (calc_mixture_sg check) + C-HEADDP (sg_for_dp candidate),vendor derived,
+ELS,OPERATING PARAMETERS: Actual Voltage Drop / Terminal Start-up Voltage / Start-up to Name Plate Volt / Bearing Load / Pump Shaft HP Ratio / Fluid Over Pump,p2,per_document,no,,,Electrical and mechanical checks; no contract.
+ELS,FLUID PROPERTIES: Total volume at Intake,p2,per_document,yes,K-CURVEFIT (downhole flow at the design point),vendor derived,
+ELS,FLUID PROPERTIES: Oil Rate / Water Rate,p2,per_document,yes,C-SG (water cut basis at downhole conditions),vendor derived,
+ELS,FLUID PROPERTIES: Free gas at Intake / Free gas into Pump,p2,per_document,yes,K-TIER2P (alpha cascade) - printed in mcf/d not % so the unit token must be carried verbatim (D8),vendor derived,
+ELS,FLUID PROPERTIES: Pump TDH,p2,per_document,yes,K-TIER1 / Test A benchmark,vendor derived,
+ELS,OPERATING PERFORMANCE: BOPD / BWPD / Gas Production,p2,per_document,yes,C-SG (surface water cut basis),vendor input,
+ELS,FLUID PROPERTIES: GOR / Calculated Water cut,p2,per_document,yes,Calculated Water cut traces to C-SG; GOR not proposed (already Direct from production data),vendor derived,
+ELS,OPERATING PARAMETERS: Required TDH,p2,per_document,yes,K-TIER1 benchmark (required vs produced head),vendor derived,
+ELS,OPERATING PARAMETERS: Total Required BHP,p2,per_document,yes,K-CURVEFIT (string power at the design point),vendor derived,
+ELS,OPERATING PARAMETERS: Fluids velocity around motor / Power Cable Length / Required kVA,p2,per_document,no,,,Cooling check and surface sizing; no contract.
+ELS,WELL / IPR: Producing FL / FLOP / Static FL,p2,per_document,no,,,Fluid levels; no contract.
+ELS,WELL / IPR: PI,p2,per_document,no,,,PI excluded (D11).
+ELS,WELL / IPR: PIP,p2,per_document,no,,,PIP excluded (D11).
+ELS,Pump chart : <manufacturer> <series> <model>,p2 chart title,per_section,yes,K-CURVEFIT (names the model the plotted curve belongs to),vendor input,
+ELS,Frequency Head chart / Frequency Power chart,p3,per_section,no,,,Rendered plots only - no numeric values in the text layer (n=3). D7 fallback candidate.
+ELS,Motor Curves,p4,per_document,no,,,Rendered plot only; no numeric values. Power factor is not printed anywhere in this family (0/3).
+ELS,3D Deviation Survey / 2D Deviation Survey / DLS Survey,p4-5,per_document,no,,,Well-path plots; no contract.
+ELS,MLE/CT Clearance / Tubing Clearance / Pump Clearance,p6,per_document,no,,,Mechanical clearance; no contract.
+BakerProLift,Project name / Target Well / Client / Case name,p1-8 page header,per_document,yes,join key -> well_id,vendor input,
+BakerProLift,Field / Country,p1-8 page header,per_document,no,,,Location labels; no contract.
+BakerProLift,Prepared by / Date,p1-8 page footer,per_document,yes,D18 effective_from; preparer name not proposed,vendor input,
+BakerProLift,Surface Electrical: System Power Consumption kW,p1 ProLift Summary,per_document,yes,C-ENERGY (motor_power_kw benchmark for the proxy path),vendor derived,
+BakerProLift,Surface Electrical: VSD Output Current / XFMR Output Voltage / XFMR Output Power,p1 ProLift Summary,per_document,no,,,Surface electrical sizing; no contract.
+BakerProLift,Surface Electrical: Motor Frequency,p1 ProLift Summary,per_document,yes,K-AFFNORM - must not be confused with Pump Shaft Frequency; this family runs a permanent-magnet motor at 2x shaft Hz (103.18 vs 51.59 at n=1),vendor input,
+BakerProLift,Surface Production Data: Surface Flow Rate / Tubing Pressure / Casing Pressure,p1 ProLift Summary,per_document,yes,Surface Flow Rate traces to C-BEP design flow; pressures not proposed,vendor input,
+BakerProLift,Downhole Equipment: Casing / Tubing (at pump discharge) / Main Cable Length / MLE,p1 ProLift Summary,per_document,no,,,Wellbore geometry and cable; no contract.
+BakerProLift,Pump(s): <model> <n> STG,p1 ProLift Summary,per_section,yes,C-NARROW + C-IDEAL + D31 model grammar (ESP B <series><model> PK form),vendor input,
+BakerProLift,Simulation Parameters: Setting Depth from pump discharge,p1 ProLift Summary,per_document,yes,C-HYD + C-DPREC (well_depth_ft) - note the basis is pump discharge not intake; the offset must be carried,vendor input,
+BakerProLift,Simulation Parameters: Total Dynamic Head,p1 ProLift Summary,per_document,yes,K-TIER1 / Test A benchmark,vendor derived,
+BakerProLift,Simulation Parameters: Submergence,p1 ProLift Summary,per_document,no,,,Fluid level over pump; no contract.
+BakerProLift,Simulation Parameters: Average Mixture Flow Rate,p1 ProLift Summary,per_document,yes,K-CURVEFIT (downhole flow at the design point - the curve x-axis for this family),vendor derived,
+BakerProLift,Simulation Parameters: Pump Discharge Pressure,p1 ProLift Summary,per_document,yes,C-DISCH benchmark (D13),vendor derived,
+BakerProLift,Simulation Parameters: Pump Intake Pressure,p1 ProLift Summary,per_document,no,,,PIP excluded (D11).
+BakerProLift,Pump Shaft Frequency,p1 ProLift Summary,per_document,yes,K-AFFNORM (D10 as-printed frequency - the hydraulic frequency),vendor derived,
+BakerProLift,Overall Pump Efficiency,p1 ProLift Summary,per_document,yes,C-EFFPROXY benchmark,vendor derived,
+BakerProLift,Intake/GS Gas Volume Fraction: Before Separation / After Natural Separation / Into Pump,p1 ProLift Summary,per_document,yes,K-TIER2P (three-stage alpha cascade),vendor derived,
+BakerProLift,Gas Separator / Motor Seal(s),p1 ProLift Summary,per_section,no,,,Not pump bodies; no head contribution.
+BakerProLift,Operating Downthrust / Shut-in Downthrust,p1 ProLift Summary,per_document,no,,,Thrust rating; no contract.
+BakerProLift,Motor: <model> / Type / Nameplate Power / Nameplate Voltage / Nameplate at rpm,p1 ProLift Summary,per_document,yes,C-ENERGY nameplate context; Type (Permanent Magnet) is required to read the frequency correctly,vendor input,
+BakerProLift,Motor: Operating Power / Motor Load / Motor Efficiency,p1 ProLift Summary,per_document,yes,C-ENERGY benchmark (motor efficiency term),vendor derived,
+BakerProLift,Motor: Operating Current / Winding Temperature,p1 ProLift Summary,per_document,no,,,Would duplicate v2 motor_rated_amps (D2); winding temp has no contract.
+BakerProLift,Top of Perforation,p1-2,per_document,yes,C-HYD depth-provenance disambiguation,vendor input,
+BakerProLift,Reservoir temperature,p1-2,per_document,yes,C-BUBBLE (T_f - replaces the 150 F default),vendor input,
+BakerProLift,Static BHP,p1-2,per_document,no,,,Reservoir-side pressure; no contract input.
+BakerProLift,Wellbore: Casing / Tubing tables (OD / ID / MD Top / MD Bottom / Roughness / Thread),p2 ProLift Detailed,per_document,no,,,Wellbore geometry; no contract.
+BakerProLift,Fluids: Oil Gravity (API),p2 ProLift Detailed,per_document,yes,C-SG (sg_oil) + C-BUBBLE (API),vendor input,
+BakerProLift,Fluids: Gas SG,p2 ProLift Detailed,per_document,yes,C-BUBBLE (gamma_g - replaces the 0.75 default),vendor input,
+BakerProLift,Fluids: Water SG,p2 ProLift Detailed,per_document,yes,C-SG (sg_water),vendor input,
+BakerProLift,Fluids: Water Cut,p2 ProLift Detailed,per_document,yes,C-SG (water_cut),vendor input,
+BakerProLift,Fluids: Producing GOR / Producing GLR,p2 ProLift Detailed,per_document,no,,,Producing GOR is already Direct from production data; not lab R_so.
+BakerProLift,Fluids: Water Salinity / H2S / CO2 / N2,p2 ProLift Detailed,per_document,no,,,Compositional detail; no contract consumes it.
+BakerProLift,Inflow Outflow: IPR method / PI,p2 ProLift Detailed,per_document,no,,,PI excluded (D11); IPR method out of scope.
+BakerProLift,Inflow Outflow: Static / Test / Target columns (Surface Flow Rate / Bottomhole Pressure / Intake Pressure / Fluid Level),p2 ProLift Detailed,per_scenario,no,,,Reservoir-side test data; intake pressure excluded (D11).
+BakerProLift,Wellhead Pressure (Casing / Tubing / Flowline) / Choke Diameter,p2 ProLift Detailed,per_document,no,,,Design-time surface conditions; no contract.
+BakerProLift,Multiphase Flow (Vertical / Horizontal correlation / Swap angle / Tuning Factor),p2 ProLift Detailed,per_document,yes,C-HYD provenance (names the multiphase correlation behind the printed TDH),vendor assumption,
+BakerProLift,Pump / Well Performance summary block,p3,per_document,no,,,Duplicated from p1 at the same grain.
+BakerProLift,Pump Performance chart (Multi-Frequency head / efficiency / power),p4,per_section,no,,,Rendered plot only - no numeric values in the text layer (n=2). D7 fallback candidate.
+BakerProLift,Motor page: Description / Type / Rating factor / Nameplate at,p5,per_document,no,,,Duplicated from p1 at the same grain.
+BakerProLift,Motor page: Power Factor %,p5,per_document,yes,C-BHP (replaces default pf = 0.90) + C-AFFINITY power check,vendor derived,
+BakerProLift,Motor page: Motor load / Voltage / Current / Efficiency / Slip / Torque / Power,p5,per_document,no,,,Duplicated from p1 or mechanical detail; no contract.
+BakerProLift,Sensitivity chart,p6,per_scenario,no,,,Rendered plot only; the numbers behind it are tabulated on p7.
+BakerProLift,Sensitivity table: Water Cut / GLR / Static BHP / PI / Surface Rate / Setting Depth per case,p7,per_scenario,yes,C-SG and C-HYD scenario variance (feeds the D16 fail-loud rule on invariant fields),vendor input,
+BakerProLift,Sensitivity table: Pump Shaft Frequency / Motor Frequency / Speed rpm per case,p7,per_scenario,yes,K-AFFNORM (three frequencies per document for the same string),vendor derived,
+BakerProLift,Sensitivity table: Total Dynamic Head / Discharge Pressure / Intake Pressure / Flowing BHP per case,p7,per_scenario,yes,K-TIER1 / Test A benchmark; intake pressure excluded (D11),vendor derived,
+BakerProLift,Sensitivity table: GVF at Intake / GVF into Pump per case,p7,per_scenario,yes,K-TIER2P (alpha at three operating points),vendor derived,
+BakerProLift,Sensitivity table: Pump Efficiency / Motor Efficiency / Overall Efficiency per case,p7,per_scenario,yes,C-EFFPROXY + C-ENERGY benchmark,vendor derived,
+BakerProLift,Sensitivity table: Operating Power / Motor Load / Surface kVA / Surface Voltage / Motor Current / VSD Current / Power Cons. kW per case,p7,per_scenario,yes,C-ENERGY (Operating Power and Power Cons. kW); currents and voltages not proposed,vendor derived,
+BakerProLift,Sensitivity table: Submergence / Intake Temp. / Winding Temp. / Fluid Velocity / Thrust Brg. Load per case,p7,per_scenario,no,,,Thermal and mechanical checks; no contract.
+BakerProLift,String diagram table: Description / PN / Q-ty / OD / Length / Mass / Bottom,p8,per_section,yes,C-IDEAL (per-housing stage counts) + K-TIER1 (section order and depth) + D31 model grammar,vendor input,
+XSize,General Description (Customer Name / Lease Name / Well Number / County / State),p1,per_document,yes,join key -> well_id; the API number is embedded in County,vendor input,
+XSize,General Description: Design Date,p1,per_document,yes,D18 effective_from,vendor input,
+XSize,General Description: Designed By / Designed For / Phone Number / Field-Reservoir,p1,per_document,no,,,Contact metadata; no contract.
+XSize,Well Parameters Overview: Casing Size / Tubing Size / Liner Size / Top of Liner,p1,per_document,no,,,Wellbore geometry; no contract.
+XSize,Well Parameters Overview: Lateral Depth (TVD),p1,per_document,yes,C-HYD depth-provenance disambiguation,vendor input,
+XSize,Well Parameters Overview: Intake Depth (MD),p1,per_document,yes,C-HYD + C-DPREC (well_depth_ft),vendor input,
+XSize,Well Parameters Overview: Maximum WHP / Casing Pressure,p1,per_document,no,,,Design-time surface conditions; no contract.
+XSize,Well Parameters Overview: Oil Gravity (API),p1,per_document,yes,C-SG (sg_oil) + C-BUBBLE (API),vendor input,
+XSize,Well Parameters Overview: Water Gravity (SG),p1,per_document,yes,C-SG (sg_water),vendor input,
+XSize,Well Parameters Overview: Gas Gravity (SG),p1,per_document,yes,C-BUBBLE (gamma_g - replaces the 0.75 default),vendor input,
+XSize,Well Parameters Overview: Reservoir Temp,p1,per_document,yes,C-BUBBLE (T_f - replaces the 150 F default),vendor input,
+XSize,Downhole Equipment Summary: Pump / -Stages / Taper Pump / -Stages / Gas Handler,p1,per_section,yes,C-NARROW + C-IDEAL + K-TIER1 + D31 model grammar (digits-first 400XPS form),vendor input,
+XSize,Downhole Equipment Summary: Discharge / Intake / Seal / Motor (Np) / Cable / Sensor,p1,per_document,yes,Motor (Np) traces to C-ENERGY nameplate context; the rest are equipment strings and are not proposed,vendor input,
+XSize,Surface Power Requirements (Surface Voltage / Surface Power Design / Transformer Specs / Motor Amps / Drive Amps / Drive Specs / Total Cable),p1,per_document,no,,,Surface sizing; Motor Amps would duplicate v2 motor_rated_amps (D2).
+XSize,Key Figures: Design Frequency Range,p1,per_document,yes,K-AFFNORM (frequency envelope for normalized observations),vendor input,
+XSize,Key Figures: System TDH Range,p1,per_document,yes,K-TIER1 / Test A benchmark envelope,vendor derived,
+XSize,Key Figures: Surface Fluid Rate Range / Surface Gas Rate Range,p1,per_document,yes,C-BEP design-flow envelope,vendor derived,
+XSize,Key Figures: Free Gas into Pump Range,p1,per_document,yes,K-TIER2P (alpha envelope),vendor derived,
+XSize,Key Figures: Pump Intake Range,p1,per_document,no,,,PIP excluded (D11).
+XSize,Key Figures: Estimated Pump Up Time / Maximum String Weight / Inclination at Top of Pump / Velocity at Motor Range,p1,per_document,no,,,Running and mechanical checks; no contract.
+XSize,Equipment Description table: Equipment Description / OD / Weight / Length / Run Depth (md),p2,per_section,yes,C-IDEAL (per-housing stage counts) + K-TIER1 (section order and depth),vendor input,
+XSize,Comments (DLS intervals) / Proposed Top of Unit MD / Estimated Bottom of Unit MD / Maximum String Weight,p2,per_document,no,,,Running advisory and string geometry; no contract.
+XSize,System Performance Specs: Inflow Modeling / Multi-Phase Flow / Pipe Roughness Factor,p3,per_document,yes,C-HYD provenance (names the multiphase correlation behind the printed TDH),vendor assumption,
+XSize,System Performance Specs: Static Bottomhole Press,p3,per_document,yes,C-BUBBLE provenance test (bubble point vs static pressure),vendor assumption,
+XSize,System Performance Specs: Bubble Point Press,p3,per_document,yes,C-BUBBLE (selected_bubble_point_psi),vendor assumption,
+XSize,Production Points: Oil Rate / Water Rate / Gas Rate,p3,per_scenario,yes,C-SG (water cut basis) + C-BEP design flow,vendor input,
+XSize,Production Points: Wellhead Pressure,p3,per_scenario,no,,,Design-time surface condition; no contract.
+XSize,Production Points: Pump Intake Press,p3,per_scenario,no,,,PIP excluded (D11).
+XSize,Production Points: Total Dynamic Head,p3,per_scenario,yes,K-TIER1 / Test A benchmark at 6 operating points,vendor derived,
+XSize,Production Points: Assumed Pump Wear,p3,per_scenario,yes,K-CURVEFIT quality flag - every XSize curve is printed at 30% worn and must not enter an ideal-curve fit unlabelled,vendor assumption,
+XSize,Production Points: System Speed,p3,per_scenario,yes,K-AFFNORM (D10 as-printed frequency),vendor input,
+XSize,Production Points: Operating Motor Load,p3,per_scenario,no,,,Loading check; no contract.
+XSize,Production Points: Electric Cost,p3,per_scenario,no,,,Economics; no contract.
+XSize,Production Points: Fluid Velocity,p3,per_scenario,no,,,Cooling check; no contract.
+XSize,Production Points: Total Volume at Intake / Total Volume at Primary,p3,per_scenario,yes,K-CURVEFIT (downhole flow at each production point - the curve x-axis),vendor derived,
+XSize,Production Points: Free Gas into Pump,p3,per_scenario,yes,K-TIER2P (alpha at 6 operating points),vendor derived,
+XSize,PVT - Calculations: Flow Rates Inside Tubing (Oil / Water / Free Gas Rate at Intake / Discharge / Surface),p4,per_scenario,yes,C-SG (water cut at downhole conditions) + K-TIER2P,vendor derived,
+XSize,PVT - Calculations: Solution Gas-Oil Ratio (Rso) + correlation,p4,per_scenario,yes,C-BUBBLE (R_so - replaces the producing-GOR proxy the contract only allows on user confirmation),vendor derived,
+XSize,PVT - Calculations: Oil FVF (Bo) / Gas FVF (Bg) / Gas Compressibility (Z) + correlations,p4,per_scenario,no,,,No active contract consumes FVF or Z.
+XSize,PVT - Calculations: Oil / Water / Gas Viscosity + correlations,p4,per_scenario,no,,,Viscosity correction is a catalog-side transform the app does not currently apply; no active contract.
+XSize,PVT - Calculations: Fluid Density / Gas Density / Average Density,p4,per_scenario,yes,C-SG benchmark (calc_mixture_sg check at intake / discharge / surface),vendor derived,
+XSize,PVT correlation names column (Standing / Real Gas Law / Beggs & Brill / Beggs and Robinson / Bradley et al. / Carr et al. / Eq. of State),p4,per_document,yes,C-BUBBLE provenance (names the correlations behind Rso and the bubble point),vendor assumption,
+XSize,ESP System Pressure Profile chart,p4,per_scenario,no,,,Rendered plot only; the pressures behind it are tabulated on p3 and p7-9.
+XSize,System VFD Curves title (<gas handler> + <n> Stg <taper> + <n> Stg <primary> Primary),p5,per_document,yes,K-TIER1 (names the full composite string and its stage counts in one token) + D31 alias evidence,vendor input,
+XSize,Variable Frequency Head - System / Variable Frequency Power - System charts,p5,per_document,no,,,Rendered plots only; the per-section numbers are tabulated on p7-9.
+XSize,Intake Section Summary (Lower Intake / Upper Intake / Max Shaft Loading),p6,per_section,no,,,Not a pump body; shaft loading has no contract.
+XSize,Gas Separation: Free Gas Below Intake / at Intake / exiting Sep. #1 / exiting Sep. #2 / exiting Gas Handler / exiting Taper Pump / exiting Primary Pump (% and bpd),p6,per_section,yes,K-TIER2P (the full per-section alpha cascade - the richest alpha source in the corpus),vendor derived,
+XSize,Gas Separation: Natural Gas Separation Efficiency / Separator #1 Efficiency / Separator #2 Efficiency,p6,per_section,yes,K-TIER2P (separation stages in the alpha cascade),vendor assumption,
+XSize,Gas Separation: Turpin Indicator at Intake / Turpin Indicator entering Pump(s),p6,per_section,yes,K-TIER2P (names Turpin as the degradation correlation and gives its indicator value - D26),vendor derived,
+XSize,Conditions at Primary Pump Intake table (Surface Fluid Rate / Surface Gas Rate / Turpin / Free Gas % / Free Gas BPD / Total DH Volume per production point),p6,per_scenario,yes,K-TIER2P (alpha at 6 operating points) + K-CURVEFIT (downhole volume),vendor derived,
+XSize,Seal Section Summary (LT / UT Seal Description / Max Shaft Loading / Chamber Capacity),p6,per_section,no,,,Not a pump body; no head contribution.
+XSize,Motor Summary: Motor Rtg (Np),p6,per_document,yes,C-ENERGY nameplate context,vendor input,
+XSize,Motor Summary: Max Power Factor,p6,per_document,yes,C-BHP (replaces default pf = 0.90) - but it is a maximum not an operating value; the basis must be carried,vendor derived,
+XSize,Motor Summary: Max Nameplate Motor Load / Max Operating Motor Load,p6,per_document,no,,,Loading envelope; no contract.
+XSize,Motor Summary: Operating Temp / Static Temp Check / Operating Temp Check / Motor Oil,p6,per_document,no,,,Thermal checks and lubricant; no contract.
+XSize,Motor Composite Curve chart (RPM / Amps / PF / Eff / DT vs Motor Load),p6,per_document,no,,,Rendered plot only; the operating power factor is not tabulated (only the maximum).
+XSize,Cable Summary,p6,per_document,no,,,Cable selection and losses; no contract.
+XSize,Per-section curve page: Pump Description,p7-9 Gas Handler / Taper Pump / Primary Pump,per_section,yes,C-NARROW + D31 model grammar,vendor input,
+XSize,Per-section curve page: Stage Count,p7-9,per_section,yes,C-IDEAL (stages) + K-CURVEFIT per-stage normalization,vendor input,
+XSize,Per-section curve page: Head per Stage (ft/stg),p7-9,per_section,yes,K-CURVEFIT (per-stage head in feet - D9) + K-TIER1,vendor derived,
+XSize,Per-section curve page: Power per Stage (HP/stg),p7-9,per_section,yes,K-CURVEFIT (per-stage power - fills ideal_power_c1..c6 which MC could not; amendment 8),vendor derived,
+XSize,Per-section curve page: Efficiency,p7-9,per_section,yes,C-EFFPROXY benchmark + K-CURVEFIT,vendor derived,
+XSize,Per-section curve page: BHP,p7-9,per_section,yes,K-CURVEFIT (section power at the design point) + C-ENERGY benchmark,vendor derived,
+XSize,Per-section curve page: Total Dynamic Head,p7-9,per_section,yes,K-TIER1 (section head contribution - Test A input),vendor derived,
+XSize,Per-section curve page: Intake Volume (O+W+G) / Disch. Volume (O+W+G),p7-9,per_section,yes,K-CURVEFIT (downhole flow at the design point) + K-TIER1 equal-flow check,vendor derived,
+XSize,Per-section curve page: Intake Pressure / Discharge Pressure,p7-9,per_section,yes,C-DISCH benchmark (D13); intake pressure carried as the section boundary not as PIP,vendor derived,
+XSize,Per-section curve page: Minimum Flow at 65 Hz / at 45 Hz,p7-9,per_section,yes,C-BEP (min_recommended_bpd) + K-WINDOW + K-AFFNORM (two frequencies for one envelope),vendor derived,
+XSize,Per-section curve page: Best Efficiency at 65 Hz / at 45 Hz,p7-9,per_section,yes,C-BEP (bep_bpd) + K-AFFNORM,vendor derived,
+XSize,Per-section curve page: Maximum Flow at 65 Hz / at 45 Hz,p7-9,per_section,yes,C-BEP (max_recommended_bpd) + K-WINDOW + K-AFFNORM,vendor derived,
+XSize,Per-section curve page header: at Prod Pt <n>: <f> Hz - <sg> SG,p7-9,per_section,yes,C-HEADDP (sg_for_dp) - the SG differs per section (0.685 / 0.71 / 0.785 at n=1) so the contracts single mixture SG is ambiguous here,vendor derived,
+XSize,Per-section curve page: Shaft Diameter / Max Shaft Loading / Max Thrust Loading / Max Housing Loading,p7-9,per_section,no,,,Mechanical ratings; no contract.
+XSize,ESP Equipment Clearance 2 (Casing / Tubing / Power Cable / MLE / Pump / Seal / Motor Description + clearances),p10,per_document,no,,,Mechanical clearance; the equipment strings are duplicated from p1-2.
+Valiant,Customer / Lease / Well / Date / Cust Rep / Quote#,p1-2 GENERAL,per_document,yes,join key -> well_id + D18 effective_from; rep and quote not proposed,vendor input,
+Valiant,System Information: Frequency Min / Design / Max,p1,per_document,yes,K-AFFNORM (frequency envelope for normalized observations),vendor input,
+Valiant,System Information: Motor Load / KVA Min / Design / Max,p1,per_document,no,,,Loading and surface sizing envelope; no contract.
+Valiant,System Information: Total Flow Min / Design / Max,p1,per_document,yes,C-BEP design flow envelope,vendor input,
+Valiant,Well Information: Casing / Tubing / BH Temp / Pump Depth,p1,per_document,yes,BH Temp traces to C-BUBBLE (T_f); Pump Depth to C-HYD; casing and tubing not proposed,vendor input,
+Valiant,Design Properties: Oil / Water / Gas,p1,per_document,yes,C-SG (water cut basis),vendor input,
+Valiant,Pump Curve chart (<model> HP / Efficiency / Head vs bbl/d),p1 and p12,per_section,no,,,Rendered plot only; the numeric envelope is tabulated on p6.
+Valiant,Production Summary: Oil / Water / Gas / Total (Oil + Water),p2,per_document,yes,C-SG (water cut basis) + C-BEP design flow,vendor input,
+Valiant,Production Summary: Producing Reservoir Pressure,p2,per_document,no,,,Reservoir-side pressure; no contract input.
+Valiant,Production Summary: Pump Intake Pressure / Calculated Pip / Desired Pip,p2 and p4,per_document,no,,,PIP excluded (D11).
+Valiant,Production Summary: Pump Intake Flow / Pump Discharge Flow,p2,per_document,yes,K-CURVEFIT (downhole flow at the design point),vendor derived,
+Valiant,Production Summary: Pump Discharge Pressure,p2,per_document,yes,C-DISCH benchmark (D13),vendor derived,
+Valiant,Production Summary: Pump TDH,p2,per_document,yes,K-TIER1 / Test A benchmark,vendor derived,
+Valiant,Equipment Summary: Pump(s) Series / Model / <n> Housing(s) / <n> stage(s),p3,per_section,yes,C-NARROW + C-IDEAL + K-TIER1 + D31 model grammar,vendor input,
+Valiant,Equipment Summary: Recommend Standard Housing / Recommend High Strength Shaft,p3,per_section,no,,,Mechanical recommendation; no contract.
+Valiant,Equipment Summary: Intake/Separator(s) (Upper / Lower Separator / Efficiency / HP / ft),p3 and p8,per_section,yes,K-TIER2P (separation stages in the alpha cascade),vendor derived,
+Valiant,Equipment Summary: Seal(s) / Total Seal HP,p3,per_section,no,,,Not a pump body; no head contribution.
+Valiant,Equipment Summary: Motor(s) Model / Nameplate HP / V / A,p3,per_document,yes,C-ENERGY nameplate context; the A field would duplicate v2 motor_rated_amps and is excluded,vendor input,
+Valiant,Equipment Summary: Surface Cable / Downhole Cable / MLE,p3,per_document,no,,,Cable selection; no contract.
+Valiant,PRODUCTION FLUIDS: Oil API / Spg Oil,p4,per_document,yes,C-SG (sg_oil) + C-BUBBLE (API) - both printed together,vendor input,
+Valiant,PRODUCTION FLUIDS: Spg Water,p4,per_document,yes,C-SG (sg_water),vendor input,
+Valiant,PRODUCTION FLUIDS: Spg Gas (HC) / Spg Gas (Mix),p4,per_document,yes,C-BUBBLE (gamma_g - replaces the 0.75 default); the HC-vs-Mix distinction must be carried,vendor input,
+Valiant,PRODUCTION FLUIDS: Water Cut,p4,per_document,yes,C-SG (water_cut),vendor derived,
+Valiant,PRODUCTION FLUIDS: Salinity,p4,per_document,no,,,No contract consumes salinity.
+Valiant,PRODUCTION FLUIDS: Water Oil Ratio / GOR / GLR,p4,per_document,no,,,Producing ratios already Direct from production data.
+Valiant,PRODUCTION FLUIDS: Rsb,p4,per_document,yes,C-BUBBLE (R_so at bubble point - replaces the producing-GOR proxy the contract only allows on user confirmation),vendor input,
+Valiant,PRODUCTION FLUIDS: Pb,p4,per_document,yes,C-BUBBLE (selected_bubble_point_psi),vendor derived,
+Valiant,PRODUCTION FLUIDS: CO2 / N2 / H2S / HC %,p4,per_document,no,,,Compositional detail; no contract consumes it.
+Valiant,PRODUCTION FLUIDS: Desired Rate,p4,per_document,yes,C-BEP design flow,vendor input,
+Valiant,WELL PRODUCTIVITY: Method / PI,p4,per_document,no,,,PI excluded (D11); IPR method out of scope.
+Valiant,WELL PRODUCTIVITY: Pr / Test Pressure / Test Flow / Design Flow (Qsc) / Design Pwf,p4,per_document,yes,Design Flow traces to C-BEP; reservoir test data not proposed,vendor input,
+Valiant,WELL CHARACTERISTICS: Tubing ID / Casing ID,p4,per_document,no,,,Wellbore geometry; no contract.
+Valiant,WELL CHARACTERISTICS: Pump Depth (MD) / Pump Depth TVD,p4,per_document,yes,C-HYD + C-DPREC (well_depth_ft) - MD and TVD printed separately,vendor input,
+Valiant,WELL CHARACTERISTICS: TPI Depth (MD) / KOP,p4,per_document,yes,C-HYD depth-provenance disambiguation,vendor input,
+Valiant,WELL CHARACTERISTICS: Temp @ Intake / Temp @ Reservoir / Temp @ Surface,p4,per_document,yes,C-BUBBLE (T_f - three temperatures let the contract use intake temperature rather than a default),vendor derived,
+Valiant,WELL CHARACTERISTICS: cf HW / Flowing Gradient / Tuning Factor / P Res,p4,per_document,yes,Flowing Gradient traces to C-HYD provenance (names the multiphase correlation); the tuning constants are not proposed,vendor assumption,
+Valiant,DESIGN SEPARATION: Natural / Mechanical / Total,p4,per_document,yes,K-TIER2P (separation stages in the alpha cascade),vendor assumption,
+Valiant,DESIGN SEPARATION: Tubing Pressure / Casing Pressure,p4,per_document,no,,,Design-time setpoints; telemetry supplies measured values.
+Valiant,DESIGN SEPARATION: Free Gas Back Into Solution / Pump Below Packer,p4,per_document,no,,,Design toggles; no contract.
+Valiant,PVT Correlations list (Pb/Rs: Al-Shammasi (1999) / Oil Density Standing / viscosity and Z correlations),p5,per_document,yes,C-BUBBLE provenance - names the correlation behind the printed Pb and shows it is NOT Standing (the correlation the app implements),vendor assumption,
+Valiant,Flowing Gradients (Flowing Gradient / Secondary / Pressure @ Separator / Temperature @ Separator),p5,per_document,no,,,Duplicated from p4; separator conditions have no contract.
+Valiant,Pump Detail: Series/Model @ <f>Hz (<n> RPM),p6,per_section,yes,K-AFFNORM (D10 as-printed frequency) + D31 model grammar,vendor input,
+Valiant,Pump Detail: Housings #<n> <n> stgs/ ... (Total: <n> stages / <n> Stages Out),p6,per_section,yes,C-IDEAL (stages) + K-TIER1 (per-housing decomposition; Stages Out is a real deduction),vendor input,
+Valiant,Pump Detail: Operating Range Min / BEP / Max,p6,per_section,yes,C-BEP (bep_bpd + min/max_recommended_bpd) + K-WINDOW,vendor derived,
+Valiant,Pump Detail: Pressure @Intake / PHI / Discharge,p6,per_section,yes,C-DISCH benchmark; PHI traces to K-TIER2P,vendor derived,
+Valiant,Pump Detail: Flow @Intake / @Discharge / Avg Flow,p6,per_section,yes,K-CURVEFIT (downhole flow at the design point) + K-TIER1 equal-flow check,vendor derived,
+Valiant,Pump Detail: Avg Cq / Avg Ch / Avg Cbhp,p6,per_section,yes,K-CURVEFIT quality flag - viscosity correction factors; all 1.0000 at n=1 meaning the printed curve is uncorrected,vendor derived,
+Valiant,Pump Detail: QHCF / HPCF,p6,per_section,no,,,Gas-handling correction factors; both zero at n=1 and no contract consumes them.
+Valiant,Pump Detail: Spg Fluid / Avg Spg Fluid / Avg Pump Spg Fluid,p6,per_section,yes,C-SG benchmark (calc_mixture_sg check) + C-HEADDP (sg_for_dp candidate),vendor derived,
+Valiant,Pump Detail: Efficiency BEP % / Design %,p6,per_section,yes,C-EFFPROXY benchmark + K-CURVEFIT (efficiency at BEP and at the design point),vendor derived,
+Valiant,Pump Detail: Pump Power Consumption HP / Intake Shaft Power HP,p6,per_section,yes,K-CURVEFIT (section power - the design docs unique contribution per amendment 8) + C-ENERGY,vendor derived,
+Valiant,Pump Detail: Worst Case Housing Pressure / Recommend Standard Housing / Std / HS limits,p6,per_section,no,,,Mechanical ratings; no contract.
+Valiant,Pump Detail: Total HP / Total Length / Pump Depth,p6,per_section,no,,,Duplicated from p4 or string geometry; no contract.
+Valiant,Pump Summary - Housing Pressure table (Description / Housing / Stages / Order / Pressure @100%H2O / Limit / Load % / Selected),p7,per_section,yes,K-TIER1 (per-housing Order gives the section stacking order explicitly),vendor derived,
+Valiant,Pump Summary - Shaft Power table (Description / Housing / Stages / Order / Shaft Load / Limit / Load %),p7,per_section,yes,K-TIER1 (cumulative shaft power per housing confirms the series stacking),vendor derived,
+Valiant,Intake/Separator Detail (Free Gas Before Separation / Liquid Flow / Gas Flow / Efficiency / Specific Gravity per separator),p8,per_section,yes,K-TIER2P (separation stages) + C-SG benchmark,vendor derived,
+Valiant,Pump Intake: Natural / Mechanical / Total Separation,p8,per_section,yes,K-TIER2P (alpha cascade),vendor derived,
+Valiant,Pump Intake: Turpin PHI / Dunbar PHI,p8,per_section,yes,K-TIER2P (names Turpin as the degradation correlation and gives its indicator - D26; Dunbar is a second correlation not implemented in the app),vendor derived,
+Valiant,Pump Intake: PFG / Total Flow / Total Liq Flow / Total Gas Flow / Specific Gravity,p8,per_section,yes,K-TIER2P (free gas fraction) + K-CURVEFIT (downhole flow),vendor derived,
+Valiant,Seal(s) Detail (Total Length / Total Power / Pump RPM / Pump Thrust / per-seal power and thrust limits),p8,per_section,no,,,Not a pump body; no head contribution.
+Valiant,Motor Detail: Nameplate 400 HP / V / A / Operating HP / V / A / F,p9,per_document,yes,C-ENERGY nameplate and operating context; the A fields would duplicate v2 motor_rated_amps and are excluded,vendor input,
+Valiant,Motor Detail: Eff,p9,per_document,yes,C-ENERGY benchmark (motor efficiency term),vendor derived,
+Valiant,Motor Detail: Pf,p9,per_document,yes,C-BHP (replaces default pf = 0.90) + C-AFFINITY power check,vendor derived,
+Valiant,Motor Detail: Pu Load / Slip RPM / Motor RPM / Temp Op / Oil Temp / Avg Insulation Life / multipliers / Base Tr / Amb Temp,p9,per_document,no,,,Thermal and derating detail; no contract.
+Valiant,Motor Shaft Load table,p9,per_document,no,,,Mechanical rating; no contract.
+Valiant,Electrical Detail (Surface / Downhole / MLE cable temperatures / voltage drops / TCF / VSD / PST Transformer / Motor KW / Cable KW / Total KW / Surface KVA),p10,per_document,yes,Motor KW and Total KW trace to C-ENERGY (motor_power_kw benchmark); the cable and drive detail is not proposed,vendor derived,
+Valiant,Productivity Curve,p11,per_document,no,,,Rendered plot only; Pwf Min is an IPR quantity with no contract.
+Valiant,Well Design table (Casing / TPI / RPP / Tubing with Start MD / Stop MD / OD / WT / ID / Drift Dia / Collar Dia),p13,per_document,no,,,Wellbore geometry; no contract.
+Valiant,Equipment Schematic / VSD Tornado Curve / Freq Charts / Inflow Curve / MLE-CT Clearance / Tubing Clearance / Motor Chart,p14-19,per_document,no,,,Rendered plots only - no numeric values in the text layer.
+Valiant,Equipment List (Description / Start MD / Stop MD / OD / WT / Length / Part#),p20,per_section,yes,K-TIER1 (per-housing depths confirm section order) + C-IDEAL (stages per housing),vendor input,
+Valiant,Surface Equipment List (VSD / PST Transformer / Surface Cable),p20,per_document,no,,,Surface equipment selection; no contract.
+Procedures,Well name / API# / Latitude / Longitude / Datum,p1 header,per_document,no,,,Out of scope - install procedure not a design document (D19 rationale). Well identity already available from the design families.
+Procedures,Depths: TD / TVD,p1 header,per_document,no,,,Out of scope (D19 rationale). Total depth is not the intake depth C-HYD needs.
+Procedures,Tubulars: Casing / Tubing,p1 header,per_document,no,,,Out of scope (D19 rationale); wellbore geometry has no contract.
+Procedures,H2S / Work Objective / Driving Directions / PROCEDURE steps / Daily Requirements / Safety sections,p1-5,per_document,no,,,Out of scope (D19 rationale) - rig execution content; no contract.
+Procedures,Production: BO / MCF / BW,p1 header,per_document,no,,,Out of scope (D19 rationale); production is already Direct from production data.
+Procedures,Well History (spud / completed dates),p1,per_document,no,,,Out of scope (D19 rationale); no contract.
+Procedures,Contact tables (Permian Resources / Regulatory / Equipment-Services),docx tables T0-T2,per_document,no,,,Out of scope (D19 rationale) - personal contact data; no contract.
+Procedures,Elevation and Casing Details table (GL / KB / TVD / MD / KOP / Landing / OD / Weight / Grade / Drift / ID / Burst / Collapse / Capacity),docx table T3,per_document,no,,,Out of scope (D19 rationale); wellbore geometry has no contract.
+Procedures,Tubing Details table (count / item / nominal OD / Spec-Provider / Length / Depth Bottom),docx table T4,per_section,no,,,Out of scope (D19 rationale) - names 'Pumps' as a count and a vendor with no model and no stage count so it cannot populate pump_config.
+Procedures,Deviation survey table (Measured Depth / Incl Angle / Drift Direction / TVD / N-S / E-W / Vertical Section / Closure / Dogleg Severity),docx table T5,per_document,no,,,Out of scope (D19 rationale); no contract consumes the well path.
+Procedures,Economics (AFE# / Cost Codes / Estimated Cost / Net Revenue / NPV / ROR / Payout / price assumptions),docx paragraphs,per_document,no,,,Out of scope (D19 rationale); economics has no contract.

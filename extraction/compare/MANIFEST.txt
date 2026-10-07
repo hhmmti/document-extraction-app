@@ -1,0 +1,3 @@
+# The loader's value parser, copied verbatim. Columns: source SHA-256, copy SHA-256, file.
+
+921aca10c80809678a07d848f1140aabfa17140d812a475d3698166eb11ebc96  921aca10c80809678a07d848f1140aabfa17140d812a475d3698166eb11ebc96  values.py

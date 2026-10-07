@@ -1,0 +1,3 @@
+# The F1 model-string normaliser, copied verbatim. Columns: source SHA-256, copy SHA-256, file.
+
+cd92d9e84816e24e548e975f8ec1f00ae933c34c3dea95281bf07bfa6176de43  cd92d9e84816e24e548e975f8ec1f00ae933c34c3dea95281bf07bfa6176de43  normalize-models.py
