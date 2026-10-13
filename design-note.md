@@ -1,7 +1,7 @@
 # Design-document extraction app — design note
 
 **Task:** B1, make design-document extraction a pipeline rather than a one-off. GitHub issue `roam-datascience-esp #98`.
-**Status:** approved by Keith; restructured into two rounds on 2026-10-05; updated at the close of Step 2 on 2026-10-06. Owner: Hamed.
+**Status:** approved by Keith; restructured into two rounds on 2026-10-05; updated at the close of Step 2 (2026-10-06) and Step 3 (2026-10-13). Owner: Hamed.
 
 A design document from a known vendor template is uploaded through a Streamlit app. Template detection runs first, then Opus on Bedrock extracts the numbers. The run is logged and every failure is reported. B1 is built in two rounds, and is done when round 2 is done:
 
@@ -102,42 +102,85 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
 
 ### Validate and stage (Lambda)
 
-- **In:** the report.
+*Rewritten at the close of Step 3, 2026-10-13.*
+
+- **In:** the report, the organisation and well from the form, and the run's *Detect* and *Prep* results (page roles and page text).
 - **Does:**
-  - **Runs the existing loader's report reader and staging transform,** with the logic unchanged.
-    - Bad values are quarantined, never coerced.
-    - A design-condition anomaly is recorded on the run as a warning: a bubble point that tracks the static datum.
-    - Contradictory pump-string identity across a document's scenarios halts the run.
-  - **Normalizes model names.** It runs the method's model-name normalizer to fill `pump_model_canonical`. The extractor is not meant to emit the canonical name; it is resolved after extraction through the alias lookup. In Step 2 this recovered every canonical name it was tested on.
-  - **Runs two deterministic guards.** Each failure is a warning on the run, not a halt, until Step 3 settles severity:
-    - **Required fields:** a field the family contract requires is present wherever its table carries it.
-    - **Scenario labels:** each scenario number carries one label across every table in the report.
-  - **Collapses the staged rows into the three grains:** `pump_config`, `esp_well_design_context` and `curve_observations`. It resolves aliases before collapsing a pump string, keeps one row per string, and lets the latest design date win.
-  - **Flags every pump model absent from `universal_catalog`.** The catalog is read only; the flag goes on the run record.
-- **Out:** the three grains for this run, the quarantine list, warnings (guard results included), and the unknown-model flags.
-- **Fail:** `REPORT_INVALID` (unparseable or off-schema); `LOAD_HALTED` (the identity halt).
+  1. **Structure guards, before anything is staged.** The frontmatter, the five data blocks and a parseable `row_counts` footer must be present; otherwise `REPORT_INVALID`. A footer that disagrees with the parsed rows is a warning.
+  2. **Family check.** The report's `vendor_family` must agree with *Detect*'s family; otherwise `FAMILY_MISMATCH`.
+  3. **The existing loader's per-document transform, with its logic unchanged.**
+     - Aliases are resolved before a pump string is collapsed.
+     - Bad values are quarantined, never coerced.
+     - A value that varies across scenarios is a warning, apart from a short list of columns allowed to vary.
+     - A contradictory pump-string identity halts the run.
+     - **Confirmed in Step 3:** over the 46 corpus reports, it reproduces the earlier batch loader's outputs exactly (76 pump-config rows, 42 design-context rows, 1,834 curve observations, and every log). The one deliberate change: the provenance column is no longer compared across scenarios, because it varies by construction. That turns two wells' spurious halts into warnings.
+  4. **Model names** are resolved to their canonical names through the loader's alias lookup. A separate normalizer step is not needed; in Step 3 every SpyGlass section resolved.
+  5. **Validation against the method's validator specification.**
+     - 52 of its 80 rules can be checked from the report, and all 52 are implemented. The rest need the PDF or other documents, or do not apply.
+     - Four rules were narrowed where real documents showed them too broad. For example, the SLB rule against head values now ignores printed design-point total dynamic head.
+     - **Guards:** scenario-label consistency. Each SLB, Baker or Valiant run carries that family's **known-issue notice**.
+  6. **Unknown models,** flagged against a read-only snapshot of `universal_catalog`: `absent`, `no_head_curve` (in the catalogue but with no head curve), or `unresolved`. Nothing is written to the catalogue.
+  7. **Review list.** Per value, for the pump string and the well-item fields only. A value needs review when any deterministic signal fires:
+     - its verbatim text is not on the page it cites;
+     - a validation rule fired;
+     - the extractor marked the row a conflict (one item per row; informational when both printed forms are the same model);
+     - it was quarantined;
+     - it is a known-issue field;
+     - the family prints it but the report has none;
+     - SpyGlass's title-versus-table frequency trap.
+
+     The list never blocks a run. On the twelve Step-2 test reports, 12% of values needed review.
+- **Severity in round 1:**
+  - **Structure → `REPORT_INVALID`;** nothing is staged.
+  - **Identity halt → `LOAD_HALTED`;** the grains are still stored.
+  - **Everything else is a warning on the run.**
+  - Each finding keeps the specification's own severity, and the run reports the document's `spec_validation_status` (`passed`, `needs_review` or `failed`) without failing on it.
+  - Section-order and identity findings carry `blocks_publish`, which round 2's well writer must honour.
+- **Out:**
+  - the three grains;
+  - quarantine, findings, notices and unknown models;
+  - the review list;
+  - the scenario-variance, identity and gas logs.
+- **Fail:** `REPORT_INVALID`, `FAMILY_MISMATCH`, `LOAD_HALTED`, `ASSET_INVALID`.
 
 ### Store (Lambda)
 
+*Rewritten at the close of Step 3. Built and tested locally; Step 5 writes it to S3.*
+
 - **In:** everything the run produced.
-- **Does:** writes the run's outputs under `<run store>/<run id>/`:
-  - the source link, the report and the manifest;
-  - the three grains, as Parquet;
-  - the quarantine list and the flags.
-- A failed run stores what it has up to the stage that failed. Runs are independent: there is no "current" version and no rebuild. **Proposed.**
-- **Reproducible:** the stored hashes, plus the source PDF, re-run the same extraction.
-- **Out:** a run directory the viewer reads directly from S3. Round 1 uses no Athena and no Glue.
-- **Fail:** `STORE_FAILED`.
+- **Does:** writes `runs/<run_id>/`:
+  - `run.json` and `source.json` (source path and SHA-256);
+  - `report.md` and `prep_manifest.csv`;
+  - the three grains as Parquet;
+  - `quarantine.jsonl`, `findings.jsonl`, `unknown_models.jsonl`, `review.jsonl` and `notices.jsonl`;
+  - the scenario-variance, identity and gas logs.
+- **Each file is written atomically.** On S3, every object is written first and `run.json` last.
+- **A failed run stores what it has.** Runs are independent: there is no "current" version and no rebuild.
+- **`run_id`:** `YYYYMMDDTHHMMSSZ-<8 hex>`.
+- **Reproducible:** two runs on the same input give byte-identical stores, apart from the run id, timestamps and durations. The prompt, contract, clarification and asset hashes are recorded.
+- **Data assets** sit outside the code repository: the alias evidence, the seed alias list, the catalogue snapshot and the field inventory. Each is checked against its SHA-256 at load; a mismatch is `ASSET_INVALID`.
+- **Location, proposed:** `s3://roam-ds-assets/esp-design-extraction/runs/<run_id>/` for runs, and `…/assets/` for the assets.
+- **Fail:** `STORE_FAILED`, naming the file it failed at.
 
 ### Record (Lambda)
 
-Moves the run record to `succeeded` or `failed`. It carries:
-- the family, the source link and the page references;
-- rows per grain and the quarantine count;
-- warnings and unknown-model flags;
-- the error code and message;
-- the hashes;
-- token counts and the duration of each stage.
+*Rewritten at the close of Step 3. This is the shape Step 5 writes to DynamoDB.*
+
+- **Status:** `running` (written first, with a `deadline_at`; the default budget is 900 s) → `succeeded` | `failed`. A `running` record past its deadline reads as failed and stale, which covers a Lambda killed by its timeout.
+- **`run.json` carries:**
+  - the mode (PDF or report), family, organisation and well;
+  - the source hashes and page references;
+  - rows per grain and the quarantine count;
+  - findings by round-1 and by specification severity;
+  - `spec_validation_status` and `blocks_publish`;
+  - review counts and unknown models;
+  - the error (code, stage, message);
+  - the model settings, stop reason, time to first token and model time;
+  - tokens and `cost_usd`;
+  - the hashes;
+  - the duration of each stage, and the start and end times;
+  - the store's file list.
+- **The run's status and the document's status are separate.** A run succeeds when the pipeline worked; `spec_validation_status` describes the document.
 
 ### Viewer (app)
 
@@ -149,11 +192,12 @@ Everything is in **roam-ai datascience (640168431387)**, region **us-east-1**. T
 
 | Resource | Status |
 |---|---|
-| `universal_catalog` in `tapered_ideal_v2` (719 rows) | exists; **read only** |
+| `universal_catalog` in `tapered_ideal_v2` (719 rows) | exists; **read only**. The pipeline reads a hashed snapshot of it, not Athena |
 | `roam_prd_ddb.default.esp_well_configuration_v2` | exists; the source for the well-list snapshot |
 | Bedrock inference profile `us.anthropic.claude-opus-5-5` | invokable; confirmed |
 | Bedrock inference profile `global.anthropic.claude-opus-5-5` | denied by organization policy |
-| `<intake prefix>`, `<run store prefix>` | new; Step 3 |
+| Run store and assets: `s3://roam-ds-assets/esp-design-extraction/runs/` and `…/assets/` | proposed in Step 3; written from Step 5 |
+| `<intake prefix>` | new; Step 5 |
 | Lambda `<extraction lambda>` and its execution role | new; Step 5 |
 | DynamoDB `<run table>` | new, or the product's run-log shape if one fits; Step 5 |
 | CloudWatch log group | created with the Lambda |
@@ -197,10 +241,17 @@ There is **no push notification**: no SNS, no email, no alerting. A failure is v
 | `MODEL_TIMEOUT` · `MODEL_TRUNCATED` · `MODEL_ERROR` | Extract | No complete report | Re-upload; DS if it repeats |
 | `REPORT_INVALID` · `LOAD_HALTED` | Validate and stage | Off-contract, or the identity halt | DS |
 | `STORE_FAILED` | Store | Outputs not written | DS |
+| `FAMILY_MISMATCH` | Validate and stage | The report's family disagrees with *Detect* | DS |
+| `ASSET_INVALID` | Extract (prompt assembly), Validate and stage | A data asset is missing, or its hash doesn't match | DS |
 
 **The one failure the Lambda can't report itself** is being killed at 15 minutes. **Proposed:** at start, the Lambda writes the record as `running` with a deadline. The viewer shows a `running` record past its deadline as **timed out**, and CloudWatch carries the platform's timeout line.
 
 **Bedrock reliability, observed in Step 2.** At high effort, calls were repeatedly refused, or their streams dropped with no error recorded by Bedrock. The no-retry policy surfaced every one as `MODEL_ERROR` or `MODEL_TIMEOUT`.
+
+**Built in Step 3:**
+- The `running`-with-deadline record above exists: past its deadline, a `running` record reads as stale.
+- A failure forced at each of seven points (*Detect*, *Prep*, *Extract*, an invalid report, an identity halt, *Store*, *Record*) stores what it has, with the right code.
+- Validation findings below `REPORT_INVALID` and `LOAD_HALTED` never fail a run.
 
 ## 5. Round 1 decisions
 
@@ -226,9 +277,20 @@ There is **no push notification**: no SNS, no email, no alerting. A failure is v
 **Settled in Step 2:**
 1. **Model:** `us.anthropic.claude-opus-5-5`, medium effort with adaptive thinking, `max_tokens` 128,000.
 2. **Contract clarifications are on by default** for three families.
-3. ***Validate and stage* gains three additions:** model-name normalization, a required-field guard and a scenario-label consistency guard.
+3. ***Validate and stage* gains a required-field guard and a scenario-label consistency guard.** Step 2 also listed a model-name normalizer; Step 3 found it unnecessary (see below). The required-field guard became the validator specification's own rules.
 4. **The single Lambda stands.** The longest document's model time is under the 10-minute fallback threshold.
 5. **The well list is a snapshot in round 1.** The app writes `submitted` before upload; the Lambda writes `running`, with a deadline, at start. Runs are stored independently under their run id.
+
+**Settled in Step 3:**
+1. **The stage is the earlier batch loader's per-document transform, with its logic unchanged.** Parity is exact on the corpus, with one named deviation (the provenance column).
+2. **Alias evidence in production:** the corpus evidence, frozen as a versioned asset, plus the run's own report.
+3. **Severity:** structure fails the run; the identity halt fails it but stores the grains; everything else is a warning. The specification's severity is kept and reported, not enforced.
+4. **Validation implements every specification rule that can be checked from the report.** Each family with an accepted known issue gets a notice on every run.
+5. **Review is deterministic and non-blocking,** limited to the fields that matter. There is no model confidence score and no second model pass. Capturing reviewer verdicts is round 2.
+6. **No separate model-name normalizer;** the alias lookup resolves canonical names.
+7. **Data assets are hashed and kept outside the code repository.**
+8. **A file name containing `&` is now substituted literally** in the prompt; the earlier batch prompts had placeholder text there for two SLB documents.
+9. **Run status is separate from document status.**
 
 ## 6. Verification
 
@@ -238,7 +300,7 @@ One document per vendor family was extracted with the new path and compared with
 
 | Families | Result |
 |---|---|
-| SpyGlass (F1), ChampionX (F2), ELS (F4) | Pass. For SpyGlass, the earlier reports had been post-processed by the model-name normalizer, which is why it moves into *Validate and stage*. |
+| SpyGlass (F1), ChampionX (F2), ELS (F4) | Pass. For SpyGlass, the earlier reports had been post-processed by the model-name normalizer. Step 3 found the loader's alias lookup already resolves those names, so no separate normalizer step is needed. |
 | SLB (F3), Baker (F5), Valiant (F7) | **Known issues, accepted:** |
 
 The three known issues:
@@ -248,6 +310,15 @@ The three known issues:
 
 **Not verified in Step 2:** fields the new reports filled where the earlier ones left them empty. Step 6 checks a sample against the PDF.
 
+### Step 3: validate, stage and store
+
+- **Loader parity:** exact on all 46 corpus reports, across all ten outputs, with the one named deviation.
+- **Determinism:** two runs on the same input give identical stores, apart from ids and times.
+- **Forced failures:** seven failure points, each storing what it has, with the right code.
+- **First live end-to-end run** (an ELS document, through the command-line tool):
+  - succeeded in 240 s of model time, at USD 0.53;
+  - staged its pump string, design context and curve points;
+  - the specification status was `passed`, with 1 of 23 values flagged for review.
 ### Step 6: end to end
 
 **The test:**
@@ -314,8 +385,9 @@ same app + Lambda path (Detect → Prep → Extract → Validate and stage)
 |---|---|---|---|
 | 1 | — | This design note | done |
 | 2 | 1 | Extraction core: detection with its errors; single-document prep; Opus on Bedrock with bounds; parity on one document per family; the longest document timed | **done 2026-10-06** |
-| 3 | 1 | Validate, stage and store by code: normalizer and guards; the three grains per run; unknown-model flag; run store; run record; run locally | next |
-| 4 | 1 | Streamlit app, local: upload form and run viewer | |
+| 2.5 | — | Well-item field list and its brief, for the product's well configuration | **done 2026-10-12** |
+| 3 | 1 | Validate, stage and store by code: validation, guards and review list; the three grains per run; unknown-model flag; run store; run record; command-line run | **done 2026-10-13** |
+| 4 | 1 | Streamlit app, local: upload form and run viewer (with the read-only review list) | next |
 | 5 | 1 | Lambda deployed: S3 trigger, run log, failures logged | |
 | 6 | 1 | App hosted; end to end; both verification uploads; sample check of added fields | |
 | 7 | 1 | Runbook, round 1 | |

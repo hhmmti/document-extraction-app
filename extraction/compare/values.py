@@ -56,7 +56,7 @@ def parse_scalar(raw, column: str) -> Parsed:
 
     text = raw.strip()
     if text == "":
-        # `"oil_sg": ""` in F5 PRIEST 233H.  Neither a value nor an absence;
+        # `"oil_sg": ""` in one F5 corpus report.  Neither a value nor an absence;
         # coerced it becomes a real zero.
         return Parsed(reason="empty_string")
 
@@ -148,7 +148,7 @@ def parse_bool(raw):
 def parse_list(raw):
     """`stages_per_housing_as_printed` can be a comma-separated list.
 
-    F2's GOUDA prints `42 + 93x4 = 414` as `"42, 93, 93, 93, 93"`.  Parsing it
+    One F2 document prints `42 + 93x4 = 414` as `"42, 93, 93, 93, 93"`.  Parsing it
     as a scalar reads 42 and silently loses 372 stages.
     """
     if raw is None:

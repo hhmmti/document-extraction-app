@@ -2,3 +2,6 @@ pypdf==6.12.1
 pdfplumber==0.11.9
 boto3==1.43.108
 pytest==9.0.3
+pandas==2.2.2
+pyarrow==22.0.0
+numpy==2.5.0

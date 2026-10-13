@@ -1,3 +1,5 @@
 # The loader's value parser, copied verbatim. Columns: source SHA-256, copy SHA-256, file.
 
-921aca10c80809678a07d848f1140aabfa17140d812a475d3698166eb11ebc96  921aca10c80809678a07d848f1140aabfa17140d812a475d3698166eb11ebc96  values.py
+921aca10c80809678a07d848f1140aabfa17140d812a475d3698166eb11ebc96  fbcabf6889741d55aeaa52287053da3b14a351d066d743ec287e3a1153b539db  values.py
+# values.py: two comment lines that named a client document or well, rewritten generically
+# (copy hash refreshed). Comment only; parsing unchanged.

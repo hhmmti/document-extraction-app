@@ -23,6 +23,7 @@ import re
 from datetime import date
 from pathlib import Path, PurePosixPath
 
+from .assets_dir import asset
 from .families import MANIFEST_COLUMNS
 from .prep import PrepResult
 
@@ -73,9 +74,14 @@ RUNTIME_OVERRIDE = [
 ]
 
 
+def _path(name: str) -> Path:
+    """The inventory is data and lives in the asset directory, hash-checked; the rest sit here."""
+    return asset(name, ASSETS / "MANIFEST.txt") if name == INVENTORY else ASSETS / name
+
+
 def _asset(name: str) -> str:
     # Bytes, then decode: text mode would translate line endings.
-    return (ASSETS / name).read_bytes().decode("utf-8")
+    return _path(name).read_bytes().decode("utf-8")
 
 
 def asset_files(family: str) -> list[str]:
@@ -108,7 +114,7 @@ def clarification_block(family: str) -> str:
 
 def asset_hashes(family: str) -> dict[str, str]:
     """SHA-256 of every asset this family's prompt is built from."""
-    return {n: hashlib.sha256((ASSETS / n).read_bytes()).hexdigest() for n in asset_files(family)}
+    return {n: hashlib.sha256(_path(n).read_bytes()).hexdigest() for n in asset_files(family)}
 
 
 def _records(text: str) -> list[str]:
@@ -169,7 +175,8 @@ def well_slug(stem: str) -> str:
 
 
 def sed_replace(text: str, placeholder: str, replacement: str) -> str:
-    """sed "s|<placeholder>|<replacement>|g": `&` is the match, `\\x` is a literal x."""
+    """sed "s|<placeholder>|<replacement>|g", `\\x` a literal x, except that `&` is literal too.
+    sed reads `&` as the match, which put placeholder text into file names that contain one."""
     out, i = [], 0
     while i < len(replacement):
         c = replacement[i]
@@ -177,7 +184,7 @@ def sed_replace(text: str, placeholder: str, replacement: str) -> str:
             out.append(replacement[i + 1])
             i += 2
             continue
-        out.append(placeholder if c == "&" else c)
+        out.append(c)
         i += 1
     return text.replace(placeholder, "".join(out))
 

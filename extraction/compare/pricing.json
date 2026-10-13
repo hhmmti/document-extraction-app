@@ -9,7 +9,7 @@
       "cache_read_usd_per_1k_tokens": 0.0002,
       "cache_write_usd_per_1k_tokens": 0.005,
       "retrieved": "2026-10-05",
-      "reason": "Not retrievable. The pricing page's retrievable content lists no Claude Opus 5.5 rows (its Anthropic section showed only Claude 3.5 Sonnet), and the model card (https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-5-5.html) defers to that page. No remembered figure is used; costs show as pending until both prices are filled in from the page."
+      "reason": "prices confirmed against the AWS pricing page, us-east-1 on-demand, 2026-10-05"
     },
     "us.anthropic.claude-sonnet-5-5": {
       "input_usd_per_1k_tokens": null,

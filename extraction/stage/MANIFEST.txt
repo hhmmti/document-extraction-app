@@ -1,0 +1,80 @@
+# The batch loader's stage logic, copied, and its seed CSV; the alias evidence, built.
+# The assets are data, not code: they live in $ESP_EXTRACTION_ASSETS_DIR, outside this tree,
+# and the stage refuses either one unless its SHA-256 is the copy hash recorded here.
+# Columns: source SHA-256, copy SHA-256, file. Equal hashes: verbatim. Different: edited,
+# and every edit is listed below. stage.py is a port of part of the loader's load.py.
+
+8fb6ef20f2f553820e0321e2102510eb4c611971640c120e6c6ee3a894ec86e7  0d445a997850e4fef6c9a0791d0872b5b999e3706c1e286f5ccef86756271def  aliases.py
+08dd112d5c66387ed752dc4900dcb428fc769c37fe2be65956bfa2305b6ddaff  5c99f477ad367503e15e3690d57ed23a85bb703fd0bd8550769d97a8c2464673  schemas.py
+09353359bbe110596929bdc231d1122e61b4a6e1c4a52eb2f56be5294af6def6  e244c2fe0fb33c415c5fdc70dd23f1f91cca87f1ed6e63b22429affb02472551  reports_reader.py
+f066d066afede02fcb380a6f66c674af1d88dc766129a9b9ea2dc8fc19a191df  5c3d79c9f13e4eaa58922e457034bc8886c59de9c466837dd14aaf0ab0fad760  transform.py
+921aca10c80809678a07d848f1140aabfa17140d812a475d3698166eb11ebc96  cdd7e2f10e3575cf53dfd953175273787f1b054eef10f1fa5e834c1dec04d8de  values.py
+4c9cd8db095c58e735a385c665ffced9a42cdd3615cd596d471903340ac9da84  e61a1c94db3cd8c505477f589e726cda399416b0ac5a805833adedb57c1b4691  stage.py
+de8b90e374a5e57fc6aae5dee7ecc1c42ffb2741ded1a3bcc3d7c297a14043d2  de8b90e374a5e57fc6aae5dee7ecc1c42ffb2741ded1a3bcc3d7c297a14043d2  m2-d31-seed-aliases.csv
+-  c40a6e5ccfdb60e32a2c7d495512743b2ae061544cfe673939325ea23e56b86b  alias-evidence-v1.json
+a8f20660d1b006ef752aa3a0683c3c2e0e81621eaa259b2b4b75fb9d82605100  a8f20660d1b006ef752aa3a0683c3c2e0e81621eaa259b2b4b75fb9d82605100  universal_catalog.parquet
+
+# alias-evidence-v1.json has no source file: scripts/freeze_alias_evidence.py built it
+# from the 46 corpus reports. Rebuilding it from the same reports gives the same bytes.
+
+# Edits. Logic is unchanged; each edit is an interface or import change.
+#
+# values.py
+#   `from schemas import (` -> `from .schemas import (`
+#     The copies live in a package; the loader ran them as top-level modules.
+# transform.py
+#   `import schemas` -> `from . import schemas`; `import values as V` -> `from . import values as V`
+#     Same reason.
+# reports_reader.py
+#   `def read_report(path: Path)` + `text = path.read_text(...)` -> `def read_report(text, family_code="")`
+#     Stage takes report text, not a file. Callers read files as the loader did (utf-8, errors="replace").
+#   `path=path`, `slug=path.stem.replace("-pass-a", "")` -> `path=None`, `slug=""`
+#     No file. `slug` was read in one place, the fallback `source_document or slug`
+#     (quarantine and reconciliation rows); all 46 corpus reports carry source_document.
+#   property `family_code` (file-name prefix) -> field `family_code`, set from the caller's family
+#     The family now comes from Detect, checked against frontmatter vendor_family.
+#   `read_all(reports_dir)` removed: it read a directory; callers pass texts.
+# stage.py, from load.py
+#   Copied verbatim: FAMILY_LABEL, observation_id, _load_one, _design_context_row,
+#   _observations, _resolve_gas_cascade, the evidence pass and the per-report lines of build().
+#   `_load_one(report, well_id, ...)` -> `_load_one(report, organization_id, well_id, ...)`, and
+#   `_design_context_row(..., well_id, ...)` -> `(..., organization_id, well_id, ...)`
+#     The organisation comes from the caller.
+#   `"organization_id": None` -> `"organization_id": organization_id` (pump_config, design context)
+#     Same reason. The loader always wrote None; parity passes None.
+#   Removed from the per-report body: `staging_totals` (only load_summary.md read it);
+#   `well_id = frontmatter well_id`, `match_status = ...`, the unmatched branch and
+#   `str(well_id).strip()` -> `if well_id is not None: _load_one(...)`
+#     The well match is the caller's. None is unmatched, and, as before, gets schema-key and
+#     truncation quarantine and reconciliation rows but no load rows.
+#   One shared Quarantine and shared output lists across documents -> fresh ones per call.
+#     They were append-only during a load; nothing read them back.
+#   One AliasLookup learned over all reports -> a fresh lookup per call whose evidence_flags
+#     are the `evidence` argument. Its resolve cache was a pure memo once evidence was fixed.
+#   Not ported: library_models, write (DuckDB, Parquet, views, blocked_wells), main, report.py.
+#   `AliasLookup(SEED)`, SEED a path beside the code -> `AliasLookup(asset(SEED))`
+#     Assets resolve from $ESP_EXTRACTION_ASSETS_DIR and are hash-checked against this file.
+#
+# Step 3b-2 edits (approved design sheet, decisions 2 and 8):
+# transform.py
+#   d16_check: `columns = {k ... if k in schemas.DESIGN_CONTEXT_COLUMNS}` gains
+#   `and k != "provenance_json"`  -- flag 2. provenance_json is provenance, not data, and
+#     carries D16's own record (§5.3 step 5). The only logic change to the summer transform.
+#     Expected parity difference: 2 wells, 3 artifacts (d16_log, load_quarantine,
+#     esp_well_design_context); checked by extraction/compare/stage_parity.flag2_check.
+#   Two docstring lines that named a client document now say "one F1 corpus document" /
+#     "one F2 document". Comment only.
+# reports_reader.py, aliases.py, schemas.py, values.py
+#   One comment line each (values.py: two) that named a client document or well, rewritten
+#   generically. Comment only.
+#   reports_reader.py: a second comment line, in `_regions`, held a client report slug; found by
+#   the 3b-2 rescan (the 3b-1 scan missed slugs), rewritten generically. Comment only.
+# stage.py
+#   `asset()` delegates to extraction/assets_dir.py (shared with prompt assembly).
+#   stage() gains keyword-only `detection` and `prep`, runs the structure guards before
+#   staging (REPORT_INVALID: nothing is staged) and extraction/validate after it; the result
+#   gains findings, unknown_models, review, notices, spec_validation_status.
+#   The staging body is unchanged.
+#
+# Step 3b-3: the asset variable is renamed ESP_EXTRACTION_ASSETS_DIR (no alias for the old name);
+#   stage.py's comment follows. Comment only.

@@ -1,6 +1,11 @@
-"""Prompt assembly on a synthetic prep result. No corpus."""
+"""Prompt assembly on a synthetic prep result. No corpus. Assembly reads the field
+inventory from ESP_EXTRACTION_ASSETS_DIR; without it the assembly tests skip."""
+
+import os
 
 import pytest
+
+from extraction.assets_dir import ASSETS_ENV
 
 from extraction.assemble import assemble_prompt, fenced_body, section, well_slug
 from extraction.families import MANIFEST_COLUMNS
@@ -14,6 +19,9 @@ def row(page, sliced, included, notes=""):
     ]))
 
 
+needs_assets = pytest.mark.skipif(not os.environ.get(ASSETS_ENV),
+                                  reason=f"assembly reads the field inventory; set {ASSETS_ENV}")
+
 PREP = PrepResult(
     kept_pages=[1, 3],
     page_text={1: "alpha\nbeta", 3: "gamma\n"},
@@ -21,6 +29,7 @@ PREP = PrepResult(
 )
 
 
+@needs_assets
 def test_assembly_order_markers_and_shell_effects():
     p = assemble_prompt("F2", PREP, "uploads/Test Doc & Co.PDF", extraction_date="2026-01-02")
     banners = [
@@ -35,11 +44,11 @@ def test_assembly_order_markers_and_shell_effects():
     ]
     at = [p.index(b) for b in banners]
     assert at == sorted(at)
-    # well_id None renders as the runners sent it; the date lands; sed's `&` expands.
+    # well_id None renders as the runners sent it; the date lands; `&` in a file name stays `&`.
     assert "Pre-matched well_id: null   ·   match status: unmatched" in p
     assert "2026-01-02" in p
-    assert "Test Doc {{source_document}} Co.pdf" in p
-    assert "Test Doc {{source_stem}} Co" in p
+    assert "Test Doc & Co.pdf" in p and "Test Doc & Co" in p
+    assert "{{source_document}}" not in p and "{{source_stem}}" not in p
     # Manifest: DictWriter serialisation, then the echo's blank line.
     header = ",".join(MANIFEST_COLUMNS)
     assert (f"# ===== PAGE MANIFEST for this document =====\n{header}\n"
@@ -53,11 +62,13 @@ def test_assembly_order_markers_and_shell_effects():
     )
 
 
+@needs_assets
 def test_given_well_id_is_exact():
     p = assemble_prompt("F2", PREP, "x.pdf", well_id="W-1", extraction_date="2026-01-02")
     assert "Pre-matched well_id: W-1   ·   match status: exact" in p
 
 
+@needs_assets
 def test_f1_has_one_schema_block_and_f5_its_contract_note():
     f1 = assemble_prompt("F1", PREP, "x.pdf")
     assert "# ===== STAGING SCHEMAS (authoritative CSV column lists) =====\n" in f1
@@ -77,6 +88,7 @@ def test_shell_helpers():
     assert well_slug("-Ab  C_d (1) é-") == "ab-cd-1"
 
 
+@needs_assets
 def test_clarifications_are_on_by_default_and_can_be_turned_off():
     for family in ("F1", "F2", "F3", "F4", "F5", "F7"):
         off = assemble_prompt(family, PREP, "x.pdf", extraction_date="2026-01-02", clarifications=False)
@@ -87,6 +99,7 @@ def test_clarifications_are_on_by_default_and_can_be_turned_off():
             assert on == off
 
 
+@needs_assets
 def test_clarification_block_sits_after_the_contract_once():
     from extraction.assemble import ASSETS, RUNNERS
     for family in ("F3", "F5", "F7"):

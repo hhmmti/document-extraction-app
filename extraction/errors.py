@@ -11,6 +11,11 @@ CODES = frozenset({
     "MODEL_TIMEOUT",           # Extract: the time budget ran out, or the socket read timed out
     "MODEL_TRUNCATED",         # Extract: stopped at max_tokens, or no row_counts footer
     "MODEL_ERROR",             # Extract: access, throttling, network or service error, or a stream that ended unfinished
+    "FAMILY_MISMATCH",         # Stage: the report's vendor_family is not the family Detect assigned
+    "ASSET_INVALID",           # Stage: an asset is missing, or its SHA-256 is not the one MANIFEST.txt records
+    "REPORT_INVALID",          # Stage: no frontmatter, a stg_* block missing, or no parseable row_counts footer
+    "LOAD_HALTED",             # Run: D17-HALT; grains, findings and review are stored, the load is halted
+    "STORE_FAILED",            # Run: a run-store write failed; the record names the file
 })
 
 

@@ -1,4 +1,6 @@
 # Prompt assets, copied verbatim. Columns: source SHA-256, copy SHA-256, file.
+# m1-field-inventory.csv is data, not code: it lives in $ESP_EXTRACTION_ASSETS_DIR and is read
+# only when its SHA-256 equals the copy hash below.
 
 169e8bc6b2ced903bc3518932a62dfed8d36d3e59b83a6da8d5a81a35651134a  169e8bc6b2ced903bc3518932a62dfed8d36d3e59b83a6da8d5a81a35651134a  f1-pass-a.md
 67eec6820b8ca1bf8005f07c363a3d1730dcf842c046a94003ed03f0231658b4  67eec6820b8ca1bf8005f07c363a3d1730dcf842c046a94003ed03f0231658b4  f1-spyglass.md

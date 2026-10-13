@@ -8,6 +8,7 @@ ESP_BATCH_PROMPT_DIR, the runners' saved `<stem>.prompt.txt` files.
 """
 
 import csv
+import hashlib
 import glob
 import os
 import re
@@ -159,6 +160,26 @@ LINE_18_AT = sum(len(line) + 1 for line in _validator_lines[:17]) if _validator_
 PAGE_BLOCK = re.compile(r"(----- BEGIN (p\d+) -----\n)(.*?)(----- END \2 -----\n)", re.S)
 needs_batch = pytest.mark.skipif(not BATCH, reason="prompt byte check needs ESP_BATCH_PROMPT_DIR; see README")
 
+# The one allowance: the runners substituted file names with sed, which reads `&` as
+# the matched placeholder, so the two corpus file names that contain `&` were sent with
+# placeholder text in their place. Assembly now substitutes literally. For exactly these
+# stems (keyed by the SHA-256 of the stem), the saved prompt is compared after that one
+# substitution is corrected; every other byte must still match.
+SED_AMPERSAND_ALLOWANCE = {
+    "d5580076aad110ee4c3dd4d58edbef378fcd88404f47d9581c183aea20ade0bf",
+    "0b256981f1c38669e1c2b18e5710028f95f07d8d726e149e0e5f2ced3153c32a",
+}
+
+
+def sed_ampersand_corrected(saved: str, stem: str) -> tuple[str, int]:
+    """The saved prompt with the runners' `&`-expanded file names put right, and how many were."""
+    n = 0
+    for placeholder, value in (("{{source_document}}", f"{stem}.pdf"), ("{{source_stem}}", stem)):
+        mangled = value.replace("&", placeholder)
+        n += saved.count(mangled)
+        saved = saved.replace(mangled, value)
+    return saved, n
+
 
 def _stem(name: str) -> str:
     return re.sub(r"\.[Pp][Dd][Ff]$", "", name)
@@ -261,7 +282,13 @@ def test_prompt_bytes_match_runner(name):
     out = _prep(name)
     got = assemble_prompt(_detect(name).family, out, name, extraction_date=DATE, clarifications=False)
     expected = SAVED[_stem(name)].read_bytes().decode("utf-8")
+    allowed = hashlib.sha256(_stem(name).encode("utf-8")).hexdigest() in SED_AMPERSAND_ALLOWANCE
+    if allowed:
+        expected, corrected = sed_ampersand_corrected(expected, _stem(name))
+        assert corrected, f"{_stem(name)}: under the `&` allowance but no expanded file name was found"
     counts, bad = _compare(name, _detect(name).family, expected, got)
+    if allowed:
+        counts["sed_ampersand"] += corrected
     pages = len(out.kept_pages)
     print(f"{_stem(name)} | {_detect(name).family} | {len(got.replace(DATE, '0000-00-00').encode())} bytes"
           f" | {pages} pages | " + " ".join(f"{k}={v}" for k, v in sorted(counts.items()))

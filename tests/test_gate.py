@@ -2,13 +2,20 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from extraction.assets_dir import ASSETS_ENV
 from extraction.bedrock import ExtractResult
 from extraction.compare.gate import read_worksheet, recheck, selected
 from extraction.compare.parity import stg_blocks
 from test_unit import F4_P1, F4_P2, make_pdf
+
+# A run assembles a prompt, which reads the field inventory from the asset directory.
+needs_assets = pytest.mark.skipif(not os.environ.get(ASSETS_ENV), reason=f"a run assembles a prompt; set {ASSETS_ENV}")
 
 LAB = Path(__file__).resolve().parents[1]
 
@@ -79,6 +86,7 @@ def test_matches_old_compares_the_whole_value():
     assert recheck(trap, blocks(stg_design_context=[CTX[0] | {"scenario_label_staged": "Case #1"}]))[1] == "matches_medium"
 
 
+@needs_assets
 def test_effort_flag_reaches_extract_and_run_json(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("parity_run", LAB / "scripts" / "parity_run.py")
     mod = importlib.util.module_from_spec(spec)
@@ -124,6 +132,7 @@ def test_conflict_review_quotes_reasons_and_alias_strings():
     assert rows[0]["verdict"] == rows[0]["note"] == ""
 
 
+@needs_assets
 def test_clarifications_flag_is_recorded_with_draft_hashes(tmp_path, monkeypatch):
     import hashlib
     spec = importlib.util.spec_from_file_location("parity_run", LAB / "scripts" / "parity_run.py")
