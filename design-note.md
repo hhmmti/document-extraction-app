@@ -1,7 +1,7 @@
 # Design-document extraction app — design note
 
 **Task:** B1, make design-document extraction a pipeline rather than a one-off. GitHub issue `roam-datascience-esp #98`.
-**Status:** approved by Keith; restructured into two rounds on 2026-10-05; updated at the close of Step 2 (2026-10-06) and Step 3 (2026-10-13). Owner: Hamed.
+**Status:** approved by Keith; restructured into two rounds on 2026-10-05; updated at the close of Step 2 (2026-10-06), Step 3 (2026-10-13) and Step 4 (2026-10-13). Owner: Hamed.
 
 A design document from a known vendor template is uploaded through a Streamlit app. Template detection runs first, then Opus on Bedrock extracts the numbers. The run is logged and every failure is reported. B1 is built in two rounds, and is done when round 2 is done:
 
@@ -28,17 +28,35 @@ Streamlit app ──► S3 intake ──(object-created)──► one Lambda ─
 
 There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract → Validate and stage → Store → Record*. The viewer reads the run record and the run store. Nothing writes to `tapered_ideal_v2`.
 
+**In Step 4 the app runs locally.** The shape is the same, with a detached local process in place of the S3 trigger and the Lambda, and a local folder in place of S3. Step 5 swaps those two parts.
+
 ## 2. Stages — inputs, outputs, failure
 
 ### Intake (app)
 
-- **In:** organisation and an existing well, chosen from dropdowns, plus the PDF.
-- **Does:** writes the DynamoDB run record with status `submitted`. Then it writes the PDF to `<intake prefix>`, with the run's metadata: organisation, Roam well id, uploader. Because the record is written first, a trigger that never fires shows up as a run stuck in `submitted`, not as nothing. **Proposed.**
-- **Out:** the S3 object; the run record in `submitted`.
-- **Dropdown source:** `roam_prd_ddb.default.esp_well_configuration_v2`.
-  - *Confirmed* readable from datascience (174 rows).
-  - **Not yet confirmed:** that it carries an organisation column and the canonical Roam well id.
-  - **Proposed for round 1:** the app reads a snapshot of that well list, exported once into its configuration, so the app role needs no cross-account read. Round 2 replaces the snapshot with a live read.
+*Rewritten at the close of Step 4, 2026-10-13. Built and run locally; Step 5 moves it onto S3 and the Lambda.*
+
+- **In:** an organisation and an existing well, chosen from dropdowns, plus the PDF.
+- **The well list** is a snapshot of the product's well configuration (`roam_prd_ddb.default.esp_well_configuration_v2`), production only. It is exported unedited from Athena and read from a file outside the code tree (`ESP_WELL_LIST_PATH`).
+  - **Columns:** `organization_id` and `well_id`. *Confirmed* in production and dev; `well_id` is human-readable, so the dropdown shows it as is.
+  - **Values are kept exactly as exported.** Nothing is stripped, case-folded, or has its spaces collapsed; only exact duplicate rows are dropped.
+  - **Organisations that differ only by case** are listed separately, with a hint naming the variant, so a document isn't filed under the wrong spelling.
+  - **Freshness:** the form shows the file's modification time, hash and row count. Refresh is manual in round 1.
+- **The form** asks for the organisation, then a well filtered by it, then the PDF.
+  - A file that is empty, or doesn't start with `%PDF-`, is refused before any launch.
+  - A cost line and a confirm box gate the submit button.
+  - A warning shows when the same PDF, organisation and well already has a live run.
+- **What it does, locally:**
+  1. **Copies the PDF** into the store as `intake/<sha256>.pdf`, atomically. An existing copy is hash-checked and reused; a mismatching one is refused. No path is ever built from an organisation or well id.
+  2. **Launches the command-line run as a detached process.** The app generates the run id. The process gets an argument list in `--flag=value` form with no shell, including `--run-id` and `--source-name` (the uploaded file's name). Its output goes to `launch/<run_id>.log`.
+  3. **Watches the run:**
+     - it shows *starting* until the run record appears, then the run's status and elapsed time against its deadline, then the detail page once the run is final;
+     - a launch is *failed* when the process exits with no record;
+     - a live process with no record after 120 s shows *no record yet, still running*;
+     - after an app restart, when the process can no longer be seen, a launch with no record after 120 s is failed.
+- **For Step 5:**
+  - The hosted app writes the PDF to `<intake prefix>`, and the S3 trigger replaces the local process.
+  - A run record written as `submitted` before the upload remains **proposed**. Locally, the run writes `running` first, and the launch log covers the gap.
 
 ### Detect (Lambda, deterministic)
 
@@ -55,6 +73,7 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
   - Every corpus document in the six supported families detects as its family, the SpyGlass documents without the dropped marker included.
   - The XSize document raises `IMAGE_ONLY`.
   - A procedure document raises `UNKNOWN_TEMPLATE`.
+- **Found in Step 4:** the signatures match the generator versions and export paths of the corpus they were built from, and real uploads differ. See §4.
 
 ### Prep (Lambda)
 
@@ -169,7 +188,7 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
 - **Status:** `running` (written first, with a `deadline_at`; the default budget is 900 s) → `succeeded` | `failed`. A `running` record past its deadline reads as failed and stale, which covers a Lambda killed by its timeout.
 - **`run.json` carries:**
   - the mode (PDF or report), family, organisation and well;
-  - the source hashes and page references;
+  - the source hashes, the uploaded file name (`source_name`, added in Step 4) and the page references;
   - rows per grain and the quarantine count;
   - findings by round-1 and by specification severity;
   - `spec_validation_status` and `blocks_publish`;
@@ -181,10 +200,33 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
   - the duration of each stage, and the start and end times;
   - the store's file list.
 - **The run's status and the document's status are separate.** A run succeeds when the pipeline worked; `spec_validation_status` describes the document.
+- **Added in Step 4:**
+  - **`source_name`** sits in the record's source block and in `source.json`. It is the name passed with `--source-name`, otherwise the PDF's file name. Prep and prompt assembly read the same value, so the name recorded is the name sent. Older records without it still render.
+  - **`--run-id`** lets the caller set the id. An existing run folder is refused before any AWS call.
 
 ### Viewer (app)
 
-Lists runs. For each one it shows the record, opens the source PDF, and shows the extracted numbers per grain, with page references and flags. Read only in round 1.
+*Rewritten at the close of Step 4, 2026-10-13.* Read only in round 1. It sits on a storage layer with a local backend; Step 5 adds an S3 backend behind the same interface.
+
+- **Run list:**
+  - every run, newest first, filterable by organisation, well and status;
+  - the run's status and the document's `spec_validation_status`, shown separately with plain-language labels. Stale runs are computed at read time;
+  - the latest succeeded run per organisation and well, marked. Runs with no well are never marked;
+  - launches that never wrote a record, listed as such.
+- **Run detail:**
+  - the record summary, including the uploaded file name;
+  - **the source PDF, found by SHA-256 only:** the intake copy first, then an optional list of local folders (`ESP_SOURCE_PDF_DIRS`). Paths recorded in the run are shown as text and never opened. Pages are rendered as images with `pypdfium2`, because Streamlit's PDF element cannot open at a given page;
+  - the three grains with their page references; each reference jumps the PDF pane to that page (the first page, for a multi-page reference);
+  - findings with severity. **Findings carry no page,** so the page comes from the staging row they name, read from the stored report;
+  - notices, unknown models with their level, and the review list with its reasons;
+  - the prep manifest and the logs;
+  - the report as plain text, so that its internal link markup never renders as links.
+- **A missing or malformed file** shows a notice in its own panel, and the rest of the run renders.
+- **Charts: head against flow per curve,** from the curve observations.
+  - A chart's curve identity is the staging identity without frequency: one series per frequency, with markers by point type and the page reference on hover.
+  - Whole-string, per-section and unstated rows are drawn apart.
+  - A curve with no drawable point is listed with the reason.
+  - **No catalogue overlay.** The catalogue stores head only as unlabelled fifth-order coefficients, at 60 Hz and per stage, with no documented form. Nothing is fitted, scaled or interpolated.
 
 ## 3. Account and resources
 
@@ -193,7 +235,7 @@ Everything is in **roam-ai datascience (640168431387)**, region **us-east-1**. T
 | Resource | Status |
 |---|---|
 | `universal_catalog` in `tapered_ideal_v2` (719 rows) | exists; **read only**. The pipeline reads a hashed snapshot of it, not Athena |
-| `roam_prd_ddb.default.esp_well_configuration_v2` | exists; the source for the well-list snapshot |
+| `roam_prd_ddb.default.esp_well_configuration_v2` | exists; the source for the well-list snapshot, with `organization_id` and `well_id` confirmed |
 | Bedrock inference profile `us.anthropic.claude-opus-5-5` | invokable; confirmed |
 | Bedrock inference profile `global.anthropic.claude-opus-5-5` | denied by organization policy |
 | Run store and assets: `s3://roam-ds-assets/esp-design-extraction/runs/` and `…/assets/` | proposed in Step 3; written from Step 5 |
@@ -223,7 +265,12 @@ Everything is in **roam-ai datascience (640168431387)**, region **us-east-1**. T
   - read the run store and the run table.
   - With the snapshot, it needs no cross-account grant.
 
-**Packaging:** a zip or a container image, decided in Step 5. The PDF stack (`pdfplumber`, `pypdf`) is pure Python. No page renderer is needed.
+**Packaging:** a zip or a container image, decided in Step 5. The PDF stack (`pdfplumber`, `pypdf`) is pure Python. The Lambda needs no page renderer.
+
+**At the close of Step 4:**
+- **The app runs locally,** against a local store, and makes no AWS call itself. Its dependencies are `streamlit` 1.65.0, `plotly` 7.1.0 and `pypdfium2` 5.14.0.
+- **The app, unlike the Lambda, needs a page renderer** (`pypdfium2`), so Step 6's hosting image must carry it.
+- **The app loads its fonts from Google Fonts at runtime,** with a plain fallback offline. Step 6 decides whether hosting allows that, or whether the fonts are bundled.
 
 ## 4. Where errors are reported
 
@@ -234,7 +281,7 @@ There is **no push notification**: no SNS, no email, no alerting. A failure is v
 | Code | Stage | Meaning | Action |
 |---|---|---|---|
 | `IMAGE_ONLY` | Detect | No text layer (includes XSize) | Can't be extracted; manual entry in round 2 |
-| `UNKNOWN_TEMPLATE` | Detect | No family signature matched | A new template is follow-on work |
+| `UNKNOWN_TEMPLATE` | Detect | No family signature matched | A new template is follow-on work (but see below) |
 | `AMBIGUOUS_TEMPLATE` | Detect | More than one matched | DS fixes the signatures |
 | `REQUIRED_PAGES_MISSING` | Detect | Known family, spine incomplete | Check the document |
 | `PREP_FAILED` | Detect, Prep | Unreadable PDF, unmapped glyphs, or a kept page with no text | DS |
@@ -252,6 +299,14 @@ There is **no push notification**: no SNS, no email, no alerting. A failure is v
 - The `running`-with-deadline record above exists: past its deadline, a `running` record reads as stale.
 - A failure forced at each of seven points (*Detect*, *Prep*, *Extract*, an invalid report, an identity halt, *Store*, *Record*) stores what it has, with the right code.
 - Validation findings below `REPORT_INVALID` and `LOAD_HALTED` never fail a run.
+
+**At the close of Step 4:**
+- **The local app adds one state of its own: launch failed,** when the process exits without writing a record. The viewer shows the last lines of the launch log. In Step 5, the Lambda's record and CloudWatch take its place.
+- **Seen in the app:** `IMAGE_ONLY` on an XSize document, and `UNKNOWN_TEMPLATE` on two real design documents from the product's upload bucket. Both stopped before any model call, at no cost.
+- **`UNKNOWN_TEMPLATE` covers more than new templates.**
+  - One of the two was a newer generator version of the ChampionX template: its page-1 representative line changed, and the vendor name appears only in the logo.
+  - The other was the second half of an SLB report, re-saved through Word, with no schematics page. It should fail as `REQUIRED_PAGES_MISSING`.
+  - Neither is changed in Step 4. How widely the product's uploads differ from the corpus is measured before any signature is changed (§6).
 
 ## 5. Round 1 decisions
 
@@ -292,6 +347,14 @@ There is **no push notification**: no SNS, no email, no alerting. A failure is v
 8. **A file name containing `&` is now substituted literally** in the prompt; the earlier batch prompts had placeholder text there for two SLB documents.
 9. **Run status is separate from document status.**
 
+**Settled in Step 4:**
+1. **The well list is a production-only snapshot,** with values kept exactly as exported.
+2. **Local intake launches the command-line run as a detached process and watches the run store.** This is Step 5's shape, with the process in place of the Lambda.
+3. **The viewer finds the source PDF by hash,** never by a recorded path.
+4. **The document's status is shown apart from the run's status,** in plain language.
+5. **Charts show extracted points only:** no catalogue overlay, and no fitting or scaling.
+6. **Every run is kept and listed;** the latest succeeded run per well is marked.
+
 ## 6. Verification
 
 ### Step 2: parity with the earlier batch extraction
@@ -319,6 +382,21 @@ The three known issues:
   - succeeded in 240 s of model time, at USD 0.53;
   - staged its pump string, design context and curve points;
   - the specification status was `passed`, with 1 of 23 values flagged for review.
+
+### Step 4: the local app
+
+Checked by Hamed in the app:
+- **The form, on the real well-list snapshot:** every row loaded; organisations that differ only by case carry the hint; an id containing two consecutive spaces is kept exactly; submit stays locked until the cost box is ticked.
+- **Failure uploads:**
+  - an XSize document, filed under the test organisation, showed `IMAGE_ONLY`;
+  - two design documents from the product's upload bucket showed `UNKNOWN_TEMPLATE` (§4).
+  - Each run's error code, stage and message showed in the viewer.
+- **A live upload:** an ELS document from the corpus, under its real organisation and well.
+  - It succeeded. The viewer showed the run as it progressed, then its numbers, page references, review list and unknown models.
+  - It staged 7 curve observations, against 6 in Step 2's run of the same document. The extra row came from a chart title and carries no point type and no value, so the model's output on one document can vary between runs.
+  - Its document status was `failed` under the validator specification. Under the round-1 severity rule this is a review signal, not a run failure.
+- **Tests:** the viewer and intake suites pass with synthetic runs and wells only; the process launch is stubbed in every test; the earlier suites are unchanged. No client identifier is added to the tracked tree.
+
 ### Step 6: end to end
 
 **The test:**
@@ -326,11 +404,12 @@ The three known issues:
 - Upload an unrecognised or image-only document; the reported error shows.
 
 **The documents:**
-- **Chord's design documents** exist for the whole organisation. They were uploaded through the ESP app's UI to an S3 location not yet identified.
-- **Chord is live,** so its wells should be in the dropdown.
-- **Once the documents are located,** *Detect* runs over them on its own. It is deterministic and makes no model calls.
+- **Chord's design documents** were located in the product's upload bucket, one design PDF per well.
+- **Chord is live,** so its wells are in the dropdown. The wells of the original corpus are in the snapshot too.
+- The one tried in Step 4 failed detection as a partial document, so it is not yet known which of them serve the known-template test.
+- **Proposed before Step 6:** run *Detect* alone over every design PDF in the product's upload bucket. It is deterministic and makes no model calls. It counts the documents by family, near miss, generator and page count.
   - Documents that match a known family serve the known-template test.
-  - The rest serve the unrecognised-template test.
+  - The rest size the work on new template versions, and serve the unrecognised-template test.
 
 ---
 
@@ -376,6 +455,7 @@ same app + Lambda path (Detect → Prep → Extract → Validate and stage)
 4. **Monorepo.** Does round 2 include the move into the ESP monorepo?
 5. **Compute.** Which account runs round 2's Lambda?
 6. **B2.** How does round 2 divide with B2, the well-to-pump linking task?
+7. **Duplicate wells.** The product's well list holds organisations that differ only by case, and wells that differ only by case or spacing. Which record a round-2 write goes to is decided with the list's owner.
 
 ---
 
@@ -387,8 +467,8 @@ same app + Lambda path (Detect → Prep → Extract → Validate and stage)
 | 2 | 1 | Extraction core: detection with its errors; single-document prep; Opus on Bedrock with bounds; parity on one document per family; the longest document timed | **done 2026-10-06** |
 | 2.5 | — | Well-item field list and its brief, for the product's well configuration | **done 2026-10-12** |
 | 3 | 1 | Validate, stage and store by code: validation, guards and review list; the three grains per run; unknown-model flag; run store; run record; command-line run | **done 2026-10-13** |
-| 4 | 1 | Streamlit app, local: upload form and run viewer (with the read-only review list) | next |
-| 5 | 1 | Lambda deployed: S3 trigger, run log, failures logged | |
+| 4 | 1 | Streamlit app, local: upload form with the well-list snapshot; detached run and live watch; run viewer with page-linked PDF, read-only review list and curve charts | **done 2026-10-13** |
+| 5 | 1 | Lambda deployed: S3 trigger, run log, failures logged | next |
 | 6 | 1 | App hosted; end to end; both verification uploads; sample check of added fields | |
 | 7 | 1 | Runbook, round 1 | |
 | 8 | 2 | Round-2 design: the questions in §9 answered, added to this note | |

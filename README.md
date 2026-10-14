@@ -141,7 +141,7 @@ AWS_PROFILE=roam-ai .venv/bin/python -m extraction --pdf <pdf> --org <id> --well
 .venv/bin/python -m extraction --report <report.md> [--pdf <pdf>] --org <id> --no-well     # no model call
 ```
 
-`--pdf` alone runs Detect, Prep, Extract (after checking the credentials are the datascience account's), Validate and stage, Store and Record. `--report` reuses a report and calls no model; with `--pdf` as well, Detect and Prep run and grounding is evaluated, and without it the checks that need them are not evaluated and the notices say so. `--well <id>` or `--no-well` (an unmatched well: no load rows, no key minted) is required. Options: `--budget-s` (default 900), `--model-id`, `--effort`, `--max-tokens` (default 128000), `--no-clarifications`. The tool prints one line, starting with the `run_id`; it exits 0 when the run succeeded, 1 when it failed (its `run.json` says why) and 2 when it could not start.
+`--pdf` alone runs Detect, Prep, Extract (after checking the credentials are the datascience account's), Validate and stage, Store and Record. `--report` reuses a report and calls no model; with `--pdf` as well, Detect and Prep run and grounding is evaluated, and without it the checks that need them are not evaluated and the notices say so. `--well <id>` or `--no-well` (an unmatched well: no load rows, no key minted) is required. Options: `--budget-s` (default 900), `--model-id`, `--effort`, `--max-tokens` (default 128000), `--no-clarifications`, `--run-id <id>` (use this id, in the tool's own format; refused if `runs/<id>/` exists) and `--source-name <name>` (with `--pdf`: the file name prep records and the prompt names, in place of the PDF path's basename). The tool prints one line, starting with the `run_id`; it exits 0 when the run succeeded, 1 when it failed (its `run.json` says why) and 2 when it could not start.
 
 A run lives in `$ESP_RUN_STORE_DIR/runs/<run_id>/`, where `run_id` is `YYYYMMDDTHHMMSSZ-<8 hex>` (the UTC start second, then random hex: sortable and unique). It holds `run.json`, `source.json` (path and SHA-256 of the PDF and of the report), `report.md`, `prep_manifest.csv`, the three grains as Parquet (`pump_config`, `esp_well_design_context`, `curve_observations`), `quarantine.jsonl`, `findings.jsonl`, `unknown_models.jsonl`, `review.jsonl`, `notices.jsonl`, `d16_log.jsonl`, `d17_log.jsonl` and `gas_log.jsonl`. Every file is written to a temporary name and renamed into place, and each is written as soon as it exists, so a failed run keeps what it produced. The layout is meant to map one to one onto an S3 prefix later; nothing is written to S3 now.
 
@@ -149,7 +149,7 @@ A run lives in `$ESP_RUN_STORE_DIR/runs/<run_id>/`, where `run_id` is `YYYYMMDDT
 
 - `run_id`, `status`, `started_at`, `deadline_at`, `ended_at`, `budget_s`, `mode` (`pdf` or `report`)
 - `organization_id`, `well_id`, `family`, `family_source` (`detect` or `report_frontmatter`)
-- `source` (`pdf` and `report`, each `path` and `sha256`, or null); `pages` (`page_count`, `kept_pages`, and each page's Detect roles)
+- `source` (`pdf` and `report`, each `path` and `sha256`, or null; `source_name`, the PDF's file name as uploaded: `--source-name`, else the PDF's basename, null without a PDF; `source.json` holds the same block); `pages` (`page_count`, `kept_pages`, and each page's Detect roles)
 - `rows` per grain; `quarantine` (count); `findings` (`total`, `by_round1_severity`, `by_spec_severity`; `none` for guards); `spec_validation_status`; `blocks_publish`; `review` (`items`, `needs_review`, `informational`); `unknown_models`
 - `error` (`code`, `message`, `details`, `stage`) or null. `status` is the run's own outcome; the document's validation verdict is `spec_validation_status`
 - `model` (`model_id`, `effort`, `max_tokens`, `clarifications`, `stop_reason`, `model_time_s`, `time_to_first_token_s`) and `tokens` (`input`, `output`) and `cost_usd` (from `extraction/compare/pricing.json`), all null without a model call
@@ -158,3 +158,16 @@ A run lives in `$ESP_RUN_STORE_DIR/runs/<run_id>/`, where `run_id` is `YYYYMMDDT
 
 Failure codes are the extraction codes plus `REPORT_INVALID` (the report and its structure findings are stored), `LOAD_HALTED` (D17-HALT: grains, findings and review are stored; the load is halted) and `STORE_FAILED` (`store.failed_at` and `error.details.failed_at` name the file the run could not write). If even the last `run.json` cannot be written, the `running` record stays and reads as stale once its deadline passes.
 
+## Run the viewer
+
+`app/main.py` is a read-only Streamlit viewer over the run store: every run, newest first and filterable, and each run in full (both statuses, the error, the source PDF page by page, the grains, curves, findings, review list, notices, unknown models, logs, and the report as plain text). Start it from this folder, so that `.streamlit/config.toml` applies:
+
+```bash
+export ESP_RUN_STORE_DIR="<run store dir>"
+export ESP_SOURCE_PDF_DIRS="<pdf dir>[:<pdf dir>]"   # optional: folders searched for source PDFs
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/streamlit run app/main.py
+```
+
+**New run from a PDF** starts a run from the viewer. It needs `ESP_WELL_LIST_PATH`, the well list exported from Athena as CSV (`organization_id`, `well_id`), plus the variables a run needs (`ESP_EXTRACTION_ASSETS_DIR`, and AWS credentials for the datascience account). The form copies the PDF to `intake/<sha256>.pdf` in the store, launches `python -m extraction --pdf … --run-id … --source-name …` as a detached process with its output in `launch/<run_id>.log`, and follows the run until its record is final. The app makes no AWS call itself.
+
+The source PDF is found by its SHA-256 only: `intake/<sha256>.pdf` under the store root, then the PDFs under `ESP_SOURCE_PDF_DIRS`. The path recorded in `run.json` and `source.json` is shown as text and never opened. Storage sits behind `app/store.py` (`RunStore`; `LocalRunStore` reads a directory). Tests: `tests/test_viewer.py` and `tests/test_intake.py`; `pytest -m store` renders every run in `ESP_RUN_STORE_DIR`. `tools/check_client_names.py <well list CSV> [changed files]` reports where the list's ids appear in this tree, by file and line only.

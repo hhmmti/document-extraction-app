@@ -1,0 +1,26 @@
+# The run viewer (app/main.py).  Streamlit reads this from the directory it is started in:
+# start it from the repository root.
+
+[server]
+address = "localhost"          # runs hold client data: not served to the network
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+base = "light"
+primaryColor = "#1D4F7A"                 # Prussian blue: selection, focus, links
+backgroundColor = "#F6F7F4"              # drafting paper
+secondaryBackgroundColor = "#E8ECE8"     # drafting film: widgets, code
+textColor = "#1F2A2E"                    # slate ink
+borderColor = "#CDD4CF"
+dataframeHeaderBackgroundColor = "#E8ECE8"
+font = "Barlow:https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&display=swap, sans-serif"
+headingFont = "Barlow Semi Condensed:https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600&display=swap, sans-serif"
+codeFont = "IBM Plex Mono:https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap, monospace"
+baseRadius = "small"
+metricValueFontSize = "1.15rem"
+chartCategoricalColors = ["#2a78d6", "#eb6834", "#1baf7a"]

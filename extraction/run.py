@@ -19,6 +19,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import time
 from collections import Counter
@@ -54,6 +55,9 @@ def utc(t: datetime) -> str:
 def new_run_id(now: datetime) -> str:
     """Sortable and unique: the UTC start second, then 8 random hex digits."""
     return f"{now.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(4)}"
+
+
+RUN_ID = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}")     # what new_run_id makes; a given run id must match
 
 
 def sha256(data: bytes) -> str:
@@ -133,19 +137,26 @@ def _summary(result) -> dict:
 
 def run(*, organization_id, well_id, pdf: Path | None = None, report: Path | None = None,
         store_root: Path, budget_s: float = BUDGET_S, model_id: str = MODEL_ID, effort: str = EFFORT,
-        max_tokens: int = MAX_TOKENS, clarifications: bool = True, client=None) -> dict:
-    """Run one document and return its final run record.  With `report`, no model is called."""
+        max_tokens: int = MAX_TOKENS, clarifications: bool = True, client=None,
+        run_id: str | None = None, source_name: str | None = None) -> dict:
+    """Run one document and return its final run record.  With `report`, no model is called.
+
+    `run_id` replaces the generated id.  `source_name` is the file name that prep records and
+    the prompt names, in place of the PDF path's basename; the record keeps it as `source.source_name`.
+    """
     if pdf is None and report is None:
         raise ValueError("a run needs a PDF, a report, or both")
+    if run_id is not None and not RUN_ID.fullmatch(run_id):
+        raise ValueError(f"not a run id: {run_id!r}")
     started = datetime.now(timezone.utc).replace(microsecond=0)
     t0 = time.monotonic()
     deadline = started + timedelta(seconds=budget_s)
     record = {
-        "run_id": new_run_id(started), "status": "running", "started_at": utc(started),
+        "run_id": run_id or new_run_id(started), "status": "running", "started_at": utc(started),
         "deadline_at": utc(deadline), "ended_at": None, "budget_s": budget_s,
         "mode": "report" if report else "pdf", "organization_id": organization_id, "well_id": well_id,
         "family": None, "family_source": None,
-        "source": {"pdf": None, "report": None}, "pages": None,
+        "source": {"pdf": None, "report": None, "source_name": None}, "pages": None,
         "rows": None, "quarantine": None, "findings": None, "spec_validation_status": None,
         "blocks_publish": None, "review": None, "unknown_models": None,
         "error": None, "model": None,
@@ -177,19 +188,20 @@ def run(*, organization_id, well_id, pdf: Path | None = None, report: Path | Non
         for kind, path, data in (("pdf", pdf, pdf_bytes), ("report", report, report_text and Path(report).read_bytes())):
             if path:
                 record["source"][kind] = {"path": str(Path(path).resolve()), "sha256": sha256(data)}
+        record["source"]["source_name"] = source_name or (Path(pdf).name if pdf else None)
         store.write("source.json", (json.dumps(record["source"], indent=1, sort_keys=True) + "\n").encode())
 
         detection = prepared = None
         if pdf:
             detection = timed("detect", detect, pdf_bytes)
             record["family"], record["family_source"] = detection.family, "detect"
-            prepared = timed("prep", prep, pdf_bytes, detection, source_file=Path(pdf).name)
+            prepared = timed("prep", prep, pdf_bytes, detection, source_file=record["source"]["source_name"])
             store.write("prep_manifest.csv", manifest_csv(prepared.manifest).encode())
             record["pages"] = {"page_count": detection.page_count, "kept_pages": prepared.kept_pages,
                                "roles": {str(p): [r for r, _, _ in v] for p, v in detection.page_roles.items() if v}}
         if report_text is None:
             family = detection.family
-            prompt = timed("assemble", assemble_prompt, family, prepared, Path(pdf).name, well_id=well_id,
+            prompt = timed("assemble", assemble_prompt, family, prepared, record["source"]["source_name"], well_id=well_id,
                            clarifications=clarifications)
             record["hashes"]["prompt_sha256"] = sha256(prompt.encode())
             record["hashes"]["contract"] = asset_hashes(family)

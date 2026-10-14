@@ -12,6 +12,10 @@ unmatched well (no load rows; no key is minted).
 The store root is $ESP_RUN_STORE_DIR, outside this folder (runs hold client data);
 assets come from $ESP_EXTRACTION_ASSETS_DIR.  Prints one summary line with the run_id.
 Exit status: 0 the run succeeded, 1 it failed (its run.json says why), 2 it did not start.
+
+--run-id <id> gives the run its id (the tool's own format), refused if runs/<id>/ exists.
+--source-name <name> is the file name prep records and the prompt names, in place of the
+PDF path's basename (with --pdf only).
 """
 
 from __future__ import annotations
@@ -23,10 +27,22 @@ from pathlib import Path
 
 from .bedrock import EFFORT, MODEL_ID, REGION
 from .errors import ExtractionError
-from .run import BUDGET_S, MAX_TOKENS, STORE_ENV, run
+from .run import BUDGET_S, MAX_TOKENS, RUN_ID, STORE_ENV, run
 
 ACCOUNT = "640168431387"
 LAB = Path(__file__).resolve().parents[1]
+
+
+def run_id_arg(value: str) -> str:
+    if not RUN_ID.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"not a run id (YYYYMMDDTHHMMSSZ-<8 hex>): {value!r}")
+    return value
+
+
+def source_name_arg(value: str) -> str:
+    if not value or Path(value).name != value or not value.isprintable():
+        raise argparse.ArgumentTypeError(f"not a plain file name: {value!r}")
+    return value
 
 
 def main(argv=None) -> int:
@@ -43,10 +59,15 @@ def main(argv=None) -> int:
     ap.add_argument("--effort", choices=("medium", "high"), default=EFFORT)
     ap.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     ap.add_argument("--clarifications", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--run-id", type=run_id_arg, help="use this run id; refused if runs/<id>/ exists")
+    ap.add_argument("--source-name", type=source_name_arg,
+                    help="the source file name to record and send, in place of the PDF path's basename")
     args = ap.parse_args(argv)
 
     if not args.pdf and not args.report:
         ap.error("give --pdf, --report, or both")
+    if args.source_name and not args.pdf:
+        ap.error("--source-name names the PDF: give --pdf")
     root = os.environ.get(STORE_ENV)
     if not root:
         print(f"set {STORE_ENV} to the run store directory", file=sys.stderr)
@@ -54,6 +75,9 @@ def main(argv=None) -> int:
     root = Path(root).resolve()
     if root == LAB or LAB in root.parents:
         print(f"refusing a run store inside {LAB}: runs hold client data", file=sys.stderr)
+        return 2
+    if args.run_id and (root / "runs" / args.run_id).exists():
+        print(f"refusing run id {args.run_id}: runs/{args.run_id}/ already exists", file=sys.stderr)
         return 2
     if not args.report:
         import boto3
@@ -65,7 +89,8 @@ def main(argv=None) -> int:
     try:
         record = run(organization_id=args.org, well_id=None if args.no_well else args.well, pdf=args.pdf,
                      report=args.report, store_root=root, budget_s=args.budget_s, model_id=args.model_id,
-                     effort=args.effort, max_tokens=args.max_tokens, clarifications=args.clarifications)
+                     effort=args.effort, max_tokens=args.max_tokens, clarifications=args.clarifications,
+                     run_id=args.run_id, source_name=args.source_name)
     except ExtractionError as err:          # the run directory itself could not be created
         print(f"- failed {err.code}: {err.message}", file=sys.stderr)
         return 2
