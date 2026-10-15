@@ -250,11 +250,11 @@ def test_list_shows_every_run_with_both_statuses_and_the_latest_marker(store):
     at = app()
     df = at.dataframe[0].value.set_index("Run id")
     assert list(df.index) == [ODD, BROKEN, NO_PDF, STALE, RUNNING, PARTIAL, GOOD, OLD]
-    assert df.loc[GOOD, "Run"] == "succeeded" and df.loc[GOOD, "Document checks"] == "needs review"
-    assert df.loc[PARTIAL, "Run"] == "failed" and df.loc[PARTIAL, "Document checks"] == "not run"
+    assert df.loc[GOOD, "Pipeline"] == "completed" and df.loc[GOOD, "Document review"] == "1 item to check"
+    assert df.loc[PARTIAL, "Pipeline"] == "failed at extract" and df.loc[GOOD, "Route"] == "template"
     assert df.loc[PARTIAL, "Error"] == "MODEL_TIMEOUT at extract"
-    assert df.loc[RUNNING, "Run"] == "running" and df.loc[STALE, "Run"] == "failed (stale)"
-    assert df.loc[BROKEN, "Run"] == "run.json unreadable"
+    assert df.loc[RUNNING, "Pipeline"] == "running" and df.loc[STALE, "Pipeline"] == "failed (stale)"
+    assert df.loc[BROKEN, "Pipeline"] == "run.json unreadable"
     assert df.loc[GOOD, "Cost (USD)"] == 0.5
     assert {r for r in df.index if df.loc[r, "Latest"]} == {GOOD, NO_PDF}      # newest succeeded per well
 
@@ -270,7 +270,7 @@ def test_list_filters_by_status(store):
 def test_succeeded_run_shows_everything(store):
     at = app(GOOD)
     md = " ".join(texts(at.markdown))
-    assert "Run: succeeded" in md and "Document checks: needs review" in md
+    assert "Pipeline: completed" in md and "Document review: 1 item to check" in md
     assert any("spec_validation_status" in c and "needs_review" in c for c in texts(at.caption))
     assert not at.error and not [i for i in texts(at.info) if "not stored" in i]
     frames = {tuple(df.value.columns)[:2]: df.value for df in at.dataframe}
@@ -304,9 +304,9 @@ def test_failed_partial_run_shows_its_error_and_what_it_stored(store):
 
 def test_running_and_stale_runs(store):
     md = " ".join(texts(app(RUNNING).markdown))
-    assert "Run: running" in md
+    assert "Pipeline: running" in md
     at = app(STALE)
-    assert "Run: failed (stale)" in " ".join(texts(at.markdown))
+    assert "Pipeline: failed (stale)" in " ".join(texts(at.markdown))
     assert any("deadline" in w for w in texts(at.warning))
 
 
@@ -327,9 +327,9 @@ def test_malformed_files_each_get_a_notice(store):
 
 
 def test_a_record_with_odd_types_still_renders(store):
-    assert app().dataframe[0].value.set_index("Run id").loc[ODD, "Run"] == '["?"]'
+    assert app().dataframe[0].value.set_index("Run id").loc[ODD, "Pipeline"] == '["?"]'
     at = app(ODD)
-    assert "Run: [\"?\"]" in " ".join(texts(at.markdown))
+    assert "Pipeline: [\"?\"]" in " ".join(texts(at.markdown))
     assert "No source information for this run." in texts(at.info)
 
 
@@ -365,7 +365,7 @@ def test_the_writers_runs_render(tmp_path, monkeypatch):
 
     cases = {  # expected code -> (patch, run kwargs)
         None: ({}, dict(report=report, pdf=pdf)),
-        "UNKNOWN_TEMPLATE": ({"detect": fail("UNKNOWN_TEMPLATE")}, dict(pdf=pdf)),
+        "IMAGE_ONLY": ({"route": fail("IMAGE_ONLY")}, dict(pdf=pdf)),
         "PREP_FAILED": ({"prep": fail("PREP_FAILED")}, dict(pdf=pdf)),
         "MODEL_TIMEOUT": ({"extract": fail("MODEL_TIMEOUT")}, dict(pdf=pdf)),
         "REPORT_INVALID": ({"extract": fake_extract(INVALID)}, dict(pdf=pdf)),
@@ -389,7 +389,7 @@ def test_the_writers_runs_render(tmp_path, monkeypatch):
         if code is None:
             assert not at.error and not [i for i in texts(at.info) if "not stored" in i]
         elif code == "stale":
-            assert "Run: failed (stale)" in " ".join(texts(at.markdown))
+            assert "Pipeline: failed (stale)" in " ".join(texts(at.markdown))
         else:
             assert code in texts(at.error)[0]
 

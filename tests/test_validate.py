@@ -15,7 +15,7 @@ from extraction.stage.stage import stage
 from extraction.validate import rules as R
 from extraction.validate import spec_validation_status, structure_findings, unknown_models, validate
 from extraction.validate.review import review, supply
-from extraction.validate.validate import _guards
+from extraction.validate.validate import _guards, declared_halt
 
 VENDOR = {"F1": "spyglass", "F2": "championx", "F3": "slb", "F4": "els", "F5": "baker_prolift", "F7": "valiant"}
 SHORT = {"pc": "stg_pump_config", "dc": "stg_design_context", "co": "stg_curve_observations",
@@ -425,3 +425,87 @@ def test_v_f3_5_fires_on_bep_ror_and_head_curve_rows_only(lookup):
     assert fires(point_type="bep") and fires(point_type="ror_max") and fires(curve_observation_role="head_curve")
     assert not fires(point_type="design_point") and not fires(point_type="q_intake") and not fires()
 
+
+
+# ---- the emptiness guards: an empty extraction, no pump rows, a halt the model declared ----
+
+HALT_LINE = "> [!warning] **HALT — V-02 (required page absent).** Stopped at Step 1: the document prints `Page: 1 / 7`."
+F4_PUMP = [{"section_order": "1", "pump_model_as_printed": "ELS-1234", "stages": "100"}]
+F4_CONTEXT = [{"depth_reference_basis": "intake", "oil_api_deg": "40"}]
+
+
+def with_prose(text, *lines):
+    """The report with prose lines between its frontmatter and its data blocks."""
+    head, rest = text.split("\n## stg_pump_config", 1)
+    return head + "\n" + "\n".join(lines) + "\n\n## stg_pump_config" + rest
+
+
+def checked(lookup, text, well_matched=True):
+    return validate(read_report(text, "F4"), "F4", lookup, [], [], [], [], [], report_text=text,
+                    well_matched=well_matched)
+
+
+def notice(out):
+    return next(n["message"] for n in out["notices"] if n["rule_id"] == "unknown_models")
+
+
+def test_declared_halt_takes_rule_ids_from_a_halt_line_only():
+    def halt(*lines, fm=None, after=""):
+        text = with_prose(report_text("F4", fm), *lines) + after
+        return declared_halt(text, read_report(text, "F4"))
+    assert halt(HALT_LINE) == ["V-02"]
+    assert halt("**HALT**: V-F2-5 and D17 both apply") == ["V-F2-5", "D17"]
+    assert halt("- HALT (no rule named)") == [] and halt(fm={"validation_status": "failed"}) == []
+    assert halt("- The document has 7 pages; this is not a HALT.", "**Emission count.** None, because of the V-02 HALT.",
+                "HALT conditions: none") is None                        # mentions, not declarations
+    assert halt(after="HALT — V-02, written after the data blocks\n") is None
+
+
+def test_an_empty_extraction_is_g_e1_and_names_only_the_rule(lookup):
+    out = checked(lookup, with_prose(report_text("F4"), HALT_LINE))
+    empty = [f for f in out["findings"] if f["rule_id"] == "G-E1"]
+    assert [(f["round1_severity"], f["blocks_publish"], f["value"]) for f in empty] == [("EXTRACTION_EMPTY", True, ["V-02"])]
+    assert empty[0]["message"] == ("no pump-configuration and no design-context rows were extracted; "
+                                   "the model declared a halt naming V-02")
+    assert "1 / 7" not in json.dumps(out)                                 # nothing the document printed
+    assert out["spec_validation_status"] == "failed"
+    assert notice(out).endswith("(empty extraction; the model declared a halt naming V-02)")
+    quiet = checked(lookup, report_text("F4"))
+    assert [f["message"] for f in quiet["findings"] if f["rule_id"] == "G-E1"] == [
+        "no pump-configuration and no design-context rows were extracted; the report declares no halt"]
+
+
+def test_no_pump_rows_beside_other_rows_needs_review(lookup):
+    out = checked(lookup, report_text("F4", dc=F4_CONTEXT))
+    assert [f["rule_id"] for f in out["findings"] if f["rule_id"].startswith("G-E")] == ["G-E2"]
+    assert out["spec_validation_status"] == "needs_review"
+    assert spec_validation_status([f for f in out["findings"] if f["rule_id"] != "G-E2"]) == "passed"
+    items = [r for r in out["review"] if r["reasons"] == ["no pump rows extracted"]]
+    assert [(r["field"], r["table"], r["needs_review"]) for r in items] == [(None, "stg_pump_config", True)]
+
+
+def test_a_declared_halt_that_left_rows_needs_review_and_names_the_rule(lookup):
+    out = checked(lookup, with_prose(report_text("F4", pc=F4_PUMP, dc=F4_CONTEXT), HALT_LINE))
+    assert [f["message"] for f in out["findings"] if f["rule_id"].startswith("G-E")] == ["model halt: V-02"]
+    assert out["spec_validation_status"] == "needs_review"
+    assert spec_validation_status([f for f in out["findings"] if f["rule_id"] != "G-E3"]) == "passed"
+    assert [r["reasons"] for r in out["review"] if r["field"] is None] == [["model halt: V-02"]]
+
+
+def test_the_no_pump_rows_notice_names_the_reason(lookup):
+    def reason(text, well_matched=True):
+        message = notice(checked(lookup, text, well_matched))
+        return message[message.index("(") + 1:-1]
+    rows = report_text("F4", pc=F4_PUMP, dc=F4_CONTEXT)
+    assert reason(rows, well_matched=False) == "unmatched well"
+    assert reason(report_text("F4")) == "empty extraction"
+    assert reason(report_text("F4"), well_matched=False) == "unmatched well; empty extraction"
+    assert reason(report_text("F4", dc=F4_CONTEXT)) == "no pump rows extracted"
+    assert reason(rows) == "none of the report's pump rows reached the load"
+
+
+def test_emptiness_guards_set_a_floor_on_the_status():
+    def status(*rule_ids, severity=None):
+        return spec_validation_status([{"spec_severity": severity, "rule_id": r} for r in rule_ids])
+    assert status("G-E1") == "failed" and status("G-E2") == status("G-E3") == "needs_review"
+    assert status("G-E2", severity="HALT") == "failed" and status("V-03") == "passed"

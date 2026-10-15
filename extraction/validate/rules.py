@@ -20,14 +20,16 @@ from ..stage import transform as T
 from ..stage import values as V
 
 STRUCTURE = {"G-S1", "G-S2", "G-S3"}
-BLOCKS_PUBLISH = {"V-08", "D17"}
+EMPTY = "G-E1"
+BLOCKS_PUBLISH = {"V-08", "D17", EMPTY}
 ENVELOPE = {"bep", "ror_min", "ror_max"}
 
 
 def finding(rule_id, spec_severity, scope, table, row_key, column, value, message) -> dict:
     """One finding.  Round-1 severity is the locked map: structure guards fail the run,
-    D17 halts the load, everything else is a warning."""
-    round1 = "REPORT_INVALID" if rule_id in STRUCTURE else "LOAD_HALTED" if rule_id == "D17" else "warning"
+    D17 halts the load, an empty extraction fails the run, everything else is a warning."""
+    round1 = ("REPORT_INVALID" if rule_id in STRUCTURE else "LOAD_HALTED" if rule_id == "D17"
+              else "EXTRACTION_EMPTY" if rule_id == EMPTY else "warning")
     return {"rule_id": rule_id, "spec_severity": spec_severity, "round1_severity": round1, "scope": scope,
             "table": table, "row_key": row_key, "column": column, "value": value, "message": message,
             "blocks_publish": rule_id in BLOCKS_PUBLISH}

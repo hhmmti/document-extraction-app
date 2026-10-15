@@ -17,6 +17,11 @@ design-context columns the well item draws on.  Signals:
   expected_missing  a field the family prints in every corpus report is not staged;
                     where the family's supply is partial, the signal is not evaluated
 
+The emptiness guards G-E2 and G-E3 each add one item of their own, with no field
+and the guard's message as its reason: `no pump rows extracted`, `model halt: <rule>`.
+On the generic route every item also carries `generic_path` and needs review:
+no vendor template checked any value.
+
 A review never blocks a run and never changes a value.
 """
 
@@ -27,6 +32,7 @@ import re
 from collections import defaultdict
 
 from ..stage import transform as T
+from ..stage.generic import GENERIC
 from .rules import page_numbers, text
 
 PUMP_STRING = ("section_order", "section_role", "pump_model_as_printed", "pump_model_as_printed_alt",
@@ -190,6 +196,12 @@ def review(doc, findings, quarantine_rows) -> list[dict]:
                 n, of = COVERAGE[field].get(doc.family, 0), CORPUS_REPORTS[doc.family]
                 out.append(_record(field, table, None, None, None, "not_evaluated",
                                    [f"expected_missing: not_evaluated (supply uncertain: {n} of {of} corpus reports)"]))
+    out += [_record(None, f["table"], None, None, None, "not_evaluated", [f["message"]])
+            for f in findings if f["rule_id"] in ("G-E2", "G-E3")]
+    if doc.family == GENERIC:
+        for item in out:
+            item["reasons"].append("generic_path")
+            item["needs_review"] = True
     return out
 
 

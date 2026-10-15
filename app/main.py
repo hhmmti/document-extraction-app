@@ -42,8 +42,10 @@ LOGS = {"d16_log": "Scenario-variance log", "d17_log": "Identity log", "gas_log"
 STAGES = ("detect", "prep", "assemble", "extract", "stage", "store", "record")
 RUN_LOOK = {"succeeded": ("green", ":material/check_circle:"), "failed": ("red", ":material/error:"),
             "running": ("blue", ":material/hourglass_top:")}
-DOC_LOOK = {"passed": ("green", ":material/check_circle:"), "needs_review": ("orange", ":material/flag:"),
-            "failed": ("red", ":material/cancel:")}
+REVIEW_LOOK = {"no issues": ("green", ":material/check_circle:"), "to check": ("orange", ":material/flag:")}
+BANNER = ("Pipeline says whether extraction ran. Document review says whether the values need an engineer's "
+          "check. A completed run can still need review.")
+GENERIC_BADGE = "Generic extraction: review every value"
 MODEL_LEVEL = {"absent": "not in the catalogue", "no_head_curve": "in the catalogue, without a head curve",
                "unresolved": "the printed name did not resolve to a model"}
 SPEC_RANK = {"HALT": 0, "ERROR": 1, "WARN": 2, "NOTE": 3}
@@ -110,9 +112,48 @@ def started(record, run_id) -> str:
     return f"{run_id[:4]}-{run_id[4:6]}-{run_id[6:8]} {run_id[9:11]}:{run_id[11:13]}:{run_id[13:15]}"
 
 
-def doc_status(record) -> str:
-    spec = dig(record, "spec_validation_status")
-    return "not run" if spec is None else "needs review" if spec == "needs_review" else text(spec)
+def pipeline(record, now=None) -> str:
+    """`completed`, `failed at <stage>`, `failed (stale)`, or the status as recorded."""
+    status, stale = run_status(record, now)
+    if stale:
+        return "failed (stale)"
+    if status == "succeeded":
+        return "completed"
+    stage = dig(record, "error", "stage")
+    if status == "failed":
+        return f"failed at {stage}" if isinstance(stage, str) else "failed"
+    return text(status)
+
+
+def review_line(record) -> str:
+    """`N items to check`, `no issues`, or `not run` when the run stored no review."""
+    n = dig(record, "review", "needs_review")
+    if not isinstance(n, int) or isinstance(n, bool):
+        return "not run"
+    return "no issues" if n == 0 else f"{n} item{'s' * (n != 1)} to check"
+
+
+def route_of(record) -> str:
+    """`template`, `generic` or `generic (forced)`.  A record from before routes were recorded is
+    `template` when it names a vendor family."""
+    route = dig(record, "route")
+    if route == "generic":
+        return "generic (forced)" if dig(record, "forced") is True else "generic"
+    code = dig(record, "family")
+    if route == "template" or (route is None and isinstance(code, str) and code in FAMILIES):
+        return "template"
+    return text(route)
+
+
+def generic_context(record) -> str:
+    """What Detect saw, for the generic badge: the family hint and its missing pages, or why none."""
+    hint, missing, forced = dig(record, "family_hint"), dig(record, "missing_roles"), dig(record, "forced_from")
+    if dig(record, "forced") is True:
+        return f"Sent down the generic route on purpose: Detect matched {family({'family': forced})}."
+    if isinstance(hint, str):
+        roles = "; ".join(map(str, missing)) if isinstance(missing, list) and missing else "none recorded"
+        return f"Family hint: {family({'family': hint})}. Missing required pages: {roles}."
+    return "No vendor template matched this document."
 
 
 def blob(store, run_id, name) -> bytes:
@@ -207,17 +248,17 @@ def list_rows(store) -> pd.DataFrame:
     runs = set(store.run_ids())
     for run_id in sorted(runs | set(store.launch_ids()), reverse=True):     # newest first
         row = {"Run id": run_id, "Started (UTC)": started({}, run_id), "Organisation": "—", "Well": "—",
-               "Latest": "", "Family": "—", "Run": "", "Document checks": "—", "Error": "", "Cost (USD)": None}
+               "Latest": "", "Family": "—", "Route": "—", "Pipeline": "", "Document review": "—",
+               "Error": "", "Cost (USD)": None}
         if run_id not in runs:
-            rows.append({**row, "Run": "launched, no record"})
+            rows.append({**row, "Pipeline": "launched, no record"})
             continue
         try:
             record = store.record(run_id)
-            status, stale = run_status(record, now)
             org, well, error = dig(record, "organization_id"), dig(record, "well_id"), dig(record, "error")
-            run = f"{text(status)} (stale)" if stale else text(status)
+            run = pipeline(record, now)
             key = (text(org), text(well))
-            is_latest = run == "succeeded" and well is not None and key not in latest
+            is_latest = run == "completed" and well is not None and key not in latest
             latest |= {key} if is_latest else set()
             row.update({
                 "Started (UTC)": started(record, run_id),
@@ -225,15 +266,16 @@ def list_rows(store) -> pd.DataFrame:
                 "Well": text(well, "no well"),
                 "Latest": "latest" if is_latest else "",
                 "Family": family(record),
-                "Run": run,
-                "Document checks": doc_status(record),
+                "Route": route_of(record),
+                "Pipeline": run,
+                "Document review": review_line(record),
                 "Error": f"{text(dig(error, 'code'))} at {text(dig(error, 'stage'))}" if isinstance(error, dict) else "",
                 "Cost (USD)": cost if isinstance(cost := dig(record, "cost_usd"), (int, float)) else None,
             })
         except FileNotFoundError:
-            row["Run"] = "no run.json"
+            row["Pipeline"] = "no run.json"
         except Exception:  # noqa: BLE001 - an unreadable record still gets its row
-            row["Run"] = "run.json unreadable"
+            row["Pipeline"] = "run.json unreadable"
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -241,16 +283,16 @@ def list_rows(store) -> pd.DataFrame:
 def show_list(store):
     st.title("Design-document runs")
     st.write("Each run takes one design document through detection, extraction, checks and storage. "
-             "**Run** says whether the pipeline worked. **Document checks** say what the checks found in the document.")
+             "**Pipeline** says whether extraction ran. **Document review** says whether the values need an "
+             "engineer's check.")
     st.button("New run from a PDF", icon=":material/upload_file:", on_click=goto, kwargs={"upload": "1"})
     df = list_rows(store)
     if df.empty:
         st.info("This run store has no runs yet.")
         return
-    filters = {"Organisation": "org", "Well": "well", "Run": "status"}
-    picked = {col: box.multiselect("Run status" if col == "Run" else col, sorted(df[col].unique()), key=key,
-                                   placeholder="All", bind="query-params")
-              for box, (col, key) in zip(st.columns(3), filters.items())}
+    filters = {"Organisation": "org", "Well": "well", "Route": "route", "Pipeline": "status"}
+    picked = {col: box.multiselect(col, sorted(df[col].unique()), key=key, placeholder="All", bind="query-params")
+              for box, (col, key) in zip(st.columns(4), filters.items())}
     view = df
     for col, chosen in picked.items():
         if chosen:
@@ -259,13 +301,15 @@ def show_list(store):
     st.dataframe(view, hide_index=True, key="runs", column_config={
         "Run id": st.column_config.ButtonColumn(key="open-run", on_click=open_run, type="tertiary",
                                                 alignment="left", help="Open this run"),
-        "Latest": st.column_config.TextColumn(help="The newest succeeded run for its organisation and well"),
+        "Latest": st.column_config.TextColumn(help="The newest completed run for its organisation and well"),
         "Family": st.column_config.TextColumn(help="`family`: the vendor template, as F-code (vendor)"),
-        "Run": st.column_config.TextColumn(
-            help="`status`: did the pipeline work? A `running` record past its `deadline_at` reads as failed (stale)."),
-        "Document checks": st.column_config.TextColumn(
-            help="`spec_validation_status`: what the validator's checks say about the document "
-                 "(passed, needs review, failed). Separate from the run's status."),
+        "Route": st.column_config.TextColumn(
+            help="`route`: template (the vendor's contract) or generic (no template: every value needs review)"),
+        "Pipeline": st.column_config.TextColumn(
+            help="`status` and `error.stage`: did extraction run? A `running` record past its `deadline_at` reads "
+                 "as failed (stale)."),
+        "Document review": st.column_config.TextColumn(
+            help="`review.needs_review`: values that need an engineer's check. Separate from the pipeline."),
         "Error": st.column_config.TextColumn(help="`error.code` at `error.stage`"),
         "Cost (USD)": st.column_config.NumberColumn(
             format="$%.2f", help="`cost_usd`: the model call's cost; empty without a model call"),
@@ -299,17 +343,18 @@ def status_cell(label, shown, look, field, raw):
 UNKNOWN_LOOK = ("gray", ":material/help:")
 
 
-def run_cell(record):
+def pipeline_cell(record):
     status, stale = run_status(record) if record else (None, False)
-    status_cell("Run", f"{text(status)} (stale)" if stale else text(status, "unknown"),
+    status_cell("Pipeline", pipeline(record) if record else "unknown",
                 ("red", ":material/timer_off:") if stale else RUN_LOOK.get(text(status), UNKNOWN_LOOK),
                 "status", dig(record, "status"))
 
 
-def doc_cell(record):
-    spec = dig(record, "spec_validation_status")
-    status_cell("Document checks", doc_status(record) if record else "unknown",
-                DOC_LOOK.get(text(spec), UNKNOWN_LOOK), "spec_validation_status", spec)
+def review_cell(record):
+    shown = review_line(record) if record else "unknown"
+    look = REVIEW_LOOK.get("no issues" if shown == "no issues" else "to check" if shown.endswith("to check") else "",
+                           UNKNOWN_LOOK)
+    status_cell("Document review", shown, look, "spec_validation_status", dig(record, "spec_validation_status"))
 
 
 def error_line(record):
@@ -322,6 +367,9 @@ def error_line(record):
 def title_block(run_id, record, problem):
     with st.container(border=True):
         st.subheader(f"Run {plain(run_id)}")
+        if dig(record, "route") == "generic":
+            st.badge(GENERIC_BADGE, icon=":material/rate_review:", color="orange")
+            st.caption(plain(generic_context(record)))
         if problem:
             st.warning(problem)
         with panel("run.json", record):
@@ -336,9 +384,10 @@ def title_block(run_id, record, problem):
             status, stale = run_status(record) if record else (None, False)
             left, right = st.columns(2)
             with left:
-                run_cell(record)
+                pipeline_cell(record)
             with right:
-                doc_cell(record)
+                review_cell(record)
+            st.info(BANNER)
             error_line(record)
             if stale:
                 st.warning(f"Still recorded as running, but its deadline ({plain(dig(record, 'deadline_at'))}) has "
@@ -364,6 +413,11 @@ def summary_tab(record):
             ("Family taken from", {"detect": "Detect, from the PDF",
                                    "report_frontmatter": "the report's frontmatter"}.get(
                 dig(record, "family_source"), dig(record, "family_source")), "family_source"),
+            ("Route", route_of(record), "route"),
+            ("Family hint", dig(record, "family_hint"), "family_hint"),
+            ("Missing required pages", dig(record, "missing_roles"), "missing_roles"),
+            ("Near misses", dig(record, "near_misses"), "near_misses"),
+            ("Forced from", dig(record, "forced_from"), "forced_from"),
             ("Organisation", dig(record, "organization_id"), "organization_id"),
             ("Well", text(dig(record, "well_id"), "no well: unmatched, so no load rows"), "well_id"),
             *([("Model", "no model call", "model")] if not isinstance(model, dict) else [
@@ -553,8 +607,8 @@ def row_pages(get) -> dict:
 
 
 def findings_tab(get, record, page_key):
-    st.caption("findings.jsonl. Run severity is what the pipeline did: only REPORT_INVALID and LOAD_HALTED fail a "
-               "run, everything else is a warning. Spec severity is the validator specification's own level, "
+    st.caption("findings.jsonl. Run severity is what the pipeline did: only REPORT_INVALID, LOAD_HALTED and "
+               "EXTRACTION_EMPTY fail a run, everything else is a warning. Spec severity is the validator specification's own level, "
                "reported and not enforced.")
     with panel("findings.jsonl", record):
         rows = jsonl(get("findings.jsonl"), "findings.jsonl")
@@ -852,7 +906,7 @@ def render_watch(store, run_id) -> str:
         except FileNotFoundError:
             st.caption("There is no launch log for this run.")
     else:
-        run_cell(record)
+        pipeline_cell(record)
         start, deadline = when(record.get("started_at")), when(record.get("deadline_at"))
         end = when(record.get("ended_at")) or datetime.now(timezone.utc)
         if start and deadline:
@@ -863,7 +917,7 @@ def render_watch(store, run_id) -> str:
             st.caption("Current stage: not in the record, which is written when the run starts and again "
                        "when it ends.")
         else:
-            doc_cell(record)
+            review_cell(record)
             error_line(record)
             st.button("Open the run", type="primary", on_click=goto, kwargs={"run": run_id})
     return state

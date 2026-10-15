@@ -32,6 +32,7 @@ from . import schemas
 from . import transform as T
 from . import values as V
 from .aliases import AliasLookup
+from .generic import GENERIC, GenericLookup, canonical_names
 from .reports_reader import read_report
 
 # Assets are data, not code: they live outside the tree, in the directory
@@ -134,7 +135,7 @@ def stage(report_text: str, organization_id, well_id, family: str, evidence: dic
     if invalid:
         raise ExtractionError("REPORT_INVALID", "; ".join(f["message"] for f in invalid),
                               {"findings": invalid})
-    printed = FAMILY_LABEL.get(report.vendor_family)
+    printed = GENERIC if report.vendor_family == GENERIC else FAMILY_LABEL.get(report.vendor_family)
     if printed != family:
         raise ExtractionError(
             "FAMILY_MISMATCH",
@@ -142,7 +143,8 @@ def stage(report_text: str, organization_id, well_id, family: str, evidence: dic
             {"vendor_family": report.vendor_family, "report_family": printed, "detected_family": family},
         )
 
-    lookup = AliasLookup(asset(SEED))
+    lookup = (GenericLookup(asset(SEED), canonical_names(asset(CATALOGUE))) if family == GENERIC
+              else AliasLookup(asset(SEED)))
     lookup.evidence_flags = dict(evidence)
     quarantine = T.Quarantine()
     pump_config, design_context, observations = [], [], []
@@ -174,7 +176,8 @@ def stage(report_text: str, organization_id, well_id, family: str, evidence: dic
                   gas_log, tier_a_fallback)
 
     checked = validate(report, family, lookup, quarantine.rows, reconciliation, d16_log, d17_log,
-                       pump_config, detection=detection, prep=prep)
+                       pump_config, detection=detection, prep=prep, report_text=report_text,
+                       well_matched=well_id is not None)
     return StageResult(
         pump_config=_frame(pump_config),
         esp_well_design_context=_frame(design_context),

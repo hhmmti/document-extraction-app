@@ -50,7 +50,7 @@ def detect_error(pdf_bytes: bytes) -> ExtractionError:
 
 
 def test_two_families_on_page_1_is_ambiguous():
-    err = detect_error(make_pdf([["SIZING REPORT", "Schematics Report", "SLB Engineer"]]))
+    err = detect_error(make_pdf([["SIZING REPORT", "SLB Engineer", "SLB | Schematics Report 1"]]))
     assert err.code == "AMBIGUOUS_TEMPLATE"
     assert err.details["families"] == ["F1", "F3"]
 
@@ -68,6 +68,43 @@ def test_blank_pdf_is_image_only():
 def test_text_without_markers_is_unknown():
     err = detect_error(make_pdf([["This page carries ordinary text and no template markers."]]))
     assert err.code == "UNKNOWN_TEMPLATE"
+
+
+# A newer F2 generator: the title, a relabelled representative block, no vendor name in the text.
+F2_NEWER = [["EQUIPMENT AND PERFORMANCE REPORT", "Account Manager | Customer Rep"], ["Summary"],
+            ["Performance Curve: 60 Hz"], ["Gas Separator / BOI"], ["Surface Equipment"], ["Motor Rating 100"]]
+F3_P1 = ["Schematics Report", "SLB Engineer", "SLB | Schematics Report 1"]
+F3_GENERAL = ["General Report", "SLB Engineer", "SLB | General Report 2"]
+
+
+def test_f2_is_its_title_and_its_required_pages():
+    assert detect(make_pdf(F2_NEWER)).family == "F2"
+    err = detect_error(make_pdf(F2_NEWER[:2]))
+    assert (err.code, err.details["family"]) == ("REQUIRED_PAGES_MISSING", "F2")
+    assert err.details["missing_roles"] == [r for r, s, _m in PAGE_MAP["F2"][2:6]]
+
+
+def test_f3_is_the_engineer_and_the_report_footer():
+    assert detect(make_pdf([F3_P1, F3_GENERAL])).family == "F3"
+    # A partial document, its schematics pages left out, is still F3 and fails on the missing page.
+    err = detect_error(make_pdf([F3_GENERAL]))
+    assert (err.code, err.details) == ("REQUIRED_PAGES_MISSING",
+                                       {"family": "F3", "missing_roles": ["Schematics Report"]})
+    # The footer must read `SLB | … Report`.
+    assert detect_error(make_pdf([[*F3_GENERAL[:2], "SLB | General 2"]])).code == "UNKNOWN_TEMPLATE"
+
+
+def test_unknown_template_names_its_near_misses_and_producer():
+    err = detect_error(make_pdf([F3_GENERAL[:2] + ["Prepared for Jo Example"]]))
+    assert err.code == "UNKNOWN_TEMPLATE"
+    assert err.details == {"families": [], "producer": "pypdf", "near_misses": [
+        {"family": "F3", "markers_matched": 1, "markers": 2,
+         "required_found": ["General Report"], "required_missing": ["Schematics Report"]}]}
+    assert err.message == ("no family's page-1 signature matched; near misses: F3 with 1 of 2 page-1 markers "
+                           "and 1 of 2 required pages (missing Schematics Report); PDF producer: pypdf")
+    err = detect_error(make_pdf([["This page carries ordinary text and no template markers."]]))
+    assert err.message == ("no family's page-1 signature matched; no family has any of its page-1 markers; "
+                           "PDF producer: pypdf")
 
 
 def test_unreadable_bytes_fail_prep():

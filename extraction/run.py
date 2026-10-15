@@ -29,12 +29,12 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .assemble import assemble_prompt, asset_hashes, clarification_hashes, manifest_csv
+from .assemble import GENERIC_PROMPT_CAP, assemble_prompt, asset_hashes, clarification_hashes, manifest_csv, route_line
 from .bedrock import EFFORT, MODEL_ID, extract
 from .compare.parity import cost_usd, model_prices
-from .detect import detect
+from .detect import GENERIC, Detection, route
 from .errors import ExtractionError
-from .prep import prep
+from .prep import prep, prep_generic
 from .stage import production_evidence, stage
 from .stage.reports_reader import read_report
 from .stage.stage import CATALOGUE, EVIDENCE, FAMILY_LABEL, SEED, asset
@@ -46,6 +46,7 @@ PRICING = Path(__file__).with_name("compare") / "pricing.json"
 GRAINS = ("pump_config", "esp_well_design_context", "curve_observations")
 LOGS = ("d16_log", "d17_log", "gas_log")
 LISTS = ("findings", "unknown_models", "review", "notices")
+LABELS = {**FAMILY_LABEL, GENERIC: GENERIC}     # report vendor_family -> family, generic included
 
 
 def utc(t: datetime) -> str:
@@ -116,9 +117,15 @@ def read_record(run_dir: Path, now: datetime | None = None) -> dict:
     return record
 
 
+STAGED = {"pump_config": "stg_pump_config", "esp_well_design_context": "stg_design_context",
+          "curve_observations": "stg_curve_observations"}
+
+
 def _summary(result) -> dict:
     findings = result.findings
+    parsed = {r["block"]: r["objects_parsed"] for r in result.log["reconciliation"]}
     return {
+        "staged": {g: parsed.get(block, 0) for g, block in STAGED.items()},   # the report's rows, before the load
         "rows": {g: len(getattr(result, g)) for g in GRAINS},
         "quarantine": len(result.quarantine),
         "findings": {
@@ -138,11 +145,13 @@ def _summary(result) -> dict:
 def run(*, organization_id, well_id, pdf: Path | None = None, report: Path | None = None,
         store_root: Path, budget_s: float = BUDGET_S, model_id: str = MODEL_ID, effort: str = EFFORT,
         max_tokens: int = MAX_TOKENS, clarifications: bool = True, client=None,
-        run_id: str | None = None, source_name: str | None = None) -> dict:
+        run_id: str | None = None, source_name: str | None = None, force_generic: bool = False) -> dict:
     """Run one document and return its final run record.  With `report`, no model is called.
 
     `run_id` replaces the generated id.  `source_name` is the file name that prep records and
     the prompt names, in place of the PDF path's basename; the record keeps it as `source.source_name`.
+    Detect's route (`template` or `generic`) picks the prep and the prompt; `force_generic` sends a
+    template document down the generic route, for measuring it.
     """
     if pdf is None and report is None:
         raise ValueError("a run needs a PDF, a report, or both")
@@ -155,7 +164,8 @@ def run(*, organization_id, well_id, pdf: Path | None = None, report: Path | Non
         "run_id": run_id or new_run_id(started), "status": "running", "started_at": utc(started),
         "deadline_at": utc(deadline), "ended_at": None, "budget_s": budget_s,
         "mode": "report" if report else "pdf", "organization_id": organization_id, "well_id": well_id,
-        "family": None, "family_source": None,
+        "family": None, "family_source": None, "route": None, "forced": False, "forced_from": None,
+        "family_hint": None, "missing_roles": [], "near_misses": [],
         "source": {"pdf": None, "report": None, "source_name": None}, "pages": None,
         "rows": None, "quarantine": None, "findings": None, "spec_validation_status": None,
         "blocks_publish": None, "review": None, "unknown_models": None,
@@ -193,21 +203,35 @@ def run(*, organization_id, well_id, pdf: Path | None = None, report: Path | Non
 
         detection = prepared = None
         if pdf:
-            detection = timed("detect", detect, pdf_bytes)
+            routing = timed("detect", route, pdf_bytes, force_generic=force_generic)
+            record.update(route=routing.route, forced=routing.forced, forced_from=routing.forced_from,
+                          family_hint=routing.family_hint, missing_roles=list(routing.missing_roles),
+                          near_misses=list(routing.near_misses))
+            if routing.route == GENERIC:
+                prepared = timed("prep", prep_generic, pdf_bytes, source_file=record["source"]["source_name"])
+                detection = Detection(GENERIC, len(prepared.manifest), {r["original_page_no"]: [] for r in prepared.manifest})
+            else:
+                detection = routing.detection
+                prepared = timed("prep", prep, pdf_bytes, detection, source_file=record["source"]["source_name"])
             record["family"], record["family_source"] = detection.family, "detect"
-            prepared = timed("prep", prep, pdf_bytes, detection, source_file=record["source"]["source_name"])
             store.write("prep_manifest.csv", manifest_csv(prepared.manifest).encode())
             record["pages"] = {"page_count": detection.page_count, "kept_pages": prepared.kept_pages,
                                "roles": {str(p): [r for r, _, _ in v] for p, v in detection.page_roles.items() if v}}
         if report_text is None:
             family = detection.family
             prompt = timed("assemble", assemble_prompt, family, prepared, record["source"]["source_name"], well_id=well_id,
-                           clarifications=clarifications)
+                           clarifications=clarifications,
+                           route_context=route_line(record["family_hint"], record["missing_roles"]))
+            size = len(prompt.encode("utf-8"))
+            if family == GENERIC and size > GENERIC_PROMPT_CAP:
+                raise ExtractionError("GENERIC_TOO_LARGE", f"the generic prompt is {size:,} bytes, over the "
+                                      f"{GENERIC_PROMPT_CAP:,}-byte cap; no model call was made",
+                                      {"prompt_bytes": size, "cap": GENERIC_PROMPT_CAP})
             record["hashes"]["prompt_sha256"] = sha256(prompt.encode())
             record["hashes"]["contract"] = asset_hashes(family)
             record["hashes"]["clarifications"] = clarification_hashes(family) if clarifications else {}
             record["model"] = {"model_id": model_id, "effort": effort, "max_tokens": max_tokens,
-                               "clarifications": clarifications}
+                               "clarifications": clarifications, "prompt_bytes": size}
             remaining = budget_s - (time.monotonic() - t0)
             result = timed("extract", extract, prompt, budget_s=remaining, max_tokens=max_tokens,
                            model_id=model_id, effort=effort, client=client)
@@ -222,8 +246,9 @@ def run(*, organization_id, well_id, pdf: Path | None = None, report: Path | Non
         record["hashes"]["report_sha256"] = sha256(report_text.encode("utf-8"))
 
         if detection is None:
-            record["family"] = FAMILY_LABEL.get(read_report(report_text).vendor_family)
+            record["family"] = LABELS.get(read_report(report_text).vendor_family)
             record["family_source"] = "report_frontmatter"
+            record["route"] = None if record["family"] is None else GENERIC if record["family"] == GENERIC else "template"
             if record["family"] is None:
                 raise ExtractionError("FAMILY_MISMATCH", "no PDF to detect, and the report names no known vendor_family",
                                       {"vendor_family": read_report(report_text).vendor_family})
@@ -241,6 +266,10 @@ def run(*, organization_id, well_id, pdf: Path | None = None, report: Path | Non
         t = time.monotonic()
         record.update(_summary(result))
         stages["record"] = round(time.monotonic() - t, 3)
+        empty = next((f for f in result.findings if f["round1_severity"] == "EXTRACTION_EMPTY"), None)
+        if empty:
+            raise ExtractionError("EXTRACTION_EMPTY", f"{empty['message']}; report, findings and review are stored",
+                                  {"model_halt": empty["value"]})
         if any(f["round1_severity"] == "LOAD_HALTED" for f in result.findings):
             raise ExtractionError("LOAD_HALTED", "D17-HALT: scenarios present different pump strings; "
                                   "grains, findings and review are stored, the load is halted", {})

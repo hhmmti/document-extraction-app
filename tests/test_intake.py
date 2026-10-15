@@ -267,11 +267,11 @@ def test_watch_view_moves_through_starting_running_and_final(env):
     write_run(env, launched, record(launched, status="running", deadline_at="2999-01-01T00:00:00Z",
                                     ended_at=None), {})
     at.run()
-    assert "Run: running" in " ".join(texts(at.markdown)) and [m.label for m in at.metric] == ["Elapsed"]
+    assert "Pipeline: running" in " ".join(texts(at.markdown)) and [m.label for m in at.metric] == ["Elapsed"]
     assert any("Current stage: not in the record" in c for c in texts(at.caption))
     (env / "runs" / launched / "run.json").write_text(json.dumps(record(launched)))
     at.run()
-    assert "Run: succeeded" in " ".join(texts(at.markdown))
+    assert "Pipeline: completed" in " ".join(texts(at.markdown))
     assert "Open the run" in [b.label for b in at.button]
 
 
@@ -303,7 +303,7 @@ def test_run_list_shows_launches_without_a_record(env):
     launched = run_id(intake.STARTUP_S + 5)
     launch_log(env, launched, "boom\n")
     df = app().dataframe[0].value.set_index("Run id")
-    assert df.loc[launched, "Run"] == "launched, no record"
+    assert df.loc[launched, "Pipeline"] == "launched, no record"
     assert any("Launch failed" in e for e in texts(app(run=launched).error))   # opening it watches it
 
 

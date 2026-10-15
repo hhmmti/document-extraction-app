@@ -60,12 +60,17 @@ def main(argv=None) -> int:
     ap.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     ap.add_argument("--clarifications", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--run-id", type=run_id_arg, help="use this run id; refused if runs/<id>/ exists")
+    ap.add_argument("--force-generic", action="store_true",
+                    help="send a document Detect matched to its template down the generic route instead "
+                         "(the yardstick's comparison runs); needs --pdf")
     ap.add_argument("--source-name", type=source_name_arg,
                     help="the source file name to record and send, in place of the PDF path's basename")
     args = ap.parse_args(argv)
 
     if not args.pdf and not args.report:
         ap.error("give --pdf, --report, or both")
+    if args.force_generic and not args.pdf:
+        ap.error("--force-generic routes a PDF: give --pdf")
     if args.source_name and not args.pdf:
         ap.error("--source-name names the PDF: give --pdf")
     root = os.environ.get(STORE_ENV)
@@ -90,7 +95,7 @@ def main(argv=None) -> int:
         record = run(organization_id=args.org, well_id=None if args.no_well else args.well, pdf=args.pdf,
                      report=args.report, store_root=root, budget_s=args.budget_s, model_id=args.model_id,
                      effort=args.effort, max_tokens=args.max_tokens, clarifications=args.clarifications,
-                     run_id=args.run_id, source_name=args.source_name)
+                     run_id=args.run_id, source_name=args.source_name, force_generic=args.force_generic)
     except ExtractionError as err:          # the run directory itself could not be created
         print(f"- failed {err.code}: {err.message}", file=sys.stderr)
         return 2
@@ -99,12 +104,15 @@ def main(argv=None) -> int:
 
 
 def summary(record: dict) -> str:
-    head = f"{record['run_id']} {record['status']} {record['family'] or '-'}"
+    head = f"{record['run_id']} {record['status']} {record['family'] or '-'}" + (" (forced)" if record.get("forced") else "")
     if record["error"]:
         head += f" {record['error']['code']} at {record['error']['stage']}"
     if record["rows"] is not None:
-        rows = "/".join(str(n) for n in record["rows"].values())
-        head += (f" rows {rows} findings {record['findings']['total']} spec {record['spec_validation_status']}"
+        load = "/".join(str(n) for n in record["rows"].values())
+        staged = record.get("staged")
+        rows = (f"staged {'/'.join(str(n) for n in staged.values())} · load {load}" if isinstance(staged, dict)
+                else f"load {load}")
+        head += (f" {rows} findings {record['findings']['total']} spec {record['spec_validation_status']}"
                  f" review {record['review']['needs_review']}/{record['review']['items']}")
     if record["cost_usd"] is not None:
         head += f" cost ${record['cost_usd']:.3f}"

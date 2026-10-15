@@ -75,6 +75,29 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
   - A procedure document raises `UNKNOWN_TEMPLATE`.
 - **Found in Step 4:** the signatures match the generator versions and export paths of the corpus they were built from, and real uploads differ. See §4.
 
+**Changed in Step 4.6 (2026-10-15): tolerant detection for new versions of known vendors.**
+- **ChampionX (F2)** is detected by its report title alone. The representative line, which a newer generator version prints differently, is no longer a marker.
+- **SLB (F3)** is detected by `SLB Engineer` plus its `SLB | … Report` footer, so an SLB report missing its Schematics page is still recognised as SLB.
+- **Identity is still confirmed by the required-page check.** A marker may now be a regular expression, matched within one line.
+- **An unrecognised document's error names its near misses** (family, markers matched, required pages found) and the PDF producer.
+- **Confirmed:**
+  - every corpus document detects exactly as before, with no ambiguous match;
+  - the corpus suite passes, the prompt byte check included;
+  - the newer ChampionX document from the product's upload bucket now detects as ChampionX;
+  - the two partial SLB documents detect as SLB, with the Schematics page missing. From Step 4.7 they go to the generic path.
+- **Known gaps, carried as future issues:** for some families, detection's required pages and the contract's must-have pages don't line up exactly. For example, the ChampionX main-pump block isn't checked at detection, and a `Motor` title can match a different page. A document that passes detection but that the model then refuses now fails visibly as `EXTRACTION_EMPTY` (see *Validate and stage*).
+
+**Added in Step 4.7 (2026-10-15): routing.** Detection now chooses a route instead of only accepting or failing:
+
+| Detection finds | Route |
+|---|---|
+| a family, with all its required pages | the family's template |
+| a family, with required pages missing | generic, recording the family as a hint and the missing pages |
+| no family, with a text layer | generic, recording the near misses |
+| no text layer, two families at once, or an unreadable file | the run fails, as before |
+
+An unrecognised template or a missing page no longer ends a run. A command-line flag, `--force-generic`, sends a recognised document down the generic route for measurement only; the app never uses it.
+
 ### Prep (Lambda)
 
 - **In:** the PDF and its family.
@@ -90,6 +113,8 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
   - private-use glyphs left unmapped;
   - a kept page under the 20-character floor in a text-layer family. There is no vision path, so it is not routed to an image.
 - **Confirmed in Step 2:** kept pages, every manifest field, and every kept page's text are byte-identical to the method's outputs, on the whole corpus.
+
+**Added in Step 4.7: generic prep.** With no page map, every page that has text is kept. Pages under the 20-character floor are dropped without failing the run. An unmapped glyph still fails `PREP_FAILED`.
 
 ### Extract (Lambda → Bedrock, Opus)
 
@@ -118,6 +143,28 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
   - **Effort:** medium, with adaptive thinking. High effort was tested and rejected: it fixed none of the systematic differences, introduced new ones, and doubled the thinking time.
   - **Limits:** `max_tokens` 128,000; budget 780 s. Reports run at about 1 byte per output token.
   - **Measured:** about USD 0.80 per document, from USD 0.55 to 1.32. Model time was 4–8 minutes, including 1.5–4.5 minutes of thinking before the first token. That projects to about USD 80 per 100 documents.
+
+**Changed in Step 4.6 (2026-10-15): four families now carry an amendment, and ChampionX's adds rules.** The statement above that each clarification only makes an existing requirement explicit still holds for SLB, Baker and Valiant. **It does not hold for ChampionX.**
+
+ChampionX's amendment is a contract revision for the newer generator version:
+- the representative block may print as `Account Manager | Customer Rep`, with the vendor named only in the logo;
+- **the page count is not fixed:** missing final plot pages get a note, not a halt, and blocks are read by their titles on whatever page they print;
+- **a charge pump** (a second pump model below the main pump, where a gas handler would otherwise be) is in scope, as `section_role = taper`;
+- a "GAS HANDLING" equipment string names the separator, not a gas-handler pump.
+
+**The original contract files are unchanged,** so the prompt byte check is unaffected. A regression run on an older ChampionX document is planned in Step 4.7.
+
+**Added in Step 4.7: the generic contract.** A new contract for documents without a usable template. It uses the same model, effort and time budget as the template route, and it was approved before any paid run.
+- **Output:** the same five data blocks, with the vendor family recorded as `generic`. The family hint and missing pages, when present, go into the prompt as one line of context.
+- **Rules:**
+  - every value verbatim, with its printed unit and a page reference;
+  - a value that isn't printed is left out, never guessed or defaulted;
+  - nothing is read off a plot;
+  - conflicting values are both kept;
+  - one row per distinct pump model, with section 1 the deepest;
+  - the traps the vendor contracts share (abbreviated plot labels, nameplate versus operating values, measured versus vertical depth, design point versus curve point) are restated.
+- **The only halt:** the document holds no ESP design or installation content at all.
+- **Size cap:** a generic prompt over 322,766 bytes (the size of the largest corpus template prompt) fails as `GENERIC_TOO_LARGE`, before any model call. To fit the largest corpus document, the field list in the generic prompt is cut to its name columns.
 
 ### Validate and stage (Lambda)
 
@@ -162,6 +209,19 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
   - the scenario-variance, identity and gas logs.
 - **Fail:** `REPORT_INVALID`, `FAMILY_MISMATCH`, `LOAD_HALTED`, `ASSET_INVALID`.
 
+**Added in Step 4.6 (2026-10-15): empty-extraction guards.** The first run on the newer ChampionX document halted under its contract, wrote every data block empty, and was recorded as succeeded with the document checks passed. Three guards close that gap:
+- **No pump rows and no design-context rows:** the run fails with `EXTRACTION_EMPTY`. The report, findings and review are stored, and the message names the halt rule the model declared, if any.
+- **No pump rows, but other rows present:** the run succeeds, with the document status at least `needs_review` and a review item "no pump rows extracted".
+- **The model declared a halt, but rows were still extracted:** the document status is at least `needs_review`, with a review item naming the rule.
+
+The guards set a minimum status; they carry no validator-specification severity. Halt detection is a heuristic, because the prompts fix no wording for a halt. The no-pump-rows notice now names its real reason (unmatched well, empty extraction, no pump rows, or a model halt), where it previously always said "unmatched well".
+
+**Added in Step 4.7: validation on the generic route.**
+- **Only the specification's general rules run,** with the stage's own checks and the empty-extraction guards. Vendor-specific rules are skipped.
+- **Model names resolve by exact match only:** to a catalogue name, or to a seed alias every vendor agrees on. Anything else is flagged as an unknown model.
+- **Every in-scope value goes on the review list** as needing review, and the document status is at least `needs_review`.
+- **A notice on the run:** "Extracted without a vendor template: every value is unverified."
+
 ### Store (Lambda)
 
 *Rewritten at the close of Step 3. Built and tested locally; Step 5 writes it to S3.*
@@ -204,6 +264,10 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
   - **`source_name`** sits in the record's source block and in `source.json`. It is the name passed with `--source-name`, otherwise the PDF's file name. Prep and prompt assembly read the same value, so the name recorded is the name sent. Older records without it still render.
   - **`--run-id`** lets the caller set the id. An existing run folder is refused before any AWS call.
 
+**Added in Step 4.7:**
+- **New fields:** the route; the family hint and missing pages; the near misses; whether the generic route was forced; and `staged`, the rows per table before loading.
+- **A run with no well** has staged rows but no loaded rows. The command line prints both.
+
 ### Viewer (app)
 
 *Rewritten at the close of Step 4, 2026-10-13.* Read only in round 1. It sits on a storage layer with a local backend; Step 5 adds an S3 backend behind the same interface.
@@ -227,6 +291,12 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
   - Whole-string, per-section and unstated rows are drawn apart.
   - A curve with no drawable point is listed with the reason.
   - **No catalogue overlay.** The catalogue stores head only as unlabelled fifth-order coefficients, at 60 Hz and per stage, with no documented form. Nothing is fitted, scaled or interpolated.
+
+**Changed in Step 4.7: status wording.** Engineers may read "run succeeded" next to "document checks failed" as a contradiction, so the wording was changed:
+- **The list and the run header** now read "**Pipeline: completed**" (or "failed at <stage>") and "**Document review: N items to check**".
+- **The run page carries the banner:** *"Pipeline says whether extraction ran. Document review says whether the values need an engineer's check. A completed run can still need review."*
+- **Generic runs carry a "Generic extraction: review every value" badge,** with the family hint when there is one.
+- **The run list** can be filtered by route.
 
 ## 3. Account and resources
 
@@ -308,6 +378,12 @@ There is **no push notification**: no SNS, no email, no alerting. A failure is v
   - The other was the second half of an SLB report, re-saved through Word, with no schematics page. It should fail as `REQUIRED_PAGES_MISSING`.
   - Neither is changed in Step 4. How widely the product's uploads differ from the corpus is measured before any signature is changed (§6).
 
+**Added in Step 4.6:** `EXTRACTION_EMPTY` (*Validate and stage*). No pump-configuration and no design-context rows were extracted, typically because the model halted under its contract. **Action:** DS checks the contract against the document's layout; a new version of a known template usually needs a contract revision.
+
+**Changed in Step 4.7:**
+- **New code `GENERIC_TOO_LARGE`,** raised before *Extract*: the generic prompt is over the size cap. **Action:** DS; the document needs a template, or the cap needs revisiting.
+- **`UNKNOWN_TEMPLATE` and `REQUIRED_PAGES_MISSING` no longer fail a run.** They send it to the generic route.
+
 ## 5. Round 1 decisions
 
 **Set by Keith:**
@@ -355,6 +431,21 @@ There is **no push notification**: no SNS, no email, no alerting. A failure is v
 5. **Charts show extracted points only:** no catalogue overlay, and no fitting or scaling.
 6. **Every run is kept and listed;** the latest succeeded run per well is marked.
 
+**Settled in Step 4.6:**
+1. **Tolerant signatures for ChampionX and SLB,** with identity confirmed by required pages.
+2. **Contract revisions** live in the family's amendment file, and the original contract stays byte-pinned.
+3. **A charge pump maps to `section_role = taper`.**
+4. **An empty extraction fails.** A partial or halted one is at least `needs_review`.
+
+**Planned for Step 4.7** (generic path): a document with text but no recognised family, or a known family with a required page missing, goes to a generic extraction. It is marked `needs_review`, with every value on the review list. Image-only documents still fail.
+
+**Settled in Step 4.7:**
+1. **The generic route,** as planned above.
+2. **The size cap** is set in prompt bytes.
+3. **Generic output is never trusted by default.**
+4. **Generic contract v1 is accepted as is,** without tuning it to the test documents. Its measured misses are carried as future work, together with a proposal to promote recurring layouts to their own templates.
+5. **The status wording** shown in the viewer.
+
 ## 6. Verification
 
 ### Step 2: parity with the earlier batch extraction
@@ -397,6 +488,37 @@ Checked by Hamed in the app:
   - Its document status was `failed` under the validator specification. Under the round-1 severity rule this is a review signal, not a run failure.
 - **Tests:** the viewer and intake suites pass with synthetic runs and wells only; the process launch is stubbed in every test; the earlier suites are unchanged. No client identifier is added to the tracked tree.
 
+#### Step 4.5: real uploads surveyed
+
+Detection alone was run over every design PDF in the product's production upload bucket: 6 documents. None matched a known template as it stood:
+- 1 newer ChampionX version;
+- 2 partial SLB reports sharing one layout;
+- 2 documents from no known vendor (an installation report and a printed schematic);
+- 1 scanned document with no text layer.
+
+The same survey over the corpus reproduced its known results exactly.
+
+#### Step 4.6: tier 1
+
+- **Detection:** the newer ChampionX document now detects, and the corpus is unchanged.
+- **First paid run:** it halted under the old contract's fixed page count and was wrongly shown as a success. That led to the contract revision and the empty-extraction guards.
+- **Second paid run:** it succeeded. The charge pump and the main pump, with their stage counts and the design context, were checked against the PDF. The document status was `needs_review`, from one flow value without its unit and one model name not yet in the alias seed list.
+- **Replay:** the first run's stored report now fails as `EXTRACTION_EMPTY`.
+
+#### Step 4.7: tier 2, the generic route
+
+- **The yardstick.** The six parity documents (one per vendor family) were sent down the generic route and compared, value by value, with their template extraction.
+  - **On rows that pair, the two agree 72% of the time.** The raw figure is 51%. Most of the gap is structural: the generic contract groups pump sections by model, misses a scenario key on one document, and makes a few deliberate vocabulary choices.
+  - **35 values are genuinely missed or wrong,** mostly setting and intake depths, motor power in kW, and a few model strings and per-housing stage counts.
+  - **Design context** (fluid properties, motor nameplate, design head, water cut) is mostly right.
+  - **Reading:** a usable fallback whose pump string and depths always need an engineer's check, which is how it is flagged.
+  - **Cost:** USD 4.66 for the six.
+- **ChampionX regression.** The revised ChampionX contract, run on an older 9-page ChampionX document, gives design context identical to the earlier extraction, and pump rows agreeing at 94%, with the same two findings as before.
+- **Production documents.** The four production documents that reach the generic route all succeeded with pump rows, the two partial SLB reports included. They were spot-checked against their PDFs.
+  - **Section order:** both partial SLB runs carry a section-order finding. That sets the publish block, so their pump strings cannot reach a well record without review.
+  - **Cost:** USD 2.17.
+- **Corpus suite:** still passes, the prompt byte check included.
+
 ### Step 6: end to end
 
 **The test:**
@@ -412,6 +534,8 @@ Checked by Hamed in the app:
   - The rest size the work on new template versions, and serve the unrecognised-template test.
 
 ---
+
+**Updated in Step 4.6:** the detection survey proposed above was run in Step 4.5. The product's production bucket holds only 6 design documents, and only one of them is a Chord document. Step 6 may use any production document that has a text layer.
 
 # Round 2 — product
 
@@ -468,9 +592,13 @@ same app + Lambda path (Detect → Prep → Extract → Validate and stage)
 | 2.5 | — | Well-item field list and its brief, for the product's well configuration | **done 2026-10-12** |
 | 3 | 1 | Validate, stage and store by code: validation, guards and review list; the three grains per run; unknown-model flag; run store; run record; command-line run | **done 2026-10-13** |
 | 4 | 1 | Streamlit app, local: upload form with the well-list snapshot; detached run and live watch; run viewer with page-linked PDF, read-only review list and curve charts | **done 2026-10-13** |
-| 5 | 1 | Lambda deployed: S3 trigger, run log, failures logged | next |
-| 6 | 1 | App hosted; end to end; both verification uploads; sample check of added fields | |
+| 4.5 | 1 | Detection survey over the product's real uploads | **done 2026-10-14** |
+| 4.6 | 1 | Tier 1: tolerant detection for new versions of known vendors; ChampionX contract revision; empty-extraction guards | **done 2026-10-15** |
+| 4.7 | 1 | Tier 2: generic extraction route, flagged for review; status wording; yardstick against template extraction | **done 2026-10-15** |
+| 5 | 1 | Lambda and its role deployed through CDK: S3 trigger, run log, failures logged | next |
+| 6 | 1 | App hosted; end to end; verification uploads; sample check of added fields | |
 | 7 | 1 | Runbook, round 1 | |
+| 7.5 | — | Walkthrough material for the round-1 review: demo, examples, production and future-issue proposal, template-generator proposal, round-2 plan | |
 | 8 | 2 | Round-2 design: the questions in §9 answered, added to this note | |
 | 9 | 2 | Product writers: well config to DynamoDB, curves to the well's Athena partition | |
 | 10 | 2 | Manual entry, edit-afterwards, version store | |

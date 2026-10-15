@@ -95,14 +95,14 @@ def test_clarifications_are_on_by_default_and_can_be_turned_off():
         on = assemble_prompt(family, PREP, "x.pdf", extraction_date="2026-01-02", clarifications=True)
         assert assemble_prompt(family, PREP, "x.pdf", extraction_date="2026-01-02") == on
         assert "CONTRACT CLARIFICATIONS" not in off
-        if family in ("F1", "F2", "F4"):  # no approved clarification: no block either way
+        if family in ("F1", "F4"):  # no clarification: no block either way
             assert on == off
 
 
 @needs_assets
 def test_clarification_block_sits_after_the_contract_once():
     from extraction.assemble import ASSETS, RUNNERS
-    for family in ("F3", "F5", "F7"):
+    for family in ("F2", "F3", "F5", "F7"):
         base = assemble_prompt(family, PREP, "x.pdf", extraction_date="2026-01-02", clarifications=False)
         p = assemble_prompt(family, PREP, "x.pdf", extraction_date="2026-01-02")
         banner = f"# ===== CONTRACT CLARIFICATIONS: {RUNNERS[family]['contract']} =====\n"

@@ -45,6 +45,19 @@ def tree(root: Path, skip: Path):
             yield rel
 
 
+def client_ids(pairs):
+    """The ids looked for: the well ids, case-folded, and each organisation id with its whole-word pattern."""
+    wells = {well.casefold() for _, well in pairs if len(well) > 4}
+    orgs = {org: re.compile(rf"(?<!\w){re.escape(org)}(?!\w)", re.IGNORECASE)
+            for org, _ in pairs if len(org) > 4 and org not in SKIP_ORGS}
+    return wells, orgs
+
+
+def names_a_client(line: str, wells, orgs) -> bool:
+    folded = line.casefold()
+    return any(well in folded for well in wells) or any(org.search(line) for org in orgs.values())
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("snapshot", type=Path)
@@ -52,16 +65,12 @@ def main(argv=None) -> int:
     ap.add_argument("--root", type=Path, default=LAB)
     args = ap.parse_args(argv)
     root = args.root.resolve()
-    pairs = load(args.snapshot).pairs
-    wells = {well.casefold() for _, well in pairs if len(well) > 4}
-    orgs = [re.compile(rf"(?<!\w){re.escape(org)}(?!\w)", re.IGNORECASE)
-            for org in {org for org, _ in pairs if len(org) > 4 and org not in SKIP_ORGS}]
+    wells, orgs = client_ids(load(args.snapshot).pairs)
     changed = {path.resolve() for path in args.changed}
     hits = {True: [], False: []}
     for rel in tree(root, args.snapshot.resolve()):
         for n, line in enumerate((root / rel).read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-            folded = line.casefold()
-            if any(well in folded for well in wells) or any(org.search(line) for org in orgs):
+            if names_a_client(line, wells, orgs):
                 hits[(root / rel).resolve() in changed].append((rel, n))
     print(f"ids checked: {len(wells)} well ids, {len(orgs)} organisation ids (longer than 4 characters)")
     for is_changed, label in ((True, "files changed this step"), (False, "pre-existing")):

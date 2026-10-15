@@ -9,7 +9,7 @@
 09353359bbe110596929bdc231d1122e61b4a6e1c4a52eb2f56be5294af6def6  e244c2fe0fb33c415c5fdc70dd23f1f91cca87f1ed6e63b22429affb02472551  reports_reader.py
 f066d066afede02fcb380a6f66c674af1d88dc766129a9b9ea2dc8fc19a191df  5c3d79c9f13e4eaa58922e457034bc8886c59de9c466837dd14aaf0ab0fad760  transform.py
 921aca10c80809678a07d848f1140aabfa17140d812a475d3698166eb11ebc96  cdd7e2f10e3575cf53dfd953175273787f1b054eef10f1fa5e834c1dec04d8de  values.py
-4c9cd8db095c58e735a385c665ffced9a42cdd3615cd596d471903340ac9da84  e61a1c94db3cd8c505477f589e726cda399416b0ac5a805833adedb57c1b4691  stage.py
+4c9cd8db095c58e735a385c665ffced9a42cdd3615cd596d471903340ac9da84  2d5d5164e78a42d666aa25ec17fe65d9f56cadf9c0ede65b1b522f304845d8ac  stage.py
 de8b90e374a5e57fc6aae5dee7ecc1c42ffb2741ded1a3bcc3d7c297a14043d2  de8b90e374a5e57fc6aae5dee7ecc1c42ffb2741ded1a3bcc3d7c297a14043d2  m2-d31-seed-aliases.csv
 -  c40a6e5ccfdb60e32a2c7d495512743b2ae061544cfe673939325ea23e56b86b  alias-evidence-v1.json
 a8f20660d1b006ef752aa3a0683c3c2e0e81621eaa259b2b4b75fb9d82605100  a8f20660d1b006ef752aa3a0683c3c2e0e81621eaa259b2b4b75fb9d82605100  universal_catalog.parquet
@@ -78,3 +78,11 @@ a8f20660d1b006ef752aa3a0683c3c2e0e81621eaa259b2b4b75fb9d82605100  a8f20660d1b006
 #
 # Step 3b-3: the asset variable is renamed ESP_EXTRACTION_ASSETS_DIR (no alias for the old name);
 #   stage.py's comment follows. Comment only.
+#
+# Emptiness guard: stage() passes `report_text` and `well_matched=well_id is not None` to
+#   extraction/validate, so it can read a halt the model declares and tell an unmatched well
+#   from an empty extraction in its notices. The staging body is unchanged.
+#
+# Generic route: stage() takes family `generic` with report vendor_family `generic`, and stages it
+#   with GenericLookup (extraction/stage/generic.py, new code): D31 by exact canonical-name or
+#   seed-alias match only. Every family's path, and the staging body, are unchanged.

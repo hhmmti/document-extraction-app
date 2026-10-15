@@ -24,6 +24,9 @@ logging.getLogger("pypdf").setLevel(logging.ERROR)
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 
+GENERIC = "generic"
+
+
 @dataclass(frozen=True)
 class Detection:
     family: str
@@ -32,6 +35,18 @@ class Detection:
     # page-map order, as (role, status, matched line). The first is the
     # page's primary role; an empty list means no role resolved.
     page_roles: dict[int, list[tuple[str, str, str]]]
+
+
+@dataclass(frozen=True)
+class Routing:
+    """Where Detect sends a document.  `detection` is set on the template route only."""
+    route: str                          # template | generic
+    detection: Detection | None
+    family_hint: str | None = None      # the family matched on page 1 whose required pages are missing
+    missing_roles: tuple = ()
+    near_misses: tuple = ()             # UNKNOWN_TEMPLATE's, when no family matched
+    forced: bool = False                # a template document sent down the generic route on purpose
+    forced_from: str | None = None      # the family Detect matched, when forced
 
 
 @contextmanager
@@ -111,6 +126,48 @@ def resolve_roles(family: str, lines: list[str], titles: list[str]):
     return out
 
 
+def marker_found(marker, page1: str) -> bool:
+    """A string marker anywhere in page 1's lines; a pattern marker within one of them."""
+    return marker.search(page1) is not None if isinstance(marker, re.Pattern) else marker in page1
+
+
+def signature_hits(page1: str) -> dict[str, int]:
+    """How many of each family's page-1 markers page 1's lines carry."""
+    return {f: sum(marker_found(m, page1) for m in sig) for f, sig in PAGE1_SIGNATURE.items()}
+
+
+def required_found(family: str, pages, lines) -> list[str]:
+    """The family's required page roles that some page resolves, in page-map order."""
+    seen = {role for p, ln in zip(pages, lines)
+            for role, _s, _m in resolve_roles(family, ln, title_lines(p) if family == "F1" else [])}
+    return [r for r, status, _m in PAGE_MAP[family] if status == "required" and r in seen]
+
+
+def unknown_template(hits: dict[str, int], pages, lines, metadata) -> ExtractionError:
+    """UNKNOWN_TEMPLATE with its near misses, each family that has some of its page-1 markers (how
+    many, and which required pages the document has), and the PDF producer. No document text."""
+    near = []
+    for family, n in hits.items():
+        if n:
+            required = [r for r, status, _m in PAGE_MAP[family] if status == "required"]
+            found = required_found(family, pages, lines)
+            near.append({"family": family, "markers_matched": n, "markers": len(PAGE1_SIGNATURE[family]),
+                         "required_found": found, "required_missing": [r for r in required if r not in found]})
+    producer = " ".join(str((metadata or {}).get("Producer") or "").split()) or "not recorded"
+    misses = "; ".join(
+        f"{m['family']} with {m['markers_matched']} of {m['markers']} page-1 markers and "
+        f"{len(m['required_found'])} of {len(m['required_found']) + len(m['required_missing'])} required pages"
+        + (f" (missing {', '.join(m['required_missing'])})" if m["required_missing"] else "")
+        for m in near)
+    return ExtractionError(
+        "UNKNOWN_TEMPLATE",
+        "no family's page-1 signature matched; "
+        + (f"near misses: {misses}" if near else "no family has any of its page-1 markers")
+        + f"; PDF producer: {producer}",
+        {"families": [], "near_misses": near, "producer": producer},
+    )
+
+
 def detect(pdf_bytes: bytes) -> Detection:
     with read_pdf(pdf_bytes) as pdf:
         pages = pdf.pages
@@ -126,12 +183,10 @@ def detect(pdf_bytes: bytes) -> Detection:
             )
 
         lines = [page_lines(p) for p in pages]
-        page1 = "\n".join(lines[0])
-        families = [f for f, sig in PAGE1_SIGNATURE.items() if all(m in page1 for m in sig)]
+        hits = signature_hits("\n".join(lines[0]))
+        families = [f for f, n in hits.items() if n == len(PAGE1_SIGNATURE[f])]
         if not families:
-            raise ExtractionError(
-                "UNKNOWN_TEMPLATE", "no family's page-1 signature matched", {"families": []},
-            )
+            raise unknown_template(hits, pages, lines, pdf.metadata)
         if len(families) > 1:
             raise ExtractionError(
                 "AMBIGUOUS_TEMPLATE",
@@ -155,3 +210,21 @@ def detect(pdf_bytes: bytes) -> Detection:
             {"family": family, "missing_roles": missing},
         )
     return Detection(family, len(lines), page_roles)
+
+
+def route(pdf_bytes: bytes, *, force_generic: bool = False) -> Routing:
+    """The template route for a family matched with all its required pages; the generic route for a
+    family matched with required pages missing (that family is the hint), or for a text layer no
+    family matches.  IMAGE_ONLY, AMBIGUOUS_TEMPLATE and PREP_FAILED still raise.  `force_generic`
+    sends a template document down the generic route without a hint, as an unknown one would go."""
+    try:
+        detection = detect(pdf_bytes)
+    except ExtractionError as err:
+        if err.code == "REQUIRED_PAGES_MISSING":
+            return Routing(GENERIC, None, err.details["family"], tuple(err.details["missing_roles"]))
+        if err.code == "UNKNOWN_TEMPLATE":
+            return Routing(GENERIC, None, near_misses=tuple(err.details["near_misses"]))
+        raise
+    if force_generic:
+        return Routing(GENERIC, None, forced=True, forced_from=detection.family)
+    return Routing("template", detection)

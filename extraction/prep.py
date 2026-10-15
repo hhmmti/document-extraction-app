@@ -110,6 +110,43 @@ def prep(pdf_bytes: bytes, detection: Detection, *, source_file: str = "") -> Pr
             low, " · ".join(notes),
         ])))
 
+    _fail_on(thin, unmapped)
+    return PrepResult(kept, page_text, rows)
+
+
+def prep_generic(pdf_bytes: bytes, *, source_file: str = "") -> PrepResult:
+    """Prep for the generic route.  There is no page map: every page whose text layer reaches the
+    image-route floor is kept, and the rest are dropped, not failed.  Glyphs are translated as for
+    the families, and an unmapped one still fails, since it may sit beside a value."""
+    with read_pdf(pdf_bytes) as pdf:
+        layouts = [p.extract_text(layout=True) or "" for p in pdf.pages]
+    kept = [i for i, layout in enumerate(layouts, 1) if n_chars(layout) >= IMAGE_ROUTE_CHARS]
+    sliced_no = {p: k for k, p in enumerate(kept, 1)}
+    page_text, rows, unmapped = {}, [], {}
+    for i, layout in enumerate(layouts, 1):
+        chars, keep = n_chars(layout), i in sliced_no
+        notes = ["generic route: no page map; kept for its text layer" if keep else
+                 f"dropped: {chars} non-whitespace characters, under the {IMAGE_ROUTE_CHARS}-character floor"]
+        low = ""
+        if keep:
+            txt = fix_pua(layout)
+            leftover = set(_PUA_LEFT.findall(txt))
+            if leftover:
+                unmapped[i] = sorted(f"U+{ord(c):04X}" for c in leftover)
+            page_text[i] = txt
+            if chars < LOW_YIELD_CHARS:
+                low = "yes"
+                notes.append(f"low yield: {chars} non-whitespace characters, under the "
+                             f"{LOW_YIELD_CHARS}-character threshold; text layer is thin but present")
+        rows.append(dict(zip(MANIFEST_COLUMNS, [
+            source_file, "generic", "detected", len(layouts), i, sliced_no.get(i, ""), "", "unmapped", "",
+            "yes" if keep else "no", "yes" if keep else "no", chars, "text" if keep else "", low, " · ".join(notes),
+        ])))
+    _fail_on({}, unmapped)
+    return PrepResult(kept, page_text, rows)
+
+
+def _fail_on(thin: dict, unmapped: dict) -> None:
     if thin or unmapped:
         problems = []
         if thin:
@@ -122,4 +159,3 @@ def prep(pdf_bytes: bytes, detection: Detection, *, source_file: str = "") -> Pr
             "PREP_FAILED", "; ".join(problems),
             {"thin_pages": thin, "unmapped_pua": unmapped},
         )
-    return PrepResult(kept, page_text, rows)

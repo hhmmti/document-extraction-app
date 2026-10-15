@@ -108,7 +108,7 @@ def fail(code):
 
 
 @pytest.mark.parametrize("target,code,stage,kept", [
-    ("detect", "UNKNOWN_TEMPLATE", "detect", ["run.json", "source.json"]),
+    ("route", "IMAGE_ONLY", "detect", ["run.json", "source.json"]),    # UNKNOWN_TEMPLATE now routes generic
     ("prep", "PREP_FAILED", "prep", ["run.json", "source.json"]),
     ("extract", "MODEL_TIMEOUT", "extract", ["prep_manifest.csv", "run.json", "source.json"]),
 ])
@@ -178,9 +178,26 @@ def test_cli_exit_codes_and_summary_line(files, monkeypatch, capsys):
     assert main(["--report", str(report), "--org", "org-1", "--no-well"]) == 0
     line = capsys.readouterr().out.strip()
     assert re.match(r"\d{8}T\d{6}Z-[0-9a-f]{8} succeeded F4 ", line)
+    assert " staged 1/1/0 · load 0/0/0 " in line         # no well: the report's rows staged, none loaded
     bad = report.with_name("bad.md")
     bad.write_text(INVALID, encoding="utf-8")
     assert main(["--report", str(bad), "--org", "org-1", "--well", "W"]) == 1
     assert "failed F4 REPORT_INVALID at stage" in capsys.readouterr().out
     monkeypatch.delenv(R.STORE_ENV)
     assert main(["--report", str(report), "--org", "org-1", "--no-well"]) == 2
+
+
+def test_an_empty_extraction_fails_and_keeps_its_report_and_findings(tmp_path):
+    from test_validate import HALT_LINE, with_prose
+    report = tmp_path / "report.md"
+    report.write_text(with_prose(report_text("F4"), HALT_LINE), encoding="utf-8")
+    record = R.run(organization_id="org-1", well_id="WELL 1", report=report, store_root=tmp_path / "store")
+    assert (record["status"], record["error"]["code"], record["error"]["stage"]) == ("failed", "EXTRACTION_EMPTY", "stage")
+    assert record["error"]["message"] == ("no pump-configuration and no design-context rows were extracted; the model "
+                                          "declared a halt naming V-02; report, findings and review are stored")
+    assert record["error"]["details"] == {"model_halt": ["V-02"]}
+    assert (record["spec_validation_status"], record["rows"]["pump_config"]) == ("failed", 0)
+    assert {"report.md", "findings.jsonl", "review.jsonl", "notices.jsonl"} <= set(stored(record))
+    findings = [json.loads(line) for line in (R.Path(record["store_dir"]) / "findings.jsonl").read_text().splitlines()]
+    assert [f["rule_id"] for f in findings if f["round1_severity"] == "EXTRACTION_EMPTY"] == ["G-E1"]
+    assert on_disk(record)["status"] == "failed"

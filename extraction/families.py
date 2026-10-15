@@ -1,16 +1,24 @@
 """Vendor families: page-1 signatures, page maps, and the glyph map.
 
 These are the constants of the corpus slicing step, carried over verbatim for
-F1-F5 and F7 with one change: F1's signature is `SIZING REPORT` alone. The
-dropped marker, `Summit ESP Representative`, sits in a page-1 disclaimer that
-some genuine F1 documents do not print; the required-page check carries the
-rest of the identification.
+F1-F5 and F7 with three changes to the page-1 signatures. In each, the
+required-page check carries the rest of the identification.
+
+- F1 is `SIZING REPORT` alone. The dropped marker, `Summit ESP Representative`,
+  sits in a page-1 disclaimer that some genuine F1 documents do not print.
+- F2 is its title alone. A newer version of its report generator prints the
+  representative block under another label and the vendor name only in the logo.
+- F3 is `SLB Engineer` and the `SLB | … Report` page footer. `Schematics Report`
+  was dropped: a partial SLB document, re-saved without its schematics pages,
+  must still read as F3, so that it fails on the missing required page.
 
 F6 (XSize) has no entry. Its documents have no text layer, so detection
 reports them as image-only rather than as a family.
 """
 
 from __future__ import annotations
+
+import re
 
 # Yield is counted in NON-WHITESPACE characters. Layout-preserving extraction
 # pads every page out to a rectangle, so raw length would report a blank page
@@ -30,13 +38,13 @@ LOW_YIELD_CHARS = 150
 # Page-1 signatures
 #
 # Every marker must be present in page 1's default-extraction lines for a
-# family to match.
+# family to match: a string anywhere in them, a pattern within one line.
 # --------------------------------------------------------------------------
 
 PAGE1_SIGNATURE = {
     "F1": ["SIZING REPORT"],
-    "F2": ["EQUIPMENT AND PERFORMANCE REPORT", "ChampionX Representative"],
-    "F3": ["Schematics Report", "SLB Engineer"],
+    "F2": ["EQUIPMENT AND PERFORMANCE REPORT"],
+    "F3": ["SLB Engineer", re.compile(r"SLB \| .*Report")],
     "F4": ["Well Name :", "Powered by LiftXP", "Manufacture"],
     "F5": ["ProLift Summary Report", "Surface Electrical"],
     "F7": ["Summary Sheet", "GENERAL"],

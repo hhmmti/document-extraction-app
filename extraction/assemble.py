@@ -11,7 +11,11 @@ shell effect the runners relied on is reproduced on purpose:
 - sed's replacement text expands `&` to the matched placeholder, so a source
   name containing `&` carries the placeholder text, as the runners' prompts do.
 
-The assets under `assets/` are verbatim copies; see `assets/MANIFEST.txt`.
+The assets under `assets/` are verbatim copies; see `assets/MANIFEST.txt`.  The generic
+route's two assets, `generic-pass-a.md` and `generic-contract.md`, are drafts written here,
+not copies, and go into the same frame: report contract, schemas and field inventory (every
+family's proposed rows, since no one family applies, cut to `family` and `field_as_printed` so
+that the largest parity document fits the generic byte cap).
 """
 
 from __future__ import annotations
@@ -56,12 +60,18 @@ RUNNERS = {
                "statement: one row, group_total, with the per-housing count carried",
                "separately.",
            ]},
+    "generic": {"prompt": "generic-pass-a.md", "contract": "generic-contract.md", "family_pat": "",
+                "staging": True, "contract_notes": [], "columns": ("family", "field_as_printed")},
     "F7": {"prompt": "f7-pass-a.md", "contract": "f7-valiant.md", "family_pat": "Valiant",
            "staging": True, "contract_notes": [
                "NOTE: §5, §6, §7 and §8 carry correction subsections dated 2026-08-20.",
                "Where the original text and a correction disagree, the CORRECTION wins.",
            ]},
 }
+
+# The generic prompt's byte cap: the largest prompt the parity runs sent (the assembled F1
+# parity document), so a generic run is never bigger than a call already measured.
+GENERIC_PROMPT_CAP = 322_766
 
 RUNTIME_OVERRIDE = [
     "# ===== RUNTIME OVERRIDE =====",
@@ -153,17 +163,19 @@ def section(text: str, start: str, stop: str) -> str:
     return _subst(out)
 
 
-def field_list(family_pat: str) -> str:
-    """The runners' inline python: this family's proposed inventory rows, re-written as CSV."""
+def field_list(family_pat: str, columns=None) -> str:
+    """The runners' inline python: this family's proposed inventory rows, re-written as CSV.
+    `columns` keeps only those columns (the generic route's list)."""
     buf = io.StringIO()
     out = csv.writer(buf, lineterminator="\n")
     r = csv.reader(io.StringIO(_asset(INVENTORY), newline=""))
     hdr = next(r)
-    out.writerow(hdr)
+    keep = [hdr.index(c) for c in columns] if columns else None
+    out.writerow(hdr if keep is None else [hdr[i] for i in keep])
     fi, pi = hdr.index("family"), hdr.index("proposed")
     for row in r:
         if len(row) > max(fi, pi) and family_pat in row[fi] and row[pi].strip().lower() == "yes":
-            out.writerow(row)
+            out.writerow(row if keep is None else [row[i] for i in keep])
     return buf.getvalue().rstrip("\n")
 
 
@@ -198,9 +210,18 @@ def manifest_csv(rows: list[dict]) -> str:
     return buf.getvalue()
 
 
+def route_line(family_hint: str | None, missing_roles=()) -> str:
+    """The generic prompt's one line of route context: the family whose page-1 signature matched
+    when its required pages are missing, else `none`."""
+    if not family_hint:
+        return "none"
+    return (f"page 1 carries the signature of vendor family {family_hint}, but its required page(s) are "
+            f"missing: {'; '.join(missing_roles)}. Context only: this contract governs.")
+
+
 def assemble_prompt(family: str, prep_result: PrepResult, source_file: str,
                     well_id: str | None = None, extraction_date: str | None = None,
-                    clarifications: bool = True) -> str:
+                    clarifications: bool = True, route_context: str = "none") -> str:
     """The full prompt for one document, byte for byte as the family's runner built it.
 
     `source_file` is the uploaded file's name; any directory part is dropped.
@@ -209,7 +230,8 @@ def assemble_prompt(family: str, prep_result: PrepResult, source_file: str,
     `extraction_date` defaults to today's local date, as `date +%F` gave.
     By default the family's approved contract clarification, if it has one, goes
     after the contract and before the report-contract banner. `clarifications=False`
-    leaves the prompt byte for byte as the runners built it.
+    leaves the prompt byte for byte as the runners built it.  `route_context` fills the generic
+    prompt's `{{route_context}}`; no family prompt has that placeholder.
     """
     if family not in RUNNERS:
         raise ValueError(f"no extraction prompt for family {family!r}")
@@ -224,6 +246,7 @@ def assemble_prompt(family: str, prep_result: PrepResult, source_file: str,
         ("{{well_id_match_status}}", "unmatched" if well_id is None else "exact"),
         ("{{extraction_date}}", extraction_date or date.today().isoformat()),
         ("{{well_slug}}", well_slug(stem)),
+        ("{{route_context}}", route_context),
     ]:
         body = sed_replace(body, placeholder, value)
 
@@ -248,7 +271,7 @@ def assemble_prompt(family: str, prep_result: PrepResult, source_file: str,
         ]
     parts += [
         "# ===== FIELD LIST (closed — extract nothing outside this) =====\n",
-        field_list(r["family_pat"]) + "\n", "\n",
+        field_list(r["family_pat"], r.get("columns")) + "\n", "\n",
         "# ===== PAGE MANIFEST for this document =====\n",
         manifest_csv(prep_result.manifest), "\n",
         "# ===== PAGE TEXT =====\n",

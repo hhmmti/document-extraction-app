@@ -12,18 +12,25 @@ Record shapes, fixed here and in the README:
 `row_key` is a row's 1-based position in its `stg_*` block as the reader parsed
 it, or null.  `round1_severity` is the locked map: REPORT_INVALID for the
 structure guards (the stage raises; nothing is staged), LOAD_HALTED for D17,
-`warning` for everything else.  `spec_severity` is the spec's, or null for a
-guard the spec does not have.  `spec_validation_status` follows spec §1.2.
+EXTRACTION_EMPTY for G-E1 (the run fails), `warning` for everything else.
+`spec_severity` is the spec's, or null for a guard the spec does not have.
+`spec_validation_status` follows spec §1.2, with a floor from the emptiness guards:
+G-E1 (no pump-configuration and no design-context rows) is failed; G-E2 (no pump
+rows beside other rows) and G-E3 (a halt the model declared, rows still staged)
+are at least needs_review.  A generic-route report is at least needs_review too, and says
+so in a notice: no vendor template checked it.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 
 import pyarrow.parquet as pq
 
 from ..stage.reports_reader import BLOCKS, _regions
+from ..stage.generic import GENERIC
 from ..stage.stage import CATALOGUE, asset
 from . import rules as R
 from .review import KNOWN_ISSUE, review
@@ -86,6 +93,55 @@ def _guards(report, reconciliation):
                             f"scenario_ordinal {ordinal} carries {len(labels[ordinal])} labels: {detail}")
 
 
+# The prompts say "HALT and report it" or "STOP … set validation_status: failed" and fix no wording.
+# A declaration is a prose line that starts with HALT and then a separator or a rule id
+# (`> [!warning] **HALT — V-02 (…)`), or that frontmatter value.  A line that only mentions a
+# halt (`… is not a HALT.`) is not one.
+_HALT_LINE = re.compile(r"^[\s>*_#-]*(?:\[![A-Za-z]+\]\s*)?[*_]*HALT\b[*_]*\s*(?:[—–:.(-]|V-|D1[67])")
+_RULE_ID = re.compile(r"\b(?:V-F\d-\d+|V-[A-Z]?\d{1,2}|D1[67])\b")
+FLOOR = {"G-E1": "failed", "G-E2": "needs_review", "G-E3": "needs_review"}
+GENERIC_NOTICE = "Extracted without a vendor template: every value is unverified."
+
+
+def declared_halt(report_text, report) -> list[str] | None:
+    """The rule ids of a halt the report declares, in order ([] when it names none), or None when it
+    declares none.  Only the prose before the data blocks is read, and only rule ids are kept, so
+    nothing the document prints is repeated."""
+    prose = (report_text or "").split("\n## stg_pump_config", 1)[0]
+    lines = [ln for ln in prose.splitlines() if _HALT_LINE.match(ln)]
+    failed = str(report.frontmatter.get("validation_status") or "").strip().lower() == "failed"
+    if not lines and not failed:
+        return None
+    return list(dict.fromkeys(rule for ln in lines for rule in _RULE_ID.findall(ln)))
+
+
+def _halt_said(halt) -> str:
+    return f"the model declared a halt naming {', '.join(halt) or 'no rule'}"
+
+
+def _emptiness(report, halt):
+    """G-E1..G-E3: an extraction with nothing to load, one with no pump rows, and a declared halt."""
+    pumps, context = report.blocks["stg_pump_config"], report.blocks["stg_design_context"]
+    if not pumps and not context:
+        yield R.finding("G-E1", None, "DOC", None, None, None, halt,
+                        "no pump-configuration and no design-context rows were extracted; "
+                        + (_halt_said(halt) if halt is not None else "the report declares no halt"))
+        return
+    if not pumps:
+        yield R.finding("G-E2", None, "DOC", "stg_pump_config", None, None, None, "no pump rows extracted")
+    if halt is not None:
+        yield R.finding("G-E3", None, "DOC", None, None, None, halt, f"model halt: {', '.join(halt) or 'no rule named'}")
+
+
+def _why_no_pump_rows(report, halt, well_matched) -> str:
+    why = [] if well_matched else ["unmatched well"]
+    if not report.blocks["stg_pump_config"]:
+        why.append("no pump rows extracted" if report.blocks["stg_design_context"] else "empty extraction")
+    if halt is not None:
+        why.append(_halt_said(halt))
+    return "; ".join(why) or "none of the report's pump rows reached the load"
+
+
 def _from_stage(quarantine_rows, d16_log, d17_log):
     """V-10, D16 and D17 are the stage's; surfaced here as findings."""
     for q in quarantine_rows:
@@ -130,17 +186,25 @@ def unknown_models(pump_config_rows, models: dict[str, bool]) -> list[dict]:
 
 
 def spec_validation_status(findings) -> str:
-    """Spec §1.2: any HALT -> failed; any ERROR or WARN -> needs_review; NOTE never blocks."""
+    """Spec §1.2: any HALT -> failed; any ERROR or WARN -> needs_review; NOTE never blocks.
+    The emptiness guards, which the spec does not have, set a floor (FLOOR)."""
     severities = {f["spec_severity"] for f in findings}
-    return "failed" if "HALT" in severities else "needs_review" if severities & {"ERROR", "WARN"} else "passed"
+    floors = {FLOOR.get(f.get("rule_id")) for f in findings}
+    if "HALT" in severities or "failed" in floors:
+        return "failed"
+    return "needs_review" if severities & {"ERROR", "WARN"} or "needs_review" in floors else "passed"
 
 
 def validate(report, family, lookup, quarantine_rows, reconciliation, d16_log, d17_log, pump_config_rows,
-             *, detection=None, prep=None) -> dict:
+             *, detection=None, prep=None, report_text=None, well_matched=True) -> dict:
+    """`report_text` lets the halt check read the report's prose; without it only the frontmatter
+    is read.  `well_matched` is false when the caller staged the report with no well."""
     roles = None if detection is None else {p: [r for r, _, _ in v] for p, v in detection.page_roles.items()}
     doc = R.Doc(report, family, lookup, roles, None if prep is None else prep.page_text)
     rule_findings, skipped = R.run(doc)
-    findings = [*_guards(report, reconciliation), *rule_findings, *_from_stage(quarantine_rows, d16_log, d17_log)]
+    halt = declared_halt(report_text, report)
+    findings = [*_guards(report, reconciliation), *_emptiness(report, halt), *rule_findings,
+                *_from_stage(quarantine_rows, d16_log, d17_log)]
 
     notices = []
     if family in NOTICE_TEXT:
@@ -159,12 +223,18 @@ def validate(report, family, lookup, quarantine_rows, reconciliation, d16_log, d
     else:
         unknown = []
         notices.append({"kind": "not_evaluated", "rule_id": "unknown_models", "family": family, "field": None,
-                        "message": "unknown models not evaluated: no staged pump_config rows (unmatched well)"})
+                        "message": "unknown models not evaluated: no staged pump_config rows "
+                                   f"({_why_no_pump_rows(report, halt, well_matched)})"})
 
+    status = spec_validation_status(findings)
+    if family == GENERIC:              # never trusted by default
+        notices.append({"kind": "generic_route", "rule_id": "generic", "family": family, "field": None,
+                        "message": GENERIC_NOTICE})
+        status = "needs_review" if status == "passed" else status
     return {
         "findings": findings,
         "unknown_models": unknown,
         "review": review(doc, findings, quarantine_rows),
         "notices": notices,
-        "spec_validation_status": spec_validation_status(findings),
+        "spec_validation_status": status,
     }
