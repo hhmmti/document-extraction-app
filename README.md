@@ -14,7 +14,7 @@ The extraction core of the design-document pipeline described in `design-note.md
   - **notice**: `kind` (`known_issue` or `not_evaluated`), `rule_id`, `family`, `field`, `message`.
   - `spec_validation_status` follows the spec's §1.2: any HALT finding gives `failed`, any ERROR or WARN `needs_review`, otherwise `passed`.
   - Three emptiness guards the spec does not have set a floor on it. G-E1, no `stg_pump_config` and no `stg_design_context` rows, is `failed`, and the run fails `EXTRACTION_EMPTY` with the report, findings and review stored; its message names the rule ids of any halt the model declared, never document text. G-E2, no pump rows beside other rows, and G-E3, a halt the model declared that still left rows, are at least `needs_review`, each with one review item (`no pump rows extracted`, `model halt: <rule>`). A declared halt is a prose line starting `HALT` and a separator or rule id, or `validation_status: failed` in the frontmatter. The no-pump-rows notice names its reason: unmatched well, empty extraction, no pump rows extracted, or a model halt.
-- Each failure raises `extraction.ExtractionError`, which carries `code`, `message` and `details`. The codes are `IMAGE_ONLY`, `UNKNOWN_TEMPLATE`, `AMBIGUOUS_TEMPLATE`, `REQUIRED_PAGES_MISSING`, `PREP_FAILED`, `GENERIC_TOO_LARGE`, `MODEL_TIMEOUT`, `MODEL_TRUNCATED`, `MODEL_ERROR`, `FAMILY_MISMATCH`, `ASSET_INVALID`, `REPORT_INVALID`, `EXTRACTION_EMPTY`, `LOAD_HALTED` and `STORE_FAILED`.
+- Each failure raises `extraction.ExtractionError`, which carries `code`, `message` and `details`. The codes are `IMAGE_ONLY`, `UNKNOWN_TEMPLATE`, `AMBIGUOUS_TEMPLATE`, `REQUIRED_PAGES_MISSING`, `PREP_FAILED`, `GENERIC_TOO_LARGE`, `MODEL_TIMEOUT`, `MODEL_TRUNCATED`, `MODEL_ERROR`, `FAMILY_MISMATCH`, `ASSET_INVALID`, `REPORT_INVALID`, `EXTRACTION_EMPTY`, `LOAD_HALTED` and `STORE_FAILED`. The Lambda (`lambda_function.py`) adds `INTAKE_INVALID` and `INTERNAL_ERROR`.
 
 The signatures, page maps and glyph map are in `extraction/families.py`. The parity comparator is `extraction/compare/parity.py`; it parses values with the loader's `values.py`, copied verbatim beside it (hash in `extraction/compare/MANIFEST.txt`), and prices calls from `extraction/compare/pricing.json`.
 
@@ -144,7 +144,7 @@ AWS_PROFILE=roam-ai .venv/bin/python -m extraction --pdf <pdf> --org <id> --well
 
 `--pdf` alone runs Detect, Prep, Extract (after checking the credentials are the datascience account's), Validate and stage, Store and Record. `--report` reuses a report and calls no model; with `--pdf` as well, Detect and Prep run and grounding is evaluated, and without it the checks that need them are not evaluated and the notices say so. `--well <id>` or `--no-well` (an unmatched well: no load rows, no key minted) is required. Options: `--budget-s` (default 900), `--model-id`, `--effort`, `--max-tokens` (default 128000), `--no-clarifications`, `--run-id <id>` (use this id, in the tool's own format; refused if `runs/<id>/` exists) and `--source-name <name>` (with `--pdf`: the file name prep records and the prompt names, in place of the PDF path's basename). The tool prints one line, starting with the `run_id`; it exits 0 when the run succeeded, 1 when it failed (its `run.json` says why) and 2 when it could not start.
 
-A run lives in `$ESP_RUN_STORE_DIR/runs/<run_id>/`, where `run_id` is `YYYYMMDDTHHMMSSZ-<8 hex>` (the UTC start second, then random hex: sortable and unique). It holds `run.json`, `source.json` (path and SHA-256 of the PDF and of the report), `report.md`, `prep_manifest.csv`, the three grains as Parquet (`pump_config`, `esp_well_design_context`, `curve_observations`), `quarantine.jsonl`, `findings.jsonl`, `unknown_models.jsonl`, `review.jsonl`, `notices.jsonl`, `d16_log.jsonl`, `d17_log.jsonl` and `gas_log.jsonl`. Every file is written to a temporary name and renamed into place, and each is written as soon as it exists, so a failed run keeps what it produced. The layout is meant to map one to one onto an S3 prefix later; nothing is written to S3 now.
+A run lives in `$ESP_RUN_STORE_DIR/runs/<run_id>/`, where `run_id` is `YYYYMMDDTHHMMSSZ-<8 hex>` (the UTC start second, then random hex: sortable and unique). It holds `run.json`, `source.json` (path and SHA-256 of the PDF and of the report), `report.md`, `prep_manifest.csv`, the three grains as Parquet (`pump_config`, `esp_well_design_context`, `curve_observations`), `quarantine.jsonl`, `findings.jsonl`, `unknown_models.jsonl`, `review.jsonl`, `notices.jsonl`, `d16_log.jsonl`, `d17_log.jsonl` and `gas_log.jsonl`. Every file is written to a temporary name and renamed into place, and each is written as soon as it exists, so a failed run keeps what it produced. The Lambda writes the same layout to S3, under `runs/<run_id>/` (`cdk/README.md`).
 
 `run.json` is written first with `status: running` and a `deadline_at` (start plus the budget), and last with `succeeded` or `failed`. A reader (`extraction.run.read_record`) treats a `running` record past its deadline as failed and marks it `stale`. Fields:
 
@@ -177,7 +177,7 @@ On the generic route, `prep_generic` keeps every page whose text reaches the 20-
 
 ## Run the viewer
 
-`app/main.py` is a read-only Streamlit viewer over the run store: every run, newest first and filterable, and each run in full (both statuses, the error, the source PDF page by page, the grains, curves, findings, review list, notices, unknown models, logs, and the report as plain text). Start it from this folder, so that `.streamlit/config.toml` applies:
+`app/main.py` is a Streamlit viewer over the run store, in local mode (the default) a directory and in S3 mode the bucket the Lambda writes ("Run the app against S3"): every run, newest first and filterable, and each run in full (both statuses, the error, the source PDF page by page, the grains, curves, findings, review list, notices, unknown models, logs, and the report as plain text). Start it from this folder, so that `.streamlit/config.toml` applies:
 
 ```bash
 export ESP_RUN_STORE_DIR="<run store dir>"
@@ -185,9 +185,28 @@ export ESP_SOURCE_PDF_DIRS="<pdf dir>[:<pdf dir>]"   # optional: folders searche
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/streamlit run app/main.py
 ```
 
-**New run from a PDF** starts a run from the viewer. It needs `ESP_WELL_LIST_PATH`, the well list exported from Athena as CSV (`organization_id`, `well_id`), plus the variables a run needs (`ESP_EXTRACTION_ASSETS_DIR`, and AWS credentials for the datascience account). The form copies the PDF to `intake/<sha256>.pdf` in the store, launches `python -m extraction --pdf … --run-id … --source-name …` as a detached process with its output in `launch/<run_id>.log`, and follows the run until its record is final. The app makes no AWS call itself.
+**New run from a PDF** starts a run from the viewer. It needs `ESP_WELL_LIST_PATH`, the well list exported from Athena as CSV (`organization_id`, `well_id`). In local mode it also needs the variables a run needs (`ESP_EXTRACTION_ASSETS_DIR`, and AWS credentials for the datascience account): the form copies the PDF to `intake/<sha256>.pdf` in the store, launches `python -m extraction --pdf … --run-id … --source-name …` as a detached process with its output in `launch/<run_id>.log`, and follows the run until its record is final. The app makes no AWS call itself. In S3 mode the form puts the PDF at `intake/<run_id>.pdf` with its four labels (`extraction/intake.py`) and follows the run the same way; the upload starts the Lambda. An upload with no record yet is *queued*; *not picked up* after 5 minutes with no run running (a `FAILED` row for its run id in the run log, `esp_design_extraction_logging`, and the function's CloudWatch logs say why); *expired* after 6 hours, Lambda's default limit for a waiting event.
 
-The source PDF is found by its SHA-256 only: `intake/<sha256>.pdf` under the store root, then the PDFs under `ESP_SOURCE_PDF_DIRS`. The path recorded in `run.json` and `source.json` is shown as text and never opened. Storage sits behind `app/store.py` (`RunStore`; `LocalRunStore` reads a directory). Tests: `tests/test_viewer.py` and `tests/test_intake.py`; `pytest -m store` renders every run in `ESP_RUN_STORE_DIR`. `tools/check_client_names.py <well list CSV> [changed files]` reports where the list's ids appear in this tree, by file and line only.
+In local mode the source PDF is found by its SHA-256 only: `intake/<sha256>.pdf` under the store root, then the PDFs under `ESP_SOURCE_PDF_DIRS`. The path recorded in `run.json` and `source.json` is shown as text and never opened. In S3 mode it is read from the location `source.json` records, only under the intake prefix, and only when its SHA-256 matches. Storage sits behind `app/store.py` (`RunStore`; `LocalRunStore` reads a directory, `S3RunStore` the bucket, its reads cached until **Refresh** in the sidebar). Tests: `tests/test_viewer.py` and `tests/test_intake.py`, and `tests/test_app_s3.py` for S3 mode on a fake bucket; `pytest -m store` renders every run in `ESP_RUN_STORE_DIR`. `tools/check_client_names.py <well list CSV> [changed files]` reports where the list's ids appear in this tree, by file and line only.
+
+## Run the app against S3
+
+```bash
+export ESP_APP_MODE=s3                                   # local (the default) or s3
+export ESP_BUCKET=roam-ds-assets                         # these three as the stack sets them for the Lambda
+export ESP_INTAKE_PREFIX=esp-design-extraction/intake/
+export ESP_RUNS_PREFIX=esp-design-extraction/runs/
+export ESP_WELL_LIST_PATH="<well list CSV>"              # the upload form's well list, as in local mode
+AWS_PROFILE=roam-ai PYTHONDONTWRITEBYTECODE=1 .venv/bin/streamlit run app/main.py
+```
+
+The credentials (`AWS_PROFILE`, or the other standard AWS sources) need these permissions on `roam-ds-assets`, and nothing more:
+
+| Action | Resource | For |
+|---|---|---|
+| `s3:ListBucket` | the bucket, with `s3:prefix` under `esp-design-extraction/intake/` or `esp-design-extraction/runs/` | list uploads and runs |
+| `s3:GetObject` | `esp-design-extraction/intake/*` and `esp-design-extraction/runs/*` | read an upload's labels and PDF, and a run's files |
+| `s3:PutObject` | `esp-design-extraction/intake/*` | upload a PDF |
 
 ## Detect survey
 

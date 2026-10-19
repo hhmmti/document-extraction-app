@@ -1,0 +1,26 @@
+# The Lambda's full dependency closure, at the lab venv's versions, so the image runs what the lab's
+# tests ran. boto3 and botocore are pinned too, so the function does not use the base image's copies.
+
+# What the pipeline imports at run time
+pdfplumber==0.11.9
+pandas==2.2.2
+pyarrow==22.0.0
+urllib3==2.8.0
+boto3==1.43.108
+botocore==1.43.108
+
+# Their dependencies
+cffi==2.1.1
+charset-normalizer==3.5.2
+cryptography==50.0.2
+jmespath==1.1.0
+numpy==2.5.0
+pdfminer.six==20251230
+pillow==12.3.0
+pycparser==3.0
+pypdfium2==5.14.0
+python-dateutil==2.9.0.post0
+pytz==2026.5
+s3transfer==0.19.2
+six==1.17.0
+tzdata==2026.5

@@ -18,6 +18,8 @@ CODES = frozenset({
     "EXTRACTION_EMPTY",        # Stage: no stg_pump_config and no stg_design_context rows; report and findings are stored
     "LOAD_HALTED",             # Run: D17-HALT; grains, findings and review are stored, the load is halted
     "STORE_FAILED",            # Run: a run-store write failed; the record names the file
+    "INTAKE_INVALID",          # Lambda: the intake key is not <prefix><run_id>.pdf, a label is missing or undecodable, or the PDF's SHA-256 is not its label's
+    "INTERNAL_ERROR",          # Lambda: anything unexpected; the trace is in the function's log
 })
 
 

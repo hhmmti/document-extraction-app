@@ -1,0 +1,89 @@
+name: DS Deploy ESP Design Extraction
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_deploy:
+        description: 'I confirm this deploys to the datascience account (640168431387)'
+        required: true
+        default: 'false'
+        type: boolean
+
+# Not in the template; as in v2-dev-deploy-api.yaml: a second run waits for a running deploy instead of overlapping it.
+concurrency:
+  group: ds-deploy-esp-design-extraction
+  cancel-in-progress: false
+
+# Not in the template: the workflow only checks out the code.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation
+        if: ${{ inputs.confirm_deploy != true }}
+        run: |
+          echo "❌ Deployment not confirmed. Check the confirmation box and try again."
+          exit 1
+
+  deploy:
+    name: Deploy ESP Design Extraction (Datascience Account)
+    runs-on: ubuntu-latest
+    needs: validate
+    defaults:
+      run:
+        working-directory: esp_design_extraction/cdk
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.DS_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.DS_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.DS_AWS_DEFAULT_REGION }}
+      AWS_ACCOUNT_NUMBER: ${{ secrets.DS_ACCOUNT_NUMBER }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Not in the template: the stack, its Bedrock profile and its trigger are built for us-east-1.
+      - name: Verify target region
+        run: |
+          if [ "$AWS_DEFAULT_REGION" != "us-east-1" ]; then
+            echo "❌ Wrong region! DS_AWS_DEFAULT_REGION must be us-east-1. Aborting."
+            exit 1
+          fi
+
+      - name: Verify target account
+        run: |
+          echo "🔍 Verifying AWS credentials..."
+          IDENTITY=$(aws sts get-caller-identity)
+          echo "$IDENTITY"
+          ACCOUNT=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+          echo "✅ Deploying to account: $ACCOUNT"
+          if [ "$ACCOUNT" != "640168431387" ]; then
+            echo "❌ Wrong account! Expected 640168431387, got $ACCOUNT. Aborting."
+            exit 1
+          fi
+
+      - name: Deploy CDK stack
+        run: |
+          # Pinned, unlike the template: the CDK CLI version the README's synth uses.
+          npm install -g aws-cdk@2.1144.0
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # Not in the template: stages the Lambda image's build context in build/lambda/ for cdk deploy.
+          python build_lambda.py
+          cdk deploy --require-approval never
+
+      - name: Done
+        run: |
+          echo "✅ esp-design-extraction stack deployed to datascience account."
+          echo "📅 $(date)"
+          echo "👤 Triggered by: ${{ github.actor }}"

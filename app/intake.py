@@ -1,8 +1,11 @@
-"""Intake for the upload form: copy the PDF into the store by hash, launch the pipeline, watch it.
+"""Intake for the upload form: start a run, then watch it.
 
-Local only.  The PDF becomes `<store>/intake/<sha256>.pdf`; `python -m extraction` runs detached,
+Local mode: the PDF becomes `<store>/intake/<sha256>.pdf`; `python -m extraction` runs detached,
 its output in `<store>/launch/<run_id>.log`.  Organisation and well ids travel only as process
 arguments: nothing derived from them becomes part of a path.
+
+S3 mode: the PDF becomes `<intake prefix><run_id>.pdf` in the bucket, with the labels the Lambda
+reads (`extraction.intake`), and the upload starts the run.  No process is started.
 """
 
 from __future__ import annotations
@@ -17,9 +20,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.store import file_sha256, run_status
+from extraction.intake import encode_labels, intake_key
 
 LAB = Path(__file__).resolve().parents[1]
 STARTUP_S = 120          # no run.json by then, and no process known to be alive: the launch failed
+PICKUP_S = 5 * 60        # S3 mode: an upload waiting longer, while no run is running, was not picked up
+EXPIRY_S = 6 * 3600      # S3 mode: Lambda keeps a waiting asynchronous event for 6 hours by default
 PROCESSES: dict[str, subprocess.Popen] = {}     # this app process's launches, by run id
 
 
@@ -90,3 +96,22 @@ def watch_state(record: dict | None, run_id: str, now: datetime, ended: bool | N
         return "launch failed" if ended is None else "no record yet"
     status, stale = run_status(record, now)
     return "stale" if stale else str(status)
+
+
+def upload(store, run_id: str, data: bytes, organization_id: str, well_id: str, source_name: str) -> None:
+    """S3 mode: the PDF as `<intake prefix><run_id>.pdf`, labelled for the Lambda, which starts on it.
+    A label the Lambda would refuse raises INTAKE_INVALID before anything is sent."""
+    metadata = encode_labels(organization_id, well_id, source_name, hashlib.sha256(data).hexdigest())
+    store.client.put_object(Bucket=store.bucket, Key=intake_key(store.intake_prefix, run_id), Body=data,
+                            ContentType="application/pdf", Metadata=metadata, IfNoneMatch="*")
+    store.refresh()
+
+
+def queue_state(waited_s: float, running: bool) -> str:
+    """S3 mode, an upload with no run record yet: `expired` after EXPIRY_S; `not picked up` after PICKUP_S
+    while no run is running (with one running, it waits its turn); else `queued`."""
+    if waited_s > EXPIRY_S:
+        return "expired"
+    if waited_s > PICKUP_S and not running:
+        return "not picked up"
+    return "queued"

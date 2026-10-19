@@ -1,7 +1,10 @@
-"""Run viewer: every run in the run store, and each run in full.  Read only.
+"""Run viewer: every run in the run store, and each run in full; its upload form starts a run.
 
-    ESP_RUN_STORE_DIR=<run store dir> streamlit run app/main.py
+    ESP_RUN_STORE_DIR=<run store dir> streamlit run app/main.py              # local mode, the default
+    ESP_APP_MODE=s3 ESP_BUCKET=… ESP_INTAKE_PREFIX=… ESP_RUNS_PREFIX=… streamlit run app/main.py
 
+Local mode reads a run store directory and starts a run as a process.  S3 mode reads the bucket the
+Lambda writes and starts a run by uploading to its intake prefix (README, "Run the app against S3").
 The store layout is the one `extraction/run.py` writes (README, "Running a document").
 Each panel reads its own file and reports a missing, empty or malformed file in place,
 so a failed run still shows everything it stored.
@@ -29,7 +32,8 @@ if ROOT not in sys.path:              # `streamlit run` puts only app/ on the pa
     sys.path.insert(0, ROOT)
 
 from app import intake  # noqa: E402
-from app.store import PDF_DIRS_ENV, STORE_ENV, local_store_from_env, run_status  # noqa: E402
+from app.store import (MODE_ENV, PDF_DIRS_ENV, S3_ENV, STORE_ENV, local_store_from_env, run_status,  # noqa: E402
+                       s3_store_from_env)
 from app.wells import WELL_LIST_ENV, SnapshotError, load as load_wells  # noqa: E402
 from extraction.stage.reports_reader import read_report  # noqa: E402
 from extraction.stage.stage import FAMILY_LABEL  # noqa: E402
@@ -71,7 +75,9 @@ RAMP = ["#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6", "#256abf", "#1c5c
 COST = ("This calls Opus on Bedrock in the datascience account; recent runs cost about USD 0.55–1.32 "
         "and take 3–8 minutes.")
 POLL_S = 3
-FINAL = {"launch failed", "succeeded", "failed", "stale"}
+FINAL = {"launch failed", "succeeded", "failed", "stale", "expired"}
+WAITING = ("queued", "not picked up", "expired")        # S3 mode: an upload with no run record yet
+MODE = os.environ.get(MODE_ENV) or "local"
 SECTIONS = ((True, "Whole string", "observation_is_composite = true"),
             (False, "Per section", "observation_is_composite = false"),
             (None, "Section not stated", "observation_is_composite is empty"))
@@ -93,6 +99,12 @@ def text(value, missing="—") -> str:
     if value is None or (not isinstance(value, (list, dict)) and pd.isna(value)):
         return missing
     return json.dumps(value) if isinstance(value, (list, dict)) else str(value)
+
+
+def wait_text(seconds) -> str:
+    """A wait, coarsely: `40 s`, `12 min`, `6 h 5 min`."""
+    s = max(0, int(seconds))
+    return f"{s} s" if s < 60 else f"{s // 60} min" if s < 3600 else f"{s // 3600} h {s % 3600 // 60} min"
 
 
 def plain(value) -> str:
@@ -243,19 +255,44 @@ def facts(rows):
 
 # ---- the run list ----
 
+def live(store, run_id, now) -> bool:
+    """Whether the run's record says running and its deadline has not passed."""
+    try:
+        return run_status(store.record(run_id), now) == ("running", False)
+    except Exception:  # noqa: BLE001 - an unreadable record is not running
+        return False
+
+
+def waiting(store, now) -> dict:
+    """S3 mode: each upload with no run record yet -> (state, seconds waited).  Empty for the local store."""
+    runs = set(store.run_ids())
+    uploads = {r: t for r in store.launch_ids() if r not in runs and (t := store.uploaded_at(r)) is not None}
+    running = bool(uploads) and any(live(store, r, now) for r in runs)
+    return {r: (intake.queue_state((now - t).total_seconds(), running), (now - t).total_seconds())
+            for r, t in uploads.items()}
+
+
 def list_rows(store) -> pd.DataFrame:
     now, latest, rows = datetime.now(timezone.utc), set(), []
     runs = set(store.run_ids())
+    queue = waiting(store, now)                                              # S3 mode: uploads with no record
     for run_id in sorted(runs | set(store.launch_ids()), reverse=True):     # newest first
         row = {"Run id": run_id, "Started (UTC)": started({}, run_id), "Organisation": "—", "Well": "—",
                "Latest": "", "Family": "—", "Route": "—", "Pipeline": "", "Document review": "—",
                "Error": "", "Cost (USD)": None}
+        if run_id in queue:
+            (state, waited), labels = queue[run_id], store.intake_labels(run_id) or {}
+            rows.append({**row, "Organisation": text(labels.get("organization-id")),
+                         "Well": text(labels.get("well-id")), "Pipeline": state, "Waited": wait_text(waited)})
+            continue
         if run_id not in runs:
             rows.append({**row, "Pipeline": "launched, no record"})
             continue
         try:
             record = store.record(run_id)
             org, well, error = dig(record, "organization_id"), dig(record, "well_id"), dig(record, "error")
+            if org is None and (labels := store.intake_labels(run_id)):      # S3: a running record names neither
+                org, well = labels["organization-id"], labels["well-id"]
             run = pipeline(record, now)
             key = (text(org), text(well))
             is_latest = run == "completed" and well is not None and key not in latest
@@ -313,6 +350,10 @@ def show_list(store):
         "Error": st.column_config.TextColumn(help="`error.code` at `error.stage`"),
         "Cost (USD)": st.column_config.NumberColumn(
             format="$%.2f", help="`cost_usd`: the model call's cost; empty without a model call"),
+        **({"Waited": st.column_config.TextColumn(
+            help=f"S3 mode: how long an upload has waited for the function. Queued; not picked up after "
+                 f"{intake.PICKUP_S // 60} min with no run running; expired after {intake.EXPIRY_S // 3600} h")}
+           if "Waited" in view else {}),
     })
 
 
@@ -364,7 +405,11 @@ def error_line(record):
                  f"{plain(text(error.get('message')))}")
 
 
-def title_block(run_id, record, problem):
+def title_block(run_id, record, problem, labels=None):
+    """`labels`: in S3 mode the upload's, for a record that does not name its organisation and well yet."""
+    org, well = dig(record, "organization_id"), dig(record, "well_id")
+    if org is None and labels:
+        org, well = labels["organization-id"], labels["well-id"]
     with st.container(border=True):
         st.subheader(f"Run {plain(run_id)}")
         if dig(record, "route") == "generic":
@@ -375,8 +420,8 @@ def title_block(run_id, record, problem):
         with panel("run.json", record):
             cost = dig(record, "cost_usd")
             for col, (label, value) in zip(st.columns([2, 3, 2, 3, 2]), [
-                    ("Organisation", text(dig(record, "organization_id"))),
-                    ("Well", text(dig(record, "well_id"), "no well")),
+                    ("Organisation", text(org)),
+                    ("Well", text(well, "no well")),
                     ("Family", family(record)),
                     ("Started (UTC)", started(record, run_id)),
                     ("Cost", f"${cost:.2f}" if isinstance(cost, (int, float)) else text(cost, "no model call"))]):
@@ -719,7 +764,14 @@ def source_pane(store, get, record, page_key):
         return
     sha = text(pdf.get("sha256"), "")
     with panel("the source PDF", record):
-        data = store.source_pdf(sha)
+        data = store.source_pdf(sha, pdf.get("path"))
+        if data is None and MODE == "s3":
+            st.warning("Source not in store")
+            st.caption("Recorded location:")
+            st.code(text(pdf.get("path")), language=None, wrap_lines=True)
+            st.caption(f"SHA-256 {sha or '—'}. The PDF is shown only from its upload under the intake prefix, "
+                       "and only when its content has this SHA-256.")
+            return
         if data is None:
             st.warning("Source not in store")
             st.caption("Recorded path, shown as text only:")
@@ -758,7 +810,7 @@ def show_run(store, run_id):
     except Exception as err:  # noqa: BLE001
         problem = (f"`run.json` could not be read ({type(err).__name__}: {plain(err)}). "
                    "The files the run stored are shown below.")
-    title_block(run_id, record, problem)
+    title_block(run_id, record, problem, store.intake_labels(run_id))
 
     def get(name):
         return blob(store, run_id, name)
@@ -807,17 +859,31 @@ def well_list():
     return snapshot, None if snapshot.pairs else "The well list has a header and no wells."
 
 
+def same_request(store, run_id, record, sha256, organisation, well) -> bool:
+    """Whether a run is for this PDF, organisation and well.  In S3 mode the upload's labels say: a running
+    record there names none of them yet."""
+    labels = store.intake_labels(run_id)
+    if labels is not None:
+        return (labels["sha256"], labels["organization-id"], labels["well-id"]) == (sha256, organisation, well)
+    return (dig(record, "source", "pdf", "sha256") == sha256 and record.get("organization_id") == organisation
+            and record.get("well_id") == well)
+
+
 def running_duplicate(store, sha256, organisation, well):
-    """A run of the same PDF, organisation and well that is still running and not stale, or None."""
+    """(run id, state) of a live run of the same PDF, organisation and well, or None: a run still running and
+    not stale, or, in S3 mode, an upload not yet picked up that has not expired."""
     now = datetime.now(timezone.utc)
     for run_id in store.run_ids():
         try:
             record = store.record(run_id)
         except Exception:  # noqa: BLE001 - an unreadable record is no duplicate
             continue
-        if (run_status(record, now) == ("running", False) and dig(record, "source", "pdf", "sha256") == sha256
-                and record.get("organization_id") == organisation and record.get("well_id") == well):
-            return run_id
+        if run_status(record, now) == ("running", False) and same_request(store, run_id, record, sha256,
+                                                                           organisation, well):
+            return run_id, "running"
+    for run_id, (state, _) in waiting(store, now).items():
+        if state != "expired" and same_request(store, run_id, {}, sha256, organisation, well):
+            return run_id, state
     return None
 
 
@@ -848,15 +914,22 @@ def show_upload(store):
         st.error("This file is not a PDF: it does not start with %PDF-.")
     ready = well is not None and data.startswith(b"%PDF-")
     if ready and (dup := running_duplicate(store, hashlib.sha256(data).hexdigest(), org, well)):
+        dup, state = dup
         st.warning(f"Run {plain(dup)} for this PDF, organisation and well is still running. You can start "
-                   "another.")
+                   "another." if state == "running" else
+                   f"Run {plain(dup)} for this PDF, organisation and well is waiting for the function ({state}). "
+                   "You can start another.")
     st.warning(COST, icon=":material/payments:")
     confirmed = st.checkbox("I understand this starts a paid model call", disabled=not ready, key="new-confirm")
     if st.button("Start the run", type="primary", disabled=not (ready and confirmed)):
         try:
-            pdf = intake.save_pdf(store.root, data)
-            run_id = intake.new_run_id(datetime.now(timezone.utc))
-            intake.launch(store.root, pdf, org, well, run_id, upload.name)
+            if MODE == "s3":
+                run_id = intake.new_run_id(datetime.now(timezone.utc))
+                intake.upload(store, run_id, data, org, well, upload.name)
+            else:
+                pdf = intake.save_pdf(store.root, data)
+                run_id = intake.new_run_id(datetime.now(timezone.utc))
+                intake.launch(store.root, pdf, org, well, run_id, upload.name)
         except Exception as err:  # noqa: BLE001 - say why nothing started
             st.error(f"The run could not be started ({type(err).__name__}: {plain(err)}).")
             return
@@ -878,18 +951,39 @@ def when(value):
 
 def watch_now(store, run_id):
     """(state, record) as the watch view shows them."""
+    store.refresh(run_id)                     # S3 mode: this run as it is now; the local store caches nothing
     try:
         record = store.record(run_id)
     except FileNotFoundError:
         record = None
     except Exception:  # noqa: BLE001 - written but not readable: keep watching
         return "unreadable", None
-    return intake.watch_state(record, run_id, datetime.now(timezone.utc), intake.exited(run_id)), record
+    now, uploaded = datetime.now(timezone.utc), store.uploaded_at(run_id)
+    if record is None and uploaded is not None:                     # S3 mode: uploaded, no record yet
+        waited = (now - uploaded).total_seconds()
+        if waited > intake.PICKUP_S:
+            store.refresh()                   # whether a run is running decides it: look at the runs again
+        return intake.queue_state(waited, any(live(store, r, now) for r in store.run_ids())), None
+    return intake.watch_state(record, run_id, now, intake.exited(run_id)), record
 
 
 def render_watch(store, run_id) -> str:
     state, record = watch_now(store, run_id)
-    if state == "starting":
+    if state in WAITING:
+        uploaded = store.uploaded_at(run_id)
+        waited = wait_text((datetime.now(timezone.utc) - uploaded).total_seconds()) if uploaded else "—"
+        if state == "queued":
+            st.info(f"Queued for {waited}: the upload is waiting for the function to pick it up.",
+                    icon=":material/hourglass_top:")
+        elif state == "not picked up":
+            st.warning(f"Not picked up: queued for {waited}, while no run is running. Look for this run id in the "
+                       "run log (DynamoDB `esp_design_extraction_logging`, as its `pipeline_execution_id`): a "
+                       "`FAILED` row there means the function could not start the run. Its CloudWatch logs "
+                       "(`/aws/lambda/esp-design-extraction`) say more.")
+        else:
+            st.error(f"Expired: queued for {waited}, past the 6 hours Lambda keeps a waiting event. This upload "
+                     "will not run; upload the PDF again.")
+    elif state == "starting":
         st.info("Starting: waiting for the run to write its record.", icon=":material/hourglass_top:")
     elif state == "no record yet":
         age = int(intake.age_s(run_id, datetime.now(timezone.utc)))
@@ -940,17 +1034,44 @@ def show_watch(store, run_id):
     live()
 
 
+def route(store):
+    if "upload" in st.query_params:
+        show_upload(store)
+    elif st.query_params.get("watch"):
+        show_watch(store, st.query_params["watch"])
+    elif st.query_params.get("run"):
+        show_run(store, st.query_params["run"])
+    else:
+        show_list(store)
+
+
+def s3_sidebar(store):
+    with st.sidebar:
+        listed = store.listed_at
+        st.caption(f"S3 mode: runs under `s3://{store.bucket}/{store.runs_prefix}`, uploads under "
+                   f"`{store.intake_prefix}`." + (f" Listed at {listed:%H:%M:%S} UTC." if listed else ""))
+        st.button("Refresh", icon=":material/refresh:", on_click=store.refresh,
+                  help="List the bucket again, and re-read every run that is not final")
+
+
 st.set_page_config(page_title="Design-document runs", page_icon=":material/description:", layout="wide")
-STORE = local_store_from_env()
+STORE = local_store_from_env() if MODE == "local" else s3_store_from_env() if MODE == "s3" else None
 if STORE is None:
     st.title("Design-document runs")
-    st.info(f"Set {STORE_ENV} to a run store directory, then start the viewer again.")
-    st.code(f"{STORE_ENV}=<run store dir> streamlit run app/main.py", language="bash")
-elif "upload" in st.query_params:
-    show_upload(STORE)
-elif st.query_params.get("watch"):
-    show_watch(STORE, st.query_params["watch"])
-elif st.query_params.get("run"):
-    show_run(STORE, st.query_params["run"])
+    if MODE == "local":
+        st.info(f"Set {STORE_ENV} to a run store directory, then start the viewer again.")
+        st.code(f"{STORE_ENV}=<run store dir> streamlit run app/main.py", language="bash")
+    elif MODE == "s3":
+        st.info(f"S3 mode reads the bucket the Lambda writes: set {', '.join(S3_ENV)} as the stack sets them, "
+                "each prefix ending in /, then start the viewer again.")
+    else:
+        st.error(f"{MODE_ENV} is {plain(MODE)}: it must be local or s3.")
+elif MODE == "s3":
+    try:
+        route(STORE)
+    except Exception as err:  # noqa: BLE001 - credentials, network or permissions: say so, not a trace
+        st.error(f"S3 could not be read ({type(err).__name__}: {plain(err)}). Check the AWS credentials "
+                 "(AWS_PROFILE; an expired SSO session needs `aws sso login`) and the bucket variables.")
+    s3_sidebar(STORE)
 else:
-    show_list(STORE)
+    route(STORE)

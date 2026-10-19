@@ -1,7 +1,7 @@
 # Design-document extraction app — design note
 
 **Task:** B1, make design-document extraction a pipeline rather than a one-off. GitHub issue `roam-datascience-esp #98`.
-**Status:** approved by Keith; restructured into two rounds on 2026-10-05; updated at the close of Step 2 (2026-10-06), Step 3 (2026-10-13) and Step 4 (2026-10-13). Owner: Hamed.
+**Status:** approved by Keith; restructured into two rounds on 2026-10-05; updated at the close of Step 2 (2026-10-06), Steps 3 and 4 (2026-10-13), Steps 4.5 to 4.7 (2026-10-15) and Step 5 (2026-10-19). Owner: Hamed.
 
 A design document from a known vendor template is uploaded through a Streamlit app. Template detection runs first, then Opus on Bedrock extracts the numbers. The run is logged and every failure is reported. B1 is built in two rounds, and is done when round 2 is done:
 
@@ -30,6 +30,12 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
 
 **In Step 4 the app runs locally.** The shape is the same, with a detached local process in place of the S3 trigger and the Lambda, and a local folder in place of S3. Step 5 swaps those two parts.
 
+**Built in Step 5.** The S3 trigger and the Lambda replace the local process, and S3 replaces the local folder. Two details differ from the drawing:
+- **The viewer reads S3 only:** the run store, plus the intake prefix for uploads not yet picked up. It does not read the run log.
+- **The DynamoDB run log is for operations,** in the same layout as the product's own pipeline log (*Record*).
+
+The app still runs locally in round 1. Everything is built and tested offline; deployment is Step 6.
+
 ## 2. Stages — inputs, outputs, failure
 
 ### Intake (app)
@@ -57,6 +63,14 @@ There is one entry kind: a PDF. The Lambda runs *Detect → Prep → Extract →
 - **For Step 5:**
   - The hosted app writes the PDF to `<intake prefix>`, and the S3 trigger replaces the local process.
   - A run record written as `submitted` before the upload remains **proposed**. Locally, the run writes `running` first, and the launch log covers the gap.
+
+**Built in Step 5: S3 mode.** Tested offline against a stand-in for S3; it is first used against the real bucket in Step 6.
+- **A mode switch,** `ESP_APP_MODE`: `local` (the default, unchanged) or `s3`. S3 mode takes the bucket and prefixes from the same variables as the Lambda, and the user's own AWS credentials.
+- **The app is not hosted in round 1.** It runs on the analyst's machine against the datascience account, and hosting moves to round 2. "The hosted app" in the bullets above is therefore round 2.
+- **Upload:** one PUT to `s3://roam-ds-assets/esp-design-extraction/intake/<run_id>.pdf`, with content type `application/pdf` and a create-only condition, so nothing is overwritten. The app creates the run id, as it did locally.
+- **Labels** travel as object metadata, each value percent-encoded UTF-8: `organization-id`, `well-id`, `source-name` and `sha256`. The app and the Lambda share one encoding module, and the form refuses any label set the Lambda would refuse.
+- **The pre-checks stay:** an empty or non-PDF file is refused; the cost line and confirm box gate the upload; the live-run warning now reads the run records and the uploads still waiting.
+- **The `submitted` record proposed above is dropped.** A waiting upload is derived instead: an intake object with no run record yet (states under *Viewer*).
 
 ### Detect (Lambda, deterministic)
 
@@ -241,6 +255,12 @@ The guards set a minimum status; they carry no validator-specification severity.
 - **Location, proposed:** `s3://roam-ds-assets/esp-design-extraction/runs/<run_id>/` for runs, and `…/assets/` for the assets.
 - **Fail:** `STORE_FAILED`, naming the file it failed at.
 
+**Built in Step 5: written to S3 by the Lambda.**
+- The pipeline runs into the Lambda's temporary storage. The Lambda then uploads `runs/<run_id>/`, every other file first and `run.json` last.
+- `run.json` and `source.json` hold `s3://` locations, never temporary paths, and the source is the intake object.
+- **Data assets** are downloaded by name from `esp-design-extraction/assets/`, and the hash checks stay the gate (`ASSET_INVALID`). They are uploaded before the first deployed run.
+- The locations above are no longer only proposed: they are what the stack's permissions allow.
+
 ### Record (Lambda)
 
 *Rewritten at the close of Step 3. This is the shape Step 5 writes to DynamoDB.*
@@ -267,6 +287,18 @@ The guards set a minimum status; they carry no validator-specification severity.
 **Added in Step 4.7:**
 - **New fields:** the route; the family hint and missing pages; the near misses; whether the generic route was forced; and `staged`, the rows per table before loading.
 - **A run with no well** has staged rows but no loaded rows. The command line prints both.
+
+**Built in Step 5.**
+- **`run.json` is the duplicate guard.** At start, the Lambda creates `runs/<run_id>/run.json` as `running`, with a create-only condition and a `deadline_at` set to the invocation's start plus its remaining time. If the file already exists, the event is a duplicate (S3 can deliver one event more than once): it is logged, and nothing else is written. This replaces the id from the object key and version proposed in §3.
+- **A failure before the pipeline starts,** such as an invalid label or a hash mismatch, leaves the Lambda's own smaller record: status, code, stage, message and source. The viewer renders it.
+- **The run log** is a DynamoDB table in datascience, `esp_design_extraction_logging`. It copies the layout of the product's pipeline log, `esp_logging_v2`, and follows the product's file-upload pipeline, the product pipeline closest to this one:
+  - **one row per run,** of type `PIPELINE_EXECUTION`: written as `RUNNING` once the labels are read, then updated in place to `SUCCEEDED` or `FAILED`, with `success` and `end_timestamp`;
+  - a failure before that point writes one `FAILED` row; a duplicate writes none; a failed log write never fails the run;
+  - **keys:** `organization_id` and `timestamp`, in the product's timestamp format (UTC, microseconds, no offset). The table carries the product's four indexes: by `uuid`, by pipeline execution id, by organisation and type, and by status;
+  - `pipeline_execution_id` and `uuid` are the run id, or `ADHOC#<request id>` when the upload's name holds no run id. The organisation is `_unknown` when its label is missing;
+  - the row also holds `well_ids`, `resource_name` (the function's name) and `data_json`: the request id, bucket and key, the run's location, deadline and file name, then the outcome;
+  - **the raw S3 event is not stored.** The table keeps rows indefinitely, as the product's does, and the event carries the uploader's identity and IP address.
+- **The run record and the run log use different status words:** `running`, `succeeded` and `failed` in `run.json`, and the product's `RUNNING`, `SUCCEEDED` and `FAILED` in the log.
 
 ### Viewer (app)
 
@@ -297,6 +329,19 @@ The guards set a minimum status; they carry no validator-specification severity.
 - **The run page carries the banner:** *"Pipeline says whether extraction ran. Document review says whether the values need an engineer's check. A completed run can still need review."*
 - **Generic runs carry a "Generic extraction: review every value" badge,** with the family hint when there is one.
 - **The run list** can be filtered by route.
+
+**Built in Step 5: the S3 backend,** behind the same interface.
+- **States:**
+  - *queued:* an upload named `<run_id>.pdf` with no run record yet, showing how long it has waited;
+  - *not picked up:* queued for more than 5 minutes while no run is running. The hint names the run log and the log group to check;
+  - *expired:* queued for more than 6 hours, Lambda's default limit for an event waiting to run. This overrides the two above;
+  - *running* and *stale:* a `running` record, before or after its deadline;
+  - *final:* `succeeded` or `failed`, on the existing detail page.
+  - Uploads with any other name are ignored.
+- **Whether a file exists comes from the bucket listing,** never from a failed read. The first load lists every run and reads each record once, which suits hundreds of runs.
+- **Reads are cached** until the user presses Refresh. Finished runs, which never change, stay cached even then.
+- **The source PDF** is read only from the intake prefix, and shown only when its SHA-256 matches the record.
+- **A `running` record names no organisation or well yet,** because the Lambda writes it before reading the labels. For those runs, the viewer uses the upload's labels.
 
 ## 3. Account and resources
 
@@ -342,6 +387,33 @@ Everything is in **roam-ai datascience (640168431387)**, region **us-east-1**. T
 - **The app, unlike the Lambda, needs a page renderer** (`pypdfium2`), so Step 6's hosting image must carry it.
 - **The app loads its fonts from Google Fonts at runtime,** with a plain fallback offline. Step 6 decides whether hosting allows that, or whether the fonts are bundled.
 
+**Built in Step 5,** as an AWS CDK app in `esp_design_extraction/cdk/`. Tested offline; nothing is deployed until Step 6.
+
+| Resource | As built |
+|---|---|
+| Lambda `esp-design-extraction` | a container image for linux/amd64, on the Lambda Python 3.12 base image. Timeout 900 s, memory 2048 MB, reserved concurrency 1, asynchronous retries 0 |
+| Its execution role | explicit, with one inline policy (below) |
+| Trigger | object created in `roam-ds-assets` under `esp-design-extraction/intake/`, with suffix `.pdf`. CDK sets it through its own helper Lambda, which keeps any existing notifications. The Lambda writes only under `runs/`, so it cannot trigger itself |
+| Run log | DynamoDB `esp_design_extraction_logging` (*Record*): on demand, point-in-time recovery, retained if the stack is deleted, no expiry |
+| Log group | `/aws/lambda/esp-design-extraction`, 90-day retention, retained |
+| Intake, run store, assets | `s3://roam-ds-assets/esp-design-extraction/intake/`, `…/runs/` and `…/assets/` |
+
+- **The role allows only:**
+  - reading `intake/` and `assets/`, and writing `runs/`;
+  - invoking the `us.` inference profile, plain and streaming, and the model in each of the profile's three US regions, but only through that profile, as AWS documents for geographic profiles;
+  - putting and updating rows in the run log;
+  - writing to its own log group.
+- **No other grant is needed.** The bucket uses S3-managed encryption (confirmed), so there is no KMS grant. The catalogue is read from the snapshot asset, so there is no Athena or Glue grant.
+- **Packaging:** a zip came to 319 MB unpacked, over Lambda's 250 MB limit, so the Lambda is a container image. Its pinned libraries are installed into the function directory, which Lambda searches first. The image is 325 MB compressed.
+- **The model's budget** is the remaining time minus 90 s, capped at 780 s.
+- **The app is not hosted in round 1.** It runs locally, with permission to list and read `intake/` and `runs/` and to write `intake/` (listing confirmed). The hosting row above, the app task role and the run-table read are round 2.
+- **Deploy:** only through a GitHub Actions workflow, never from a laptop. It follows the pattern of the ESP monorepo's datascience deploys:
+  - it is started by hand, behind a confirm box;
+  - credentials come from the repository's datascience secrets;
+  - it stops unless the account is 640168431387 and the region us-east-1;
+  - a pinned CDK CLI builds the image on the runner, then deploys.
+  - The CDK app reads the account and region from the environment, like the monorepo's apps. The account's CDK bootstrap bucket and image repository are confirmed to exist.
+
 ## 4. Where errors are reported
 
 There is **no push notification**: no SNS, no email, no alerting. A failure is visible in two places:
@@ -383,6 +455,21 @@ There is **no push notification**: no SNS, no email, no alerting. A failure is v
 **Changed in Step 4.7:**
 - **New code `GENERIC_TOO_LARGE`,** raised before *Extract*: the generic prompt is over the size cap. **Action:** DS; the document needs a template, or the cap needs revisiting.
 - **`UNKNOWN_TEMPLATE` and `REQUIRED_PAGES_MISSING` no longer fail a run.** They send it to the generic route.
+
+**Added in Step 5:** two codes, raised by the Lambda before the pipeline runs.
+
+| Code | Stage | Meaning | Action |
+|---|---|---|---|
+| `INTAKE_INVALID` | Lambda, before *Detect* | The upload isn't named `<run_id>.pdf`, a label is missing or doesn't decode, or the PDF's SHA-256 doesn't match its label | Upload again through the app |
+| `INTERNAL_ERROR` | Lambda | Anything unexpected; the trace goes to CloudWatch | DS |
+
+**Where a failure shows now depends on how far the run got:**
+- **after the run record exists:** the failed record in the viewer, a `FAILED` row in the run log, and CloudWatch;
+- **before it** (a badly named upload, or a run record that couldn't be created): only the run-log row and CloudWatch. The viewer shows the second case as *not picked up*, and its hint names both places;
+- **killed at 15 minutes:** the record reads as stale in the viewer, as built in Step 3. The run-log row stays `RUNNING`;
+- **never invoked:** *not picked up*, then *expired* after 6 hours.
+
+**Still no alerting.** The run log can be queried by status, but nothing watches it.
 
 ## 5. Round 1 decisions
 
@@ -445,6 +532,16 @@ There is **no push notification**: no SNS, no email, no alerting. A failure is v
 3. **Generic output is never trusted by default.**
 4. **Generic contract v1 is accepted as is,** without tuning it to the test documents. Its measured misses are carried as future work, together with a proposal to promote recurring layouts to their own templates.
 5. **The status wording** shown in the viewer.
+
+**Settled in Step 5:**
+1. **Deploys go only through GitHub Actions,** in the pattern the ESP monorepo uses (Keith). The workflow reaches `main` through a small PR of its own, ahead of round 1's code PR.
+2. **Round 1 is not hosted:** the app runs locally against the datascience account (confirmed with Keith). Hosting is round 2.
+3. **Intake:** `intake/<run_id>.pdf`, named by the app, with the labels as object metadata.
+4. **The viewer reads S3 only.** A waiting upload is an intake object with no run record, and it expires after 6 hours.
+5. **The duplicate guard is a create-only `run.json`.**
+6. **The run log follows the product's file-upload pipeline,** in the product's logging layout. Moving into the product's own table later is then a configuration change, plus the points in §9.
+7. **The Lambda is a container image.**
+8. **Of Step 2's decision 5,** the `submitted` record is dropped (decision 4 above); the rest stands.
 
 ## 6. Verification
 
@@ -519,6 +616,21 @@ The same survey over the corpus reproduced its known results exactly.
   - **Cost:** USD 2.17.
 - **Corpus suite:** still passes, the prompt byte check included.
 
+### Step 5: built and tested offline
+
+Everything in Step 5 ran against stand-ins for S3 and DynamoDB; nothing has run in AWS yet.
+- **The Lambda:**
+  - a duplicate event stops;
+  - a badly named upload or a hash mismatch fails as `INTAKE_INVALID`;
+  - a failure after the run record exists leaves a failed record and a `FAILED` log row, and an earlier one leaves the log row;
+  - a success uploads the run with `run.json` last and leaves one `SUCCEEDED` row;
+  - no stored file holds a temporary path.
+- **The run log:** the stand-in table refuses what DynamoDB would, such as an unescaped reserved word or a key attribute in an update. A failed first write still ends with a complete row.
+- **The app's S3 mode:** every state, from set waiting times; the upload's key, type and labels, accepted by the Lambda's own check; and the viewer reading both kinds of failure record.
+- **The image** builds, and the pinned AWS libraries load from the function directory.
+- **The CDK app** synthesises offline, and its template tests pass. Reading the account and region from the environment leaves the template unchanged.
+- **Earlier suites are unchanged,** and no client identifier was added to the tracked tree.
+- **Left for Step 6:** paging, the create-only upload and the user's credentials against the real bucket; the deployed image loading the handler; the workflow's credentials publishing the image; the trigger firing; and one log row per run.
 ### Step 6: end to end
 
 **The test:**
@@ -583,6 +695,11 @@ same app + Lambda path (Detect → Prep → Extract → Validate and stage)
 
 ---
 
+**Added in Step 5, for moving the run log into the product's own table:**
+8. **Missing organisation.** The product files log rows with no organisation under `super_admin`; round 1 uses `_unknown`.
+9. **Second log row.** The product's file-upload Lambda also writes a `LOG` row on every invocation, which the health dashboard counts. Should this pipeline write one too? If it does, it leaves out the event and any token.
+10. **Which pipeline wrote a row.** The product marks it with a prefix on the execution id (`FILE_UPLOAD#`, `ADHOC#`). This pipeline's ids have none; a prefix would be agreed with the product team.
+
 ## Build steps
 
 | Step | Round | Ends in | Status |
@@ -595,8 +712,8 @@ same app + Lambda path (Detect → Prep → Extract → Validate and stage)
 | 4.5 | 1 | Detection survey over the product's real uploads | **done 2026-10-14** |
 | 4.6 | 1 | Tier 1: tolerant detection for new versions of known vendors; ChampionX contract revision; empty-extraction guards | **done 2026-10-15** |
 | 4.7 | 1 | Tier 2: generic extraction route, flagged for review; status wording; yardstick against template extraction | **done 2026-10-15** |
-| 5 | 1 | Lambda and its role deployed through CDK: S3 trigger, run log, failures logged | next |
-| 6 | 1 | App hosted; end to end; verification uploads; sample check of added fields | |
+| 5 | 1 | The Lambda, its role, the S3 trigger and the run log in CDK; the app's S3 mode; the deploy workflow. Built and tested offline | **done 2026-10-19** |
+| 6 | 1 | Deployed through the workflow; end to end; verification uploads; sample check of added fields. Hosting moves to round 2 | next |
 | 7 | 1 | Runbook, round 1 | |
 | 7.5 | — | Walkthrough material for the round-1 review: demo, examples, production and future-issue proposal, template-generator proposal, round-2 plan | |
 | 8 | 2 | Round-2 design: the questions in §9 answered, added to this note | |
