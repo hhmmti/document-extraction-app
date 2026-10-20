@@ -414,6 +414,12 @@ Everything is in **roam-ai datascience (640168431387)**, region **us-east-1**. T
   - a pinned CDK CLI builds the image on the runner, then deploys.
   - The CDK app reads the account and region from the environment, like the monorepo's apps. The account's CDK bootstrap bucket and image repository are confirmed to exist.
 
+**Step 6, 2026-10-19: deployed.**
+- **Changed before the deploy:** the run log and the log group are retained on a stack delete or a replacing update, but not when their creation rolls back. So a failed first deploy no longer leaves them behind to block the next one.
+- **Outside the stack:** CDK's notification helper leaves its own log group, `/aws/lambda/<generated name>`, with no expiry.
+- **Checked before the deploy:** the bucket was in us-east-1 with no event notifications; the account's Lambda concurrency was 1,000, all unreserved; and none of the stack's three fixed names existed.
+- **The data assets** were uploaded to `assets/` before the deploy. The trigger goes live with the stack, and every run checks all four assets first, an image-only one included. With no `s3:ListBucket`, a missing asset reads as `AccessDenied` in the `ASSET_INVALID` message.
+
 ## 4. Where errors are reported
 
 There is **no push notification**: no SNS, no email, no alerting. A failure is visible in two places:
@@ -631,6 +637,8 @@ Everything in Step 5 ran against stand-ins for S3 and DynamoDB; nothing has run 
 - **The CDK app** synthesises offline, and its template tests pass. Reading the account and region from the environment leaves the template unchanged.
 - **Earlier suites are unchanged,** and no client identifier was added to the tracked tree.
 - **Left for Step 6:** paging, the create-only upload and the user's credentials against the real bucket; the deployed image loading the handler; the workflow's credentials publishing the image; the trigger firing; and one log row per run.
+
+**Done in Step 6,** except paging, which two runs cannot exercise (Step 6).
 ### Step 6: end to end
 
 **The test:**
@@ -648,6 +656,15 @@ Everything in Step 5 ran against stand-ins for S3 and DynamoDB; nothing has run 
 ---
 
 **Updated in Step 4.6:** the detection survey proposed above was run in Step 4.5. The product's production bucket holds only 6 design documents, and only one of them is a Chord document. Step 6 may use any production document that has a text layer.
+
+**Done, 2026-10-19 and 20** (checked by Hamed: the app, the bucket, the run log and CloudWatch):
+- **Deployed through the workflow:** run https://github.com/roam-ai-io/roam-datascience-esp/actions/runs/39362736168, at commit `a0c590a`. The stack and the bucket's trigger were created in 84 s.
+- **Image-only:** a production design document with no text layer, under the test organisation. Queued, running, then failed as `IMAGE_ONLY` before any model call, at no cost.
+- **Known template:** an F4 document from the corpus, under its own organisation and well. It succeeded through the template route in 129 s, for USD 0.49, with the same rows as its local run (2 pump-configuration, 1 design-context, 7 curve observations) and 1 of 23 values to review. The viewer showed the three grains with page references beside the PDF.
+- **The run log** holds exactly one row per run, `FAILED` and `SUCCEEDED`. **CloudWatch** shows one invocation per upload, so no retry.
+- **What only AWS could show** (Step 5's list): the create-only upload and the user's credentials against the real bucket, the deployed image loading the handler, the workflow's credentials publishing the image, the trigger firing, and one log row per run all held. **Paging was not exercised:** S3 returns up to 1,000 keys per list call, and two runs make a few dozen.
+- **Cold start:** the first run after the deploy hit Lambda's 10-second limit on initialisation. Lambda re-ran it inside the invocation, so the run started about 40 s after its upload, with its deadline counted from the invocation's start. Peak memory stayed under 300 MB of 2,048.
+- **The added-field check from Step 2:** 20 fields that the new reports filled where the old ones were empty, drawn with a fixed seed, were checked against the PDFs and found good. It is a spot check, not an estimate: 13 of the 20 are among the 251 added differences of Step 2's parity, 7 are trap-field values, and the pool skips the alias-evidence and gas-cascade tables.
 
 # Round 2 — product
 
@@ -713,8 +730,8 @@ same app + Lambda path (Detect → Prep → Extract → Validate and stage)
 | 4.6 | 1 | Tier 1: tolerant detection for new versions of known vendors; ChampionX contract revision; empty-extraction guards | **done 2026-10-15** |
 | 4.7 | 1 | Tier 2: generic extraction route, flagged for review; status wording; yardstick against template extraction | **done 2026-10-15** |
 | 5 | 1 | The Lambda, its role, the S3 trigger and the run log in CDK; the app's S3 mode; the deploy workflow. Built and tested offline | **done 2026-10-19** |
-| 6 | 1 | Deployed through the workflow; end to end; verification uploads; sample check of added fields. Hosting moves to round 2 | next |
-| 7 | 1 | Runbook, round 1 | |
+| 6 | 1 | Deployed through the workflow; end to end; verification uploads; sample check of added fields. Hosting moves to round 2 | **done 2026-10-20** |
+| 7 | 1 | Runbook, round 1 | next |
 | 7.5 | — | Walkthrough material for the round-1 review: demo, examples, production and future-issue proposal, template-generator proposal, round-2 plan | |
 | 8 | 2 | Round-2 design: the questions in §9 answered, added to this note | |
 | 9 | 2 | Product writers: well config to DynamoDB, curves to the well's Athena partition | |
