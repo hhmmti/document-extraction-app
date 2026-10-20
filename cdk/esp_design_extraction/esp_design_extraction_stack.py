@@ -52,7 +52,7 @@ class EspDesignExtractionStack(Stack):
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
                 point_in_time_recovery_enabled=True),
-            removal_policy=RemovalPolicy.RETAIN,
+            removal_policy=RemovalPolicy.RETAIN_ON_UPDATE_OR_DELETE,
         )
         for index, partition, sort in (("uuid", "uuid", None),
                                        ("pipeline_execution_id_timestamp", "pipeline_execution_id", "timestamp"),
@@ -64,7 +64,7 @@ class EspDesignExtractionStack(Stack):
 
         log_group = logs.LogGroup(
             self, "LogGroup", log_group_name=f"/aws/lambda/{FUNCTION_NAME}",
-            retention=logs.RetentionDays.THREE_MONTHS, removal_policy=RemovalPolicy.RETAIN,
+            retention=logs.RetentionDays.THREE_MONTHS, removal_policy=RemovalPolicy.RETAIN_ON_UPDATE_OR_DELETE,
         )
 
         # Inline statements only: anything CDK added on its own would land in a separate policy,

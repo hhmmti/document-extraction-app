@@ -33,7 +33,7 @@ The bucket uses SSE-S3, so no KMS permission is needed. S3 may invoke the functi
 
 **CDK's helper Lambda.** The stack does not own `roam-ds-assets`, so CDK sets the notification through a custom resource backed by its own small Lambda (`BucketNotificationsHandler…`). That Lambda runs only when the stack is deployed, updated or deleted. Its role has `s3:GetBucketNotification` and `s3:PutBucketNotification` on this bucket only, plus the AWS managed policy `AWSLambdaBasicExecutionRole` for its own logs. It reads the bucket's current notification configuration and keeps every notification it did not create, including any EventBridge setting. It adds or removes only this stack's notification.
 
-**Retained on delete.** The run-log table and the log group survive a stack deletion, so run history and logs are kept and must be removed by hand if ever wanted. The function, both roles, the helper and this stack's notification are removed. The bucket and its objects are never touched. The image stays in the bootstrap repository.
+**Retained on delete.** The run-log table and the log group survive a stack deletion, so run history and logs are kept and must be removed by hand if ever wanted. The function, both roles, the helper and this stack's notification are removed. The helper also leaves its own log group, `/aws/lambda/<generated name>`, with no expiry, outside the stack. The bucket and its objects are never touched. The image stays in the bootstrap repository.
 
 ## Build and test
 
@@ -62,7 +62,7 @@ To run it: Actions → **DS Deploy ESP Design Extraction** → Run workflow → 
 
 The workflow stops unless the region is `us-east-1` and the credentials are for `640168431387`. Then, in `esp_design_extraction/cdk`, it installs `requirements.txt`, runs `build_lambda.py` and then `cdk deploy --require-approval never`, with the same CDK CLI version as the synth above. `cdk deploy` builds the image with the runner's Docker, for `linux/amd64`, and pushes it to the bootstrap repository. A second run waits for a running one rather than overlapping it.
 
-Before deploying, check two things on `roam-ds-assets`. First, the bucket policy must not deny this role; it has not been reviewed yet. Second, no existing object-created notification may overlap the `intake/` prefix, because S3 rejects overlapping notification rules.
+Before deploying, check two things on `roam-ds-assets`. First, the bucket policy must not deny this role. Second, no existing object-created notification may overlap the `intake/` prefix, because S3 rejects overlapping notification rules.
 
 ## Install the workflow
 

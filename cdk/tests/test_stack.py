@@ -158,10 +158,10 @@ def test_table(template):
     assert p["BillingMode"] == "PAY_PER_REQUEST"
     assert p["PointInTimeRecoverySpecification"] == {"PointInTimeRecoveryEnabled": True}
     assert "TimeToLiveSpecification" not in p and "StreamSpecification" not in p
-    assert (table["DeletionPolicy"], table["UpdateReplacePolicy"]) == ("Retain", "Retain")
+    assert (table["DeletionPolicy"], table["UpdateReplacePolicy"]) == ("RetainExceptOnCreate", "Retain")
 
 
 def test_log_group(template):
     _, group = only(template, "AWS::Logs::LogGroup", LogGroupName="/aws/lambda/esp-design-extraction")
     assert group["Properties"]["RetentionInDays"] == 90
-    assert (group["DeletionPolicy"], group["UpdateReplacePolicy"]) == ("Retain", "Retain")
+    assert (group["DeletionPolicy"], group["UpdateReplacePolicy"]) == ("RetainExceptOnCreate", "Retain")
