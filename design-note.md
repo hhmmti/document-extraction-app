@@ -666,6 +666,8 @@ Everything in Step 5 ran against stand-ins for S3 and DynamoDB; nothing has run 
 - **Cold start:** the first run after the deploy hit Lambda's 10-second limit on initialisation. Lambda re-ran it inside the invocation, so the run started about 40 s after its upload, with its deadline counted from the invocation's start. Peak memory stayed under 300 MB of 2,048.
 - **The added-field check from Step 2:** 20 fields that the new reports filled where the old ones were empty, drawn with a fixed seed, were checked against the PDFs and found good. It is a spot check, not an estimate: 13 of the 20 are among the 251 added differences of Step 2's parity, 7 are trap-field values, and the pool skips the alias-evidence and gas-cascade tables.
 
+**Corrected 2026-10-22:** the image-only document in the run above was a design document from the corpus, not a production upload. A production image-only document fails the same way, as `IMAGE_ONLY` at Detect.
+
 # Round 2 — product
 
 **Status: a target, not a design yet.** Keith set the write shape as his current thinking. Round 2 is designed in detail once the questions in §9 are answered, and that design is added to this note in Step 8.
@@ -731,9 +733,9 @@ same app + Lambda path (Detect → Prep → Extract → Validate and stage)
 | 4.7 | 1 | Tier 2: generic extraction route, flagged for review; status wording; yardstick against template extraction | **done 2026-10-15** |
 | 5 | 1 | The Lambda, its role, the S3 trigger and the run log in CDK; the app's S3 mode; the deploy workflow. Built and tested offline | **done 2026-10-19** |
 | 6 | 1 | Deployed through the workflow; end to end; verification uploads; sample check of added fields. Hosting moves to round 2 | **done 2026-10-20** |
-| 7 | 1 | Runbook, round 1 | next |
-| 7.5 | — | Walkthrough material for the round-1 review: demo, examples, production and future-issue proposal, template-generator proposal, round-2 plan | |
-| 8 | 2 | Round-2 design: the questions in §9 answered, added to this note | |
+| 7 | 1 | Runbook, round 1 (`RUNBOOK.md`) | **done 2026-10-22** |
+| 7.5 | — | Walkthrough material for the round-1 review: demo, examples, production and future-issue proposal, template-generator proposal, round-2 plan | **done 2026-10-21** |
+| 8 | 2 | Round-2 design: the questions in §9 answered, added to this note | next |
 | 9 | 2 | Product writers: well config to DynamoDB, curves to the well's Athena partition | |
 | 10 | 2 | Manual entry, edit-afterwards, version store | |
 | 11 | 2 | Deployed to product end to end; round-2 verification | |
