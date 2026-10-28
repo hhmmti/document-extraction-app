@@ -368,7 +368,7 @@ def test_a_success_uploads_the_folder_run_json_last_with_start_and_success_rows(
     names = [key.removeprefix(f"{RUNS}{RUN_ID}/") for key in keys[1:]]
     assert sorted(names) == sorted(["run.json", "source.json", "prep_manifest.csv", "report.md",
                                     *(f"{g}.parquet" for g in R.GRAINS), "quarantine.jsonl",
-                                    *(f"{n}.jsonl" for n in R.LISTS + R.LOGS)])
+                                    *(f"{n}.jsonl" for n in R.LISTS + R.LOGS), R.ENTRY])   # uploaded by the folder walk
     record, created = stored(s3, "run.json"), json.loads(s3.puts[0][1])
     assert (created["status"], record["status"], record["store"]["files"]) == ("running", "succeeded", names)
     assert (record["started_at"], record["deadline_at"]) == (created["started_at"], created["deadline_at"])

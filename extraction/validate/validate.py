@@ -6,7 +6,7 @@ Record shapes, fixed here and in the README:
                  column, value, message, blocks_publish
   review         field, table, row_key, value, cited_page, grounding, reasons,
                  needs_review
-  unknown model  model, class, pump_model_as_printed
+  unknown model  model, class, pump_model_as_printed (+ candidates when ambiguous)
   notice         kind, rule_id, family, field, message
 
 `row_key` is a row's 1-based position in its `stg_*` block as the reader parsed
@@ -29,6 +29,7 @@ from collections import defaultdict
 
 import pyarrow.parquet as pq
 
+from ..catalogue import AMBIGUOUS, CatalogueNames
 from ..stage.reports_reader import BLOCKS, _regions
 from ..stage.generic import GENERIC
 from ..stage.stage import CATALOGUE, asset
@@ -170,18 +171,25 @@ def catalogue() -> dict[str, bool]:
 
 
 def unknown_models(pump_config_rows, models: dict[str, bool]) -> list[dict]:
+    """Each row's D31 canonical name, or its printed string where D31 gave none, through the shared
+    catalogue lookup.  A case or key match is a catalogue name, so it is not unknown; a match that
+    names more than one catalogue name is `ambiguous`, with its candidates."""
+    names = CatalogueNames(models)
     out = {}
     for r in pump_config_rows:
         canonical, printed = r.get("pump_model_canonical"), r.get("pump_model_as_printed")
-        if canonical is None:
-            key = ("unresolved", printed)
-        elif canonical not in models:
-            key = ("absent", canonical)
-        elif not models[canonical]:
-            key = ("no_head_curve", canonical)
+        match = names.lookup(printed if canonical is None else canonical)
+        if match.name is not None:
+            if models[match.name]:
+                continue
+            key = ("no_head_curve", match.name)
+        elif match.how == AMBIGUOUS:
+            key = ("ambiguous", printed if canonical is None else canonical)
         else:
-            continue
-        out.setdefault(key, {"model": key[1], "class": key[0], "pump_model_as_printed": printed})
+            key = ("unresolved", printed) if canonical is None else ("absent", canonical)
+        record = out.setdefault(key, {"model": key[1], "class": key[0], "pump_model_as_printed": printed})
+        if match.candidates:
+            record["candidates"] = list(match.candidates)
     return list(out.values())
 
 

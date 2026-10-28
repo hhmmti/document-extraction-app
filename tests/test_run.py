@@ -61,7 +61,7 @@ def test_report_mode_succeeds_and_stores_everything(files):
     assert record["status"] == "succeeded" and record["error"] is None and record["model"] is None
     assert stored(record) == sorted(["run.json", "source.json", "prep_manifest.csv", "report.md",
                                      *(f"{g}.parquet" for g in R.GRAINS), "quarantine.jsonl",
-                                     *(f"{n}.jsonl" for n in R.LISTS + R.LOGS)])
+                                     *(f"{n}.jsonl" for n in R.LISTS + R.LOGS), R.ENTRY])   # a well: its entry too
     disk = on_disk(record)
     assert disk["status"] == "succeeded" and disk["rows"]["pump_config"] == 1 and disk["family"] == "F4"
     assert disk["source"]["pdf"]["sha256"] == R.sha256(pdf.read_bytes())

@@ -5,6 +5,8 @@
 or, from an existing report, Validate and stage -> Store -> Record (with Detect
 and Prep first when the PDF is given too; without it the checks that need them
 are not evaluated, and the run's notices say so).  Local only: no S3, no DynamoDB.
+A run that staged rows for a well also stores its proposed entry, `well_entry.json`
+(extraction/well_entry.py).
 
 The store root is the directory ESP_RUN_STORE_DIR names; a run lives in
 `<root>/runs/<run_id>/`.  `run.json` is written first with status `running` and
@@ -38,6 +40,7 @@ from .prep import prep, prep_generic
 from .stage import production_evidence, stage
 from .stage.reports_reader import read_report
 from .stage.stage import CATALOGUE, EVIDENCE, FAMILY_LABEL, SEED, asset
+from .well_entry import ENTRY, build_entry, entry_bytes
 
 STORE_ENV = "ESP_RUN_STORE_DIR"
 BUDGET_S = 900
@@ -253,8 +256,11 @@ def run(*, organization_id, well_id, pdf: Path | None = None, report: Path | Non
                 raise ExtractionError("FAMILY_MISMATCH", "no PDF to detect, and the report names no known vendor_family",
                                       {"vendor_family": read_report(report_text).vendor_family})
         record["hashes"]["stage_assets"] = {n: sha256(asset(n).read_bytes()) for n in (SEED, EVIDENCE, CATALOGUE)}
+        evidence = production_evidence(report_text)
         result = timed("stage", stage, report_text, organization_id, well_id, record["family"],
-                       production_evidence(report_text), detection=detection, prep=prepared)
+                       evidence, detection=detection, prep=prepared)
+        entry = build_entry(result, report_text, record["family"], organization_id, well_id,
+                            prep=prepared, evidence=evidence)      # None: no well, or an empty extraction
 
         for g in GRAINS:
             store.write(f"{g}.parquet", parquet(getattr(result, g)))
@@ -263,6 +269,8 @@ def run(*, organization_id, well_id, pdf: Path | None = None, report: Path | Non
             store.write(f"{name}.jsonl", jsonl(getattr(result, name)))
         for name in LOGS:
             store.write(f"{name}.jsonl", jsonl(result.log[name]))
+        if entry is not None:
+            store.write(ENTRY, entry_bytes(entry))
         t = time.monotonic()
         record.update(_summary(result))
         stages["record"] = round(time.monotonic() - t, 3)
