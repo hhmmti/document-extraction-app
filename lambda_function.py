@@ -1,4 +1,5 @@
-"""The Lambda's entry point, `lambda_function.lambda_handler`: an intake PDF in, a run folder out.
+"""The Lambda's entry point, `lambda_function.lambda_handler`: an intake PDF in, a run folder out.  The same image's
+second entry point, `confirm_handler`, is the confirmation writer (at the end of this file).
 
 S3 calls it for each `.pdf` created under ESP_INTAKE_PREFIX in ESP_BUCKET (the stack sets these and
 the other ESP_* variables).  For each record of the event (S3 sends one):
@@ -49,10 +50,14 @@ from botocore.exceptions import ClientError
 from extraction.assemble import ASSETS, INVENTORY
 from extraction.assets_dir import ASSETS_ENV, asset
 from extraction.bedrock import make_client
+from extraction.confirm_writer import confirm
+from extraction.confirmation import ASSETS_PREFIX, BUCKET, WRITTEN, S3Objects, request_id
+from extraction.confirmation import ROOT as CONFIRMATION_ROOT
 from extraction.errors import ExtractionError
 from extraction.intake import LABELS, decode_label, decode_labels, intake_run_id
 from extraction.run import run, sha256, utc
 from extraction.stage.stage import CATALOGUE, EVIDENCE, MANIFEST, SEED
+from extraction.validate.validate import catalogue as read_catalogue
 
 WORK = Path("/tmp/esp-design-extraction")   # intake/, assets/, and the run store's runs/<run_id>/
 RESERVE_S = 90                              # kept from the model for staging, the upload and the last row write
@@ -94,11 +99,13 @@ def relocate(obj, places):
     return obj
 
 
-def fetch_assets(s3, bucket: str, prefix: str, directory: Path) -> None:
-    """Each data asset, downloaded by name, then through its loader: the loaders' hash checks are the gate."""
+def fetch_assets(s3, bucket: str, prefix: str, directory: Path, names=tuple(ASSET_MANIFESTS)) -> None:
+    """Each data asset (or those named), downloaded by name, then through its loader: the loaders' hash checks are
+    the gate."""
     directory.mkdir(parents=True, exist_ok=True)
     os.environ[ASSETS_ENV] = str(directory)
-    for name, manifest in ASSET_MANIFESTS.items():
+    for name in names:
+        manifest = ASSET_MANIFESTS[name]
         try:
             body = s3.get_object(Bucket=bucket, Key=prefix + name)["Body"].read()
         except ClientError as err:
@@ -118,7 +125,7 @@ def standard_timestamp(at: datetime) -> str:
 def log_row(organization_id, pipeline_execution_id, well_id, status, data, at: datetime) -> dict:
     """The run's row, shaped as the file-upload pipeline's PIPELINE_EXECUTION row in esp_logging_v2, whose
     `uuid` is its pipeline execution id.  The function is `resource_name`, as esp_logging_v2's LOG rows name
-    theirs; everything else of B1's goes in `data_json`."""
+    theirs; everything else of this pipeline's goes in `data_json`."""
     organization_id = organization_id or UNKNOWN_ORGANIZATION
     return {
         "organization_id": organization_id,
@@ -311,3 +318,74 @@ def handle(s3_record, context, s3, table, bedrock) -> dict:
         return {"run_id": run_id, "status": record["status"]}
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+# ---- the confirmation writer: a second entry point in the same image ----
+
+CONFIRM_WORK = Path("/tmp/esp-design-confirmation")    # the catalogue snapshot, fetched for each request
+
+
+def confirm_handler(event, context, *, s3=None, table=None, catalogue=None):
+    """The confirmation writer's entry point, `lambda_function.confirm_handler`.  S3 calls it for each
+    `confirmations/<id>/request.json` created under s3://roam-ds-assets/esp-design-extraction/; the work is
+    extraction/confirm_writer.py's, with the layout extraction/confirmation.py fixes, so it reads no ESP_* prefix:
+    only ESP_RUN_LOG_TABLE.
+
+    The run log gets one PIPELINE_EXECUTION row per request, through `log_row` and `write_row` as a run's: its ids
+    are the confirmation id, its `resource_name` this function's name, and its `data_json` the request key, the run
+    id, the row and version keys and the outcome, never the event.  It is written RUNNING once the request names its
+    organisation and well, then updated to SUCCEEDED (written) or FAILED (refused or failed).  A request that cannot
+    be read gets one FAILED row instead, a duplicate none, and a key that is not a request one FAILED row under
+    `ADHOC#<request id>`.  Each step prints one JSON line whose `run_id` is the confirmation id; a failure's trace goes
+    there too.  The keywords stand in for AWS in tests; `catalogue()` replaces fetching the snapshot."""
+    s3 = s3 or boto3.client("s3")
+    table = table or boto3.resource("dynamodb").Table(os.environ["ESP_RUN_LOG_TABLE"])
+    return [confirm_one(s3_record, context, s3, table, catalogue) for s3_record in event.get("Records", [])]
+
+
+def confirm_one(s3_record, context, s3, table, catalogue) -> dict:
+    deadline = now() + timedelta(milliseconds=context.get_remaining_time_in_millis())
+    key = unquote_plus(s3_record["s3"]["object"]["key"])
+    cid = request_id(key)
+    row_data = {"request_id": context.aws_request_id, "request_key": key}
+    if cid is None:
+        message = f"the key is not {CONFIRMATION_ROOT}confirmations/<id>/request.json"
+        log(None, "key", key=key, message=message)
+        write_row(table, None, failed_row(None, f"ADHOC#{context.aws_request_id}", None,
+                                          {**row_data, "outcome": "rejected", "reasons": [message]}))
+        return {"key": key, "status": "rejected"}
+
+    def fetched():
+        fetch_assets(s3, BUCKET, ASSETS_PREFIX, CONFIRM_WORK / "assets", names=(CATALOGUE,))
+        return read_catalogue()
+
+    start = {}
+
+    def started(request):
+        start["row"] = log_row(request["organization_id"], cid, request["well_id"], "RUNNING",
+                               {**row_data, "run_id": request.get("run_id")}, now())
+        write_row(table, cid, start["row"])
+
+    shutil.rmtree(CONFIRM_WORK, ignore_errors=True)
+    try:
+        outcome = confirm(S3Objects(s3), key, deadline=deadline, catalogue=catalogue or fetched, started=started)
+    finally:
+        shutil.rmtree(CONFIRM_WORK, ignore_errors=True)
+    failure_ = outcome["error"]
+    if failure_:
+        log(cid, failure_["stage"], error=failure_["code"], message=failure_["message"], trace=failure_["trace"])
+    if outcome["status"] == "duplicate":
+        log(cid, "duplicate")
+        return {"confirmation_id": cid, "status": "duplicate"}
+    data = {**row_data, "run_id": outcome["run_id"], "row_key": outcome["row_key"],
+            "version_key": outcome["version_key"], "outcome": outcome["status"], "reasons": outcome["reasons"],
+            **(failure(failure_["code"], failure_["stage"], failure_["message"], failure_["trace"]) if failure_ else {})}
+    status = "SUCCEEDED" if outcome["status"] == WRITTEN else "FAILED"
+    if "row" in start:
+        write_row(table, cid, {**start["row"], "status": status, "success": status == "SUCCEEDED",
+                               "end_timestamp": standard_timestamp(now()),
+                               "data_json": json.dumps(data, default=str, sort_keys=True)}, update=True)
+    else:
+        write_row(table, cid, failed_row(outcome["organization_id"], cid, outcome["well_id"], data))
+    log(cid, "end", status=outcome["status"], run=outcome["run_id"], reasons=len(outcome["reasons"]))
+    return {"confirmation_id": cid, "status": outcome["status"]}

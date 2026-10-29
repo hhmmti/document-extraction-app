@@ -18,6 +18,7 @@ filesystem path: the S3 upload relocates paths only in run.json and source.json.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ from .stage.generic import GENERIC, GenericLookup, canonical_names
 from .stage.reports_reader import read_report
 from .stage.stage import CATALOGUE, SEED, asset, production_evidence
 from .validate.review import _informational, ground
+from .validate.rules import v08, v09
 from .validate.validate import catalogue
 
 ENTRY = "well_entry.json"
@@ -347,10 +349,7 @@ def section(row, position, names, models, ctx, report, scenario, lookup, generic
         reasons.append(f"model_ambiguous: {', '.join(match.candidates)}" if match.how == AMBIGUOUS
                        else f"model_absent: {canonical}" if canonical is not None else f"model_unresolved: {printed}")
     order, stages = row.get("section_order"), row.get("stages")
-    if not isinstance(order, int) or order != position:
-        reasons.append(f"section_incomplete: section_order {order} at position {position}")
-    if not isinstance(stages, int) or stages < 1:
-        reasons.append(f"section_incomplete: stages {stages}")
+    reasons += section_incomplete(order, stages, position)
     for k in members(report, row, scenario, lookup):
         for reason in ctx.review_reasons(PC, k, ("section_order", "section_role", "pump_model_as_printed",
                                                  "pump_model_as_printed_alt", "stages", "housing_count",
@@ -369,6 +368,23 @@ def section(row, position, names, models, ctx, report, scenario, lookup, generic
             "top_md_ft": row.get("top_md_ft"), "bottom_md_ft": row.get("bottom_md_ft"), "page": row.get("source_page"),
             "status": TO_CHECK if reasons or review else SETTLED, "reasons": reasons + review,
             "review_reasons": review}                    # the string's `review` check reads these
+
+
+def section_incomplete(order, stages, position) -> list[str]:
+    """A section's own completeness: its order is its position, and it has a whole number of stages."""
+    out = []
+    if not isinstance(order, int) or order != position:
+        out.append(f"section_incomplete: section_order {order} at position {position}")
+    if not isinstance(stages, int) or stages < 1:
+        out.append(f"section_incomplete: stages {stages}")
+    return out
+
+
+def section_value(s) -> dict:
+    """One item of the pump_sections value."""
+    return {"section_order": s["section_order"], "pump_model": s["pump_model"], "stages": s["stages"],
+            **({"section_role": s["section_role"]} if isinstance(s["section_role"], str) and s["section_role"].strip()
+               else {})}
 
 
 def check(name, result, why) -> dict:
@@ -432,9 +448,7 @@ def pump_string(result, report, ctx, names, models, lookup, generic):
     status = BLOCKS if failed & {"V-08", "D17"} else TO_CHECK if reasons else SETTLED
     value = None
     if sections and not unresolved and not incomplete:
-        value = [{"section_order": s["section_order"], "pump_model": s["pump_model"], "stages": s["stages"],
-                  **({"section_role": s["section_role"]} if isinstance(s["section_role"], str) and s["section_role"].strip()
-                     else {})} for s in sections]
+        value = [section_value(s) for s in sections]
     record = {"status": status, "reasons": reasons, "scenario": scenario, "checks": checks, "sections": sections,
               "head_sum": heads["scenarios"]}
     if halted:
@@ -649,3 +663,157 @@ def build_entry(result, report_text, family, organization_id, well_id, *, prep=N
 
 def entry_bytes(entry: dict) -> bytes:
     return (json.dumps(entry, indent=1, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+
+
+# ---------------------------------------------------------------------------------------------------
+# The string's checks, re-run on a confirmation's final sections (extraction/confirm_writer.py)
+# ---------------------------------------------------------------------------------------------------
+
+STAGED_AS = (("section_order", "section_order"), ("stages", "stages"), ("housing_count", "housings"),
+             ("stages_per_housing_as_printed", "stages_per_housing_as_printed"), ("top_md_ft", "top_md_ft"),
+             ("bottom_md_ft", "bottom_md_ft"))
+
+
+class FinalSections:
+    """Final sections as the validator's rules read a report: one scenario's stg_pump_config rows, each value the
+    string a report would print."""
+
+    def __init__(self, sections):
+        self.pump_rows = [{column: self.printed(s[name]) for column, name in STAGED_AS if s.get(name) is not None}
+                          for s in sections]
+
+    @staticmethod
+    def printed(value) -> str:
+        return ", ".join(map(str, value)) if isinstance(value, list) else str(value)
+
+    def rows(self, table):
+        return enumerate(self.pump_rows if table == PC else [], 1)
+
+
+def order_check(sections) -> dict:
+    """V-08 on final sections: the validator's own rule (contiguous 1..N, 1 deepest by the depth columns)."""
+    fired = [message for *_, message in v08(FinalSections(sections))]
+    return check("V-08", "fail" if fired else "pass" if sections else "not run",
+                 "; ".join(fired) or ("section order contiguous, 1 deepest" if sections else "no sections"))
+
+
+def final_string_checks(sections, names) -> list[dict]:
+    """The string's checks that read its sections alone, re-run on final sections with the functions that made
+    them: sections, V-08 and V-09 (the validator's rules), models (the catalogue lookup) and complete
+    (`section_incomplete`).  D17, conflict, review and the head sum read the report; they stay as the entry has them."""
+    fired = [message for *_, message in v09(FinalSections(sections))]
+    lookups = [(i, s.get("pump_model"), names.lookup(s.get("pump_model"))) for i, s in enumerate(sections, 1)]
+    unresolved = [(i, model, m) for i, model, m in lookups if m.name is None]
+    short = [(i, s) for i, s in enumerate(sections, 1) if section_incomplete(s.get("section_order"), s.get("stages"), i)]
+    return [
+        check("sections", "pass" if sections else "fail", f"{len(sections)} sections" if sections else "no sections"),
+        order_check(sections),
+        check("V-09", "fail" if fired else "pass" if sections else "not run",
+              "; ".join(fired) or ("stages agree with housings" if sections else "no pump rows")),
+        check("models", "fail" if unresolved else "pass" if sections else "not run",
+              "; ".join(f"position {i}: no model" if model is None else
+                        f"position {i}: {model} ambiguous: {', '.join(m.candidates)}" if m.how == AMBIGUOUS else
+                        f"position {i}: {model} not in the catalogue" for i, model, m in unresolved)
+              or ("every model is a catalogue name" if sections else "no sections")),
+        check("complete", "fail" if short else "pass" if sections else "not run",
+              "; ".join(f"position {i}: section_order {s.get('section_order')}, stages {s.get('stages')}" for i, s in short)
+              or ("every section has its order and stages" if sections else "no sections")),
+    ]
+
+
+# ---------------------------------------------------------------------------------------------------
+# The product's rules for the two maps (#1218's well_parameters.py at 6831cbd6), restated: the confirmation
+# writer checks every row's maps with them, and tests/test_confirm.py checks they agree with the product's own.
+# ---------------------------------------------------------------------------------------------------
+
+SOURCES = ("measured", "ops_entered", "estimated", SOURCE)
+ENVELOPE_KEYS = ("value", "unit", "source", "as_of", "note")
+UNITS = {"none", "id", "ft", "in", "psi", "psia", "scf/stb", "°F", "bbl/day", "mcf/day", "A", "V", "kW", "hp", "Hz",
+         "count", "sg", "fraction", "%"}
+UNIT_BY_SUFFIX = {"id": "id", "ft": "ft", "in": "in", "psi": "psi", "psia": "psia", "scfstb": "scf/stb", "f": "°F",
+                  "bpd": "bbl/day", "mcfd": "mcf/day", "amps": "A", "volts": "V", "kw": "kW", "hp": "hp", "hz": "Hz",
+                  "count": "count", "sg": "sg", "fraction": "fraction", "pct": "%"}
+RETIRED = {"pump_id": (PUMP, "id"), "stages": (PUMP, "count"), "setting_depth_ft": (PUMP, "ft")}   # read, not written
+DESCRIBED = {**KEYS, **RETIRED}
+SECTION_KEYS = ("section_order", "pump_model", "stages", "section_role")
+
+
+def _number(v) -> bool:
+    return not isinstance(v, bool) and isinstance(v, (int, float, Decimal))
+
+
+def _whole(v) -> bool:
+    return _number(v) and math.isfinite(v) and float(v) == int(float(v))
+
+
+def sections_problem(key, sections) -> str | None:
+    """The pump string's first problem, as #1218's validate_pump_sections finds it; None when there is none."""
+    if not isinstance(sections, list) or not sections:
+        return f"{key}: expected a non-empty list of sections, deepest section first"
+    for position, s in enumerate(sections, 1):
+        where = f"{key}[{position}]"
+        if not isinstance(s, dict):
+            return f"{where}: expected a section object, got {type(s).__name__}"
+        unknown = sorted(set(s) - set(SECTION_KEYS))
+        if unknown:
+            return f"{where}: unknown key(s) {unknown}"
+        missing = [k for k in SECTION_KEYS[:3] if s.get(k) is None]
+        if missing:
+            return f"{where}: missing {missing}"
+        if not _whole(s["section_order"]) or int(s["section_order"]) != position:
+            return f"{where}: section_order must be {position} here, got {s['section_order']!r}"
+        if not isinstance(s["pump_model"], str) or not s["pump_model"].strip():
+            return f"{where}: pump_model must be a model name"
+        if not _whole(s["stages"]) or int(s["stages"]) < 1:
+            return f"{where}: stages must be a whole number of at least 1, got {s['stages']!r}"
+        role = s.get("section_role")
+        if role is not None and (not isinstance(role, str) or not role.strip()):
+            return f"{where}: section_role must be a name when set"
+    return None
+
+
+def envelope_problem(key, envelope) -> str | None:
+    """The first rule an envelope breaks, in the order #1218's validate_envelope checks them; None when it passes."""
+    if not isinstance(envelope, dict):
+        return f"{key}: expected {{value, unit, source}}, got {type(envelope).__name__}"
+    unknown = sorted(set(envelope) - set(ENVELOPE_KEYS))
+    if unknown:
+        return f"{key}: unknown key(s) {unknown}"
+    missing = [k for k in ENVELOPE_KEYS[:3] if envelope.get(k) is None]
+    if missing:
+        return f"{key}: missing {missing}"
+    if envelope["source"] not in SOURCES:
+        return f"{key}: source {envelope['source']!r} is not one of {list(SOURCES)}"
+    unit, value = envelope["unit"], envelope["value"]
+    if _number(value):
+        if unit == "none":
+            return f"{key}: a number must state a real unit, not 'none'"
+        if unit not in UNITS:
+            return f"{key}: unknown unit {unit!r}"
+        if unit in ("id", "count") and not _whole(value):
+            return f"{key}: a {unit} must be a whole number, got {value}"
+    elif unit != "none":
+        return f"{key}: a non-numeric value must use unit 'none'"
+    bare = str(key).rsplit(".", 1)[-1]
+    declared = UNIT_BY_SUFFIX.get(str(key).rsplit("_", 1)[-1].lower())
+    if declared is not None and declared != unit:
+        return f"{key}: the key name declares {declared!r} but the value says {unit!r}"
+    if declared is None and bare in DESCRIBED and DESCRIBED[bare][1] != unit:
+        return f"{key}: {bare!r} is recorded in {DESCRIBED[bare][1]!r} but the value says {unit!r}"
+    return sections_problem(key, value) if bare == "pump_sections" else None
+
+
+def parameter_problems(mapping, field) -> list[str]:
+    """#1218's validate_parameter_map, listing each refused key's first problem where the product raises on the
+    first: [] when the product's validator accepts the map.  None and {} pass, as there."""
+    if mapping is None:
+        return []
+    if not isinstance(mapping, dict):
+        return [f"{field}: expected a map of parameters"]
+    out = []
+    for key, envelope in mapping.items():
+        if key in DESCRIBED and DESCRIBED[key][0] != field:
+            out.append(f"{field}.{key}: {key!r} belongs to {DESCRIBED[key][0]}, not {field}")
+        elif problem := envelope_problem(f"{field}.{key}", envelope):
+            out.append(problem)
+    return out

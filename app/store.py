@@ -9,6 +9,10 @@ then by hashing the PDFs under the directories ESP_SOURCE_PDF_DIRS names (path-s
 uploads under ESP_INTAKE_PREFIX, each naming a run that may have no record yet.  Whether a file
 exists comes from the listing, never from a failed read.  The source PDF is read from the location
 `source.json` records, only under the intake prefix, and only when its SHA-256 matches.
+
+Both also read confirmed entries, in extraction/confirmation.py's layout (their store root, or the bucket's
+esp-design-extraction/): `current_entry`, `current_entries`, `latest_version` and `result`.  Rows and versions
+never change, so each is read once and kept; listings and results are read each time.
 """
 
 from __future__ import annotations
@@ -21,8 +25,9 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 
+from extraction import confirmation as C
 from extraction.errors import ExtractionError
-from extraction.intake import decode_labels, intake_key, intake_run_id
+from extraction.intake import RUN_ID, decode_labels, intake_key, intake_run_id
 
 STORE_ENV = "ESP_RUN_STORE_DIR"
 PDF_DIRS_ENV = "ESP_SOURCE_PDF_DIRS"
@@ -73,6 +78,53 @@ class RunStore(ABC):
     def refresh(self, run_id: str | None = None) -> None:
         """Forget cached reads, of one run or of everything.  A backend that caches nothing has nothing to do."""
 
+    # ---- confirmed entries: `objects` is the store as extraction/confirmation.py's objects ----
+
+    objects = None
+
+    def _kept(self, key: str) -> dict:
+        """A row or a version, read once: neither ever changes."""
+        kept = self.__dict__.setdefault("_kept_reads", {})
+        if key not in kept:
+            kept[key] = C.load(self.objects.get(key))
+        return kept[key]
+
+    def current_entries(self, environment: str) -> dict:
+        """{(organization_id, well_id): the current row} in this environment: each well's latest confirmed row."""
+        if environment not in C.ENVIRONMENTS:
+            raise ValueError(f"not an environment: {environment!r}")
+        current = {}
+        for key in self.objects.keys(C.row_prefix(environment)):
+            row = self._kept(key)
+            well = (row["organization_id"], row["well_id"])
+            if well not in current or C.latest(row) > C.latest(current[well]):
+                current[well] = row
+        return current
+
+    def current_entry(self, environment: str, organization_id: str, well_id: str) -> dict | None:
+        """The well's current row, its ids exactly as given; None when it has none."""
+        return self.current_entries(environment).get((organization_id, well_id))
+
+    def latest_version(self, document_sha256: str, organization_id: str, well_id: str) -> dict | None:
+        """The document's latest version for this well whose row exists: a version without one never committed."""
+        if not SHA256.fullmatch(str(document_sha256 or "")):
+            return None
+        versions = [self._kept(key) for key in self.objects.keys(f"{C.record_prefix(document_sha256)}versions/")]
+        rows = {}
+        for version in sorted(versions, key=C.latest, reverse=True):
+            if (version["labels"]["organization_id"], version["labels"]["well_id"]) != (organization_id, well_id):
+                continue
+            prefix = C.row_prefix(version["environment"])
+            if prefix not in rows:
+                rows[prefix] = set(self.objects.keys(prefix))
+            if version["row_key"] in rows[prefix]:
+                return version
+        return None
+
+    def result(self, confirmation_id: str) -> dict | None:
+        """A confirmation's result, a running one past its deadline_at read as stale; None while there is none."""
+        return C.read_result(self.objects, confirmation_id) if RUN_ID.fullmatch(str(confirmation_id or "")) else None
+
 
 def _plain(name: str) -> str:
     """A single path component, so a run id or file name from a URL cannot leave the store."""
@@ -98,6 +150,7 @@ class LocalRunStore(RunStore):
     def __init__(self, root: Path, pdf_dirs=()):
         self.root = Path(root)
         self.pdf_dirs = [Path(d) for d in pdf_dirs]
+        self.objects = C.LocalObjects(self.root)
 
     def run_ids(self) -> list[str]:
         runs = self.root / "runs"
@@ -155,6 +208,7 @@ class S3RunStore(RunStore):
     def __init__(self, client, bucket: str, intake_prefix: str, runs_prefix: str):
         self.client, self.bucket = client, bucket
         self.intake_prefix, self.runs_prefix = intake_prefix, runs_prefix
+        self.objects = C.S3Objects(client, bucket)
         self._listing = None        # (listed at, {run id: its file names}, {run id: upload time})
         self._reads = {}            # (run id, file name) -> bytes
         self._labels = {}           # run id -> the upload's labels, or None
