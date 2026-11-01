@@ -105,14 +105,18 @@ class RunStore(ABC):
         """The well's current row, its ids exactly as given; None when it has none."""
         return self.current_entries(environment).get((organization_id, well_id))
 
-    def latest_version(self, document_sha256: str, organization_id: str, well_id: str) -> dict | None:
-        """The document's latest version for this well whose row exists: a version without one never committed."""
+    def latest_version(self, document_sha256: str, organization_id: str, well_id: str,
+                       run_id: str | None = None) -> dict | None:
+        """The document's latest version for this well whose row exists: a version without one never committed.
+        With `run_id`, the latest of that run's: whether the run is confirmed."""
         if not SHA256.fullmatch(str(document_sha256 or "")):
             return None
         versions = [self._kept(key) for key in self.objects.keys(f"{C.record_prefix(document_sha256)}versions/")]
         rows = {}
         for version in sorted(versions, key=C.latest, reverse=True):
             if (version["labels"]["organization_id"], version["labels"]["well_id"]) != (organization_id, well_id):
+                continue
+            if run_id is not None and (version.get("run") or {}).get("run_id") != run_id:
                 continue
             prefix = C.row_prefix(version["environment"])
             if prefix not in rows:

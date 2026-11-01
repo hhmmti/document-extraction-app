@@ -221,6 +221,7 @@ def test_a_run_the_handler_completes_renders_in_full(fake, handler):
     upload(fake, run_id, pdf=TL.PDF)
     handler(run_id, with_assets=True)
     at = app(run=run_id)
+    at.button_group[0].set_value("Run details (technical)").run()          # it stored a proposed entry, so it opens in review
     assert "Pipeline: completed" in markdown(at) and not at.error
     assert len(at.image) == 1 and not [i for i in texts(at.info) if "not stored" in i]
 

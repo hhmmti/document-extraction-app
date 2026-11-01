@@ -384,6 +384,8 @@ def test_the_writers_runs_render(tmp_path, monkeypatch):
     app()
     for code, run_id in ids.items():
         at = app(run_id)
+        if at.button_group:                         # it stored a proposed entry, so it opens in review: its files
+            at.button_group[0].set_value("Run details (technical)").run()                  # are under Run details
         if "pdf" in cases[code][1]:                                            # the recorded path is never opened
             assert "Source not in store" in texts(at.warning)
         if code is None:
