@@ -1,13 +1,16 @@
 """No identifier or code on an engineer's screen.  The review mode (its header, groups, value lines and string block),
-the four pop-ups, the Write pop-up and the confirmed view, with every message on them, say what was noticed and what
-to check in plain words.  Run details (technical) keeps the pipeline's own files and is not scanned.
+the four pop-ups, the Write pop-up, the string's editor and the confirmed view, with every message on them, say what
+was noticed and what to check in plain words.  Run details (technical) keeps the pipeline's own files and is not
+scanned.
 
     pytest -m store tests/test_screens.py    every run with an entry in ESP_RUN_STORE_DIR: its review mode, each
-                                             pop-up and the Write pop-up, or, once written, its confirmed view
+                                             pop-up and the Write pop-up, then the string's editor (a section without
+                                             a model marked not in the catalogue, and the string saved so); or, once
+                                             written, its confirmed view
 
 The rest needs no input: every message the app makes, scanned the same way.  What a scan leaves out (`exempt`): the
-organisation and the well, as the well list names them; pump models; values and text as printed; the document's file
-name; who confirms; and what the engineer typed.
+organisation and the well, as the well list names them; pump models, the catalogue's names among them; values and
+text as printed; the document's file name; who confirms; and what the engineer typed.
 """
 
 import json
@@ -23,6 +26,8 @@ from streamlit.testing.v1.element_tree import Dataframe
 
 import app.review as R
 import extraction.confirmation as C
+from extraction.catalogue import CatalogueNames
+from extraction.validate.validate import catalogue as read_catalogue
 from extraction.well_entries_schema import VALUE_TYPE
 
 APP = str(Path(__file__).resolve().parents[1] / "app" / "main.py")
@@ -112,8 +117,10 @@ def exempt(record=None, entry=None, version=None, *more) -> list[str]:
 
 def ids(texts, leave_out=()) -> list[str]:
     """`<pattern>: <match> in "<text>"` for every id or code left in `texts` once `leave_out` is taken out."""
-    hits = []
+    hits, whole = [], set(leave_out)
     for text in texts:
+        if text in whole:                               # all of it left out, as a catalogue name in a pick's options
+            continue
         rest = text
         for name in leave_out:
             rest = rest.replace(name, " ")
@@ -236,6 +243,65 @@ def test_the_apps_own_messages_are_plain(tmp_path):
     assert ids(notes, ["tester"]) == []
 
 
+# The string as an engineer may leave it in the editor: a section marked not in the catalogue, one whose printed model
+# matched two names, one of a model not spelled as the catalogue does, one with nothing; housings and stages that
+# disagree each way V-09 has; depths against the order.
+EDITED_SECTIONS = [
+    {"section_order": 1, "pump_model": None, "stages": None, "section_role": "gas_handler", "housings": 2,
+     "stages_per_housing_as_printed": "2X117 STG", "top_md_ft": 9600.0, "bottom_md_ft": 9620.0},
+    {"section_order": 2, "pump_model": None, "stages": 300, "section_role": "taper", "housings": 2,
+     "stages_per_housing_as_printed": "100", "top_md_ft": None, "bottom_md_ft": 9650.0},
+    {"section_order": 3, "pump_model": "SF 2700", "stages": 500, "section_role": None, "housings": 3,
+     "stages_per_housing_as_printed": "100, 100, 100, 100", "top_md_ft": None, "bottom_md_ft": None},
+    {"section_order": None, "pump_model": None, "stages": None, "section_role": None, "housings": None,
+     "stages_per_housing_as_printed": None, "top_md_ft": None, "bottom_md_ft": None}]
+EDITED_ROWS = [{"printed": "REDA 400/400 AGH", "candidates": [], "absent": True},
+               {"printed": "PUMP MSC_400UNB_35H_93 STG", "candidates": ["SF2700", "SF2700X"], "absent": False},
+               {"printed": "SF 2700", "candidates": [], "absent": False},
+               {"printed": None, "candidates": [], "absent": False}]
+PRINTED = ["REDA 400/400 AGH", "PUMP MSC_400UNB_35H_93 STG", "SF 2700", "SF2700", "SF2700X"]
+NOT_RUN = ["no pump rows", "no pump rows reached the load", "no sections", "no section prints a head",
+           "only some sections print a head", "no TDH printed", "a single section", "a section has two different heads",
+           "the TDH is not one value in the scenario", "scenario keys missing on the design-context rows",
+           "scenario keys missing on the pump rows", "something not seen before"]
+
+
+def test_every_message_of_the_string_editor_is_plain():
+    names = CatalogueNames({"SF2700": True, "SF2700X": True, "ELS1750": False})
+    said = [w for _, w in R.string_checks(EDITED_SECTIONS, EDITED_ROWS, names)]
+    said += [w for _, w in R.string_checks(EDITED_SECTIONS[1:2], EDITED_ROWS[1:2], names)]     # numbered 2, alone
+    said += [w for _, w in R.string_checks([], [], names)]
+    checks = [{"check": c, "result": r, "why": w} for c in R.AS_READ for r, w in (
+        ("pass", "x"), ("fail", "scenario 1: 3 scenarios present different pump strings"),
+        *(("not run", w) for w in NOT_RUN))]
+    said += [w for _, w in R.document_checks({"review": {"pump_string": {"checks": checks}}})]
+    rows = [{**dict.fromkeys(R.EDITABLE), "id": f"n{i}", "page": None, "printed": p, "candidates": [], "absent": a}
+            for i, (p, a) in enumerate(((None, True), (None, False), ("X 1", True)), 1)]
+    said += R.save_problems({"editor": {"rows": rows, "reason": " "}}) + R.save_problems({"editor": {"rows": [],
+                                                                                                    "reason": ""}})
+    said += R.save_problems({"editor": {"rows": [{**rows[0], "absent": False, "pump_model": "SF2700"}], "reason": ""}})
+    for v in ({"final": None, "status": C.TO_CHECK, "sections": [], "unwritten": None},
+              {"final": None, "status": C.BLOCKS, "sections": EDITED_SECTIONS, "unwritten": None},
+              {"final": None, "status": C.CORRECTED, "sections": EDITED_SECTIONS, "unwritten": REASON,
+               "display": [{"printed": "REDA 400/400 AGH", "absent": True}, {"printed": None, "absent": False}]},
+              {"final": None, "status": C.CORRECTED, "sections": EDITED_SECTIONS, "unwritten": None,
+               "display": [{"printed": None, "absent": False}]},
+              {"final": None, "status": C.CORRECTED, "sections": EDITED_SECTIONS[2:3], "unwritten": REASON,
+               "display": [{"printed": None, "absent": False}]}):
+        said.append(R.unwritten_words({"values": {R.STRING: v}}))
+    said += [R.field_problem(f, v, names) for f, v in (("stages", 0), ("housings", 1.5), ("top_md_ft", float("inf")),
+                                                ("bottom_md_ft", "deep"), ("section_role", "booster"),
+                                                ("pump_model", "XYZ"), ("absent", None), ("section_order", 1))]
+    said += [R.step_words(C.step(C.CORRECTED, "tester", "2026-11-02T10:00:00.000001", r)) for r in (
+        "edited · changed section_order, pump_model, stages, section_role, housings, stages_per_housing_as_printed, "
+        "top_md_ft, bottom_md_ft",
+        'edited · added 2 · removed 1 · moved 3 · not in the catalogue: "REDA 400/400 AGH", "X \\"2\\"" · not written: '
+        '"because"', 'edited · changed stages · not written: "because"', "edited")]
+    said += [R.UNSAVED]
+    assert all(said) and ids(said, ["tester", REASON, *PRINTED]) == []
+    assert all(s.endswith((".", "”", ")")) or s.startswith("sections edited") for s in said), said
+
+
 # ---- every engineer screen of every run in a store ----
 
 STORE = os.environ.get("ESP_RUN_STORE_DIR", "")
@@ -264,6 +330,7 @@ def walk(at, rid):
     if at.button(key=f"batch-{rid}").disabled:
         at.session_state["dialog"] = (rid, "write")
         yield "Write pop-up", at.run()
+        yield from edited(at, rid)
         return
     at.button(key=f"batch-{rid}").click().run()
     while (step := at.session_state["dialog"][1]) != "write":
@@ -279,12 +346,41 @@ def walk(at, rid):
                 yield f"{step} pop-up, one pulled out", at
         at.button(key=f"dlg-go-{rid}-{step}").click().run()
     yield "Write pop-up, over the review after the batches", at
+    yield from edited(at, rid)
+
+
+def edited(at, rid):
+    """The string's editor, opened from its block once the pop-ups are closed: as it opens; with each section that has
+    no model marked not in the catalogue (or, when every section has one, the first one's stage count cleared), not
+    saved; then, with a reason, saved, or else cancelled."""
+    at.session_state["dialog"] = None
+    at.run()
+    at.button(key=f"sections-{rid}").click().run()
+    yield "editor", at
+    ed = at.session_state[f"review-{rid}"]["review"]["editor"]
+    k, bare = f"ed-{rid}-{ed['gen']}", [r["id"] for r in ed["rows"] if r["pump_model"] is None]
+    for row_id in bare:
+        at.checkbox(key=f"{k}-{row_id}-absent").check().run()
+    if ed["rows"] and not bare:
+        at.number_input(key=f"{k}-{ed['rows'][0]['id']}-stages").set_value(None).run()
+    yield "editor, a change not saved" + (", sections marked not in the catalogue" if bare else ", a stage count cleared"), at
+    if ed["rows"]:                                      # either way the string would not be written: a reason first
+        at.text_area(key=f"{k}-reason").input(REASON).run()
+        if not at.button(key=f"ed-{rid}-save").disabled:
+            at.button(key=f"ed-{rid}-save").click().run()
+            yield "review mode, the string recorded and not written", at
+            return
+    at.button(key=f"ed-{rid}-cancel").click().run()
 
 
 @pytest.mark.store
 @pytest.mark.skipif(not STORE, reason="the runs to render need ESP_RUN_STORE_DIR")
 def test_no_id_or_code_on_any_engineer_screen(monkeypatch):
     monkeypatch.setenv(R.OFFLINE_ENV, "reviewer")       # Write's checks run, so their refusals show
+    try:
+        names = list(read_catalogue())                  # the editor's model pick shows the catalogue's names
+    except Exception:  # noqa: BLE001 - no snapshot: the editor shows none
+        names = []
     root, hits, screens = Path(STORE), [], 0
     runs = sorted(p.name for p in (root / "runs").iterdir() if (p / C.ENTRY).is_file())
     for rid in runs:
@@ -295,7 +391,7 @@ def test_no_id_or_code_on_any_engineer_screen(monkeypatch):
         versions = [json.loads(p.read_text(encoding="utf-8")) for p in root.glob("design-records/*/versions/*.json")]
         mine = [v for v in versions if (v.get("run") or {}).get("run_id") == rid]
         leave_out = exempt(record, entry, mine[0] if mine else None, "reviewer", REASON,
-                           *(v["confirmed_by"] for v in versions))
+                           *(v["confirmed_by"] for v in versions), *names)
         for name, at in walk(open_run(rid), rid):
             screens += 1
             hits += [f"{rid} · {name} · {hit}" for hit in unplain(at, *leave_out)]

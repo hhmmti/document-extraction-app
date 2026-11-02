@@ -44,6 +44,7 @@ from app.store import (MODE_ENV, PDF_DIRS_ENV, S3_ENV, STORE_ENV, local_store_fr
                        s3_store_from_env)
 from app.wells import WELL_LIST_ENV, SnapshotError, load as load_wells  # noqa: E402
 from extraction import confirmation as C  # noqa: E402
+from extraction.catalogue import CatalogueNames  # noqa: E402
 from extraction.stage.reports_reader import read_report  # noqa: E402
 from extraction.stage.stage import FAMILY_LABEL  # noqa: E402
 from extraction.validate.rules import page_numbers  # noqa: E402
@@ -881,9 +882,11 @@ GROUP_HINT = {"found": "Read from the document, to check against it.",
               "not found": "Nothing was read: settle each as empty if the document does not print it."}
 BATCH_TITLE = {"string": "The pump string", "found": "Values found", "not found": "Values not found"}
 TECHNICAL = "The pipeline's own files for this run, exactly as it stored them: for checking the pipeline, not the design."
-SECTION_COLUMNS = {"section_order": "order", "pump_model": "model", "stages": "stages", "section_role": "role",
-                   "housings": "housings", "stages_per_housing_as_printed": "stages per housing",
-                   "top_md_ft": "top MD (ft)", "bottom_md_ft": "bottom MD (ft)"}
+NO_CATALOGUE = ("The pump catalogue could not be read on this computer, so models cannot be picked or checked here. "
+                "Whoever runs the app should check its set-up.")
+ROLE_WORDS = {None: "none", "primary": "primary", "taper": "taper", "gas_handler": "gas handler"}
+PRINTED_HELP = ("Give every name the document prints for this section, as printed: the equipment list's and the "
+                "schematic's, for instance, separated by semicolons.")
 NO_PDF = ("The document's PDF is not available here, so its pages cannot be shown. Check the values against your own "
           "copy.")
 BAD_PDF = "The document's PDF could not be opened, so its pages cannot be shown. Check the values against your own copy."
@@ -906,6 +909,15 @@ def now_text() -> str:
 def catalogue() -> dict:
     """The catalogue snapshot the writer checks pump models against: ESP_EXTRACTION_ASSETS_DIR's, hash-checked."""
     return read_catalogue()
+
+
+def catalogue_names():
+    """(the snapshot, model -> has a head curve; its names), or (None, None) when it cannot be read here."""
+    try:
+        models = catalogue()
+    except Exception:  # noqa: BLE001 - no snapshot on this computer: the string's screens say so
+        return None, None
+    return models, CatalogueNames(models)
 
 
 def open_dialog(run_id, step):
@@ -946,7 +958,7 @@ def review_state(store, run_id, record, entry) -> dict:
         version = store.latest_version(dig(record, "source", "pdf", "sha256"), org, well)
         st.session_state[key] = {
             "entry": entry, "kept": kept, "environment": environment,
-            "review": R.start(entry, record, version, at=now_text()),
+            "review": R.start(entry, record, version, at=now_text(), names=catalogue_names()[1]),
             "version": version and {k: version.get(k) for k in ("confirmation_id", "confirmed_by", "confirmed_at")},
             "dates": R.design_dates(kept, run_id, store.current_entry(environment, org, well))}
     return st.session_state[key]
@@ -957,10 +969,12 @@ def context(store, run_id, record, state, page_key) -> SimpleNamespace:
         st.session_state["confirmer"] = R.confirmer(MODE, os.environ, getattr(store, "root", None))
     name, who = st.session_state["confirmer"]
     sha, pdf = dig(record, "source", "pdf", "sha256"), source_pdf(store, record)
+    models, names = catalogue_names()
     return SimpleNamespace(run_id=run_id, record=record, entry=state["entry"], items=R.reviewed(state["entry"]),
                            review=state["review"], kept=state["kept"], env=state["environment"],
                            dates=state["dates"], version=state["version"], name=name, who=who,
-                           offline=MODE == "local" and name is not None, sha=sha, pdf=pdf, page_key=page_key)
+                           offline=MODE == "local" and name is not None, sha=sha, pdf=pdf, page_key=page_key,
+                           models=models, names=names)
 
 
 def source_pdf(store, record) -> bytes | None:
@@ -996,7 +1010,10 @@ def document_pane(store, record, page_key, pdf=None):
 
 
 def gate(ctx) -> tuple[bool, str]:
-    """(whether Write is on, why not).  On only when the writer would accept the request as it stands."""
+    """(whether Write is on, why not).  On only when the writer would accept the request as it stands, and the
+    string's editor holds no unsaved edits."""
+    if R.unsaved(ctx.review):
+        return False, " ".join(filter(None, (ctx.who if ctx.name is None else "", R.UNSAVED)))
     groups = R.groups(ctx.review, ctx.entry)
     left = sum(len(groups[g]) for g in R.GROUPS)
     waiting = f"{left} value{'s' * (left != 1)} left to check" if left else ""
@@ -1150,7 +1167,7 @@ def actions(ctx, key):
     proposed, blocks = R.proposal(ctx.entry, key), R.blocking(ctx.review, ctx.entry, key)
     row = st.container(horizontal=True, gap="small")
     as_proposed = v["status"] == C.SETTLED and v["final"] == proposed and not v["accept_anyway"]
-    if not blocks and not as_proposed:
+    if not R.proposal_blocks(ctx.entry, key) and not as_proposed:
         row.button("Settle as proposed" if key == R.STRING else "Settle", icon=":material/check:",
                    key=f"settle-{rid}-{key}", on_click=decide, args=(rid, R.settle, key))
     if key != R.STRING:
@@ -1159,15 +1176,15 @@ def actions(ctx, key):
         if (v["final"] is not None or v["status"] in R.UNDECIDED) and not (blocks and proposed is None):
             row.button("Settle as empty", icon=":material/do_not_disturb_on:", key=f"empty-{rid}-{key}",
                        on_click=decide, args=(rid, R.settle_empty, key))
-    if blocks and not (v["accept_anyway"] and v["status"] == C.SETTLED):
+    if blocks and not (v["accept_anyway"] and v["status"] in C.FINAL):
         with row.popover("Accept anyway", icon=":material/gavel:", key=f"anywaypop-{rid}-{key}"):
             why = st.text_area("Why accept it uncorrected?", key=f"anyway-{rid}-{key}",
                                placeholder="Recorded with the value as its accept-anyway reason")
             st.button("Accept anyway", type="primary", key=f"anyway-go-{rid}-{key}", disabled=not (why or "").strip(),
                       on_click=accept, args=(rid, key))
     if key == R.STRING:
-        row.button("Edit sections", icon=":material/table_edit:", key=f"sections-{rid}", disabled=True,
-                   help="Editing the string's sections comes later")
+        row.button("Edit sections", icon=":material/table_edit:", key=f"sections-{rid}", on_click=edit,
+                   args=(rid, R.open_editor), help="Edit the string's sections here, beside the document")
 
 
 def correction_form(ctx, key):
@@ -1196,12 +1213,6 @@ def sections_table(ctx, page_key, table_key):
         table(cells(rows), table_key, page_key, "page")
     else:
         st.caption("No sections were read.")
-    if ctx.review["values"][R.STRING]["sections"] != R.sections(ctx.entry):
-        st.caption("Carried from the earlier confirmation's correction:")
-        st.dataframe(cells(section_rows(ctx.review["values"][R.STRING]["sections"])), hide_index=True)
-    words = [R.in_words(r) for r in ctx.items[R.STRING]["reasons"]]
-    if words:
-        st.caption(plain(" ".join(dict.fromkeys(words))))
 
 
 def cells(rows) -> pd.DataFrame:
@@ -1209,10 +1220,53 @@ def cells(rows) -> pd.DataFrame:
     return frame([{k: "" if v is None else v for k, v in r.items()} for r in rows])
 
 
-def section_rows(sections) -> list[dict]:
-    """Sections as the engineer reads them: plain column names, a role in words."""
-    return [{SECTION_COLUMNS.get(k, R.words_of(k)): R.words_of(v) if k == "section_role" and v else v
-             for k, v in s.items()} for s in sections]
+def section_rows(sections, display=None) -> list[dict]:
+    """Sections as the engineer reads them: plain column names, a role in words, and a section marked not in the
+    catalogue shown with its model as printed."""
+    def cell(k, v, d):
+        if k == "pump_model" and d.get("absent"):
+            return f"not in the catalogue: {d['printed']}"
+        return R.words_of(v) if k == "section_role" and v else v
+    return [{R.FIELD_WORDS.get(k, R.words_of(k)): cell(k, v, d) for k, v in s.items()}
+            for s, d in zip(sections, display or [{}] * len(sections))]
+
+
+def string_view(ctx, page_key, table_key):
+    """The string as it stands (beside the string as read when they differ), what it puts in the well's entry, and its
+    checks in words."""
+    v = ctx.review["values"][R.STRING]
+    if v["sections"] == R.sections(ctx.entry):
+        sections_table(ctx, page_key, table_key)
+    else:
+        carried = v["carried"] and len(v["history"]) == v["since"]
+        st.caption(f"Carried from {plain(R.confirmation_words(ctx.version or {}))}:" if carried else "As corrected:")
+        st.dataframe(cells(section_rows(v["sections"], v["display"])), hide_index=True)
+        if v["moved"]:
+            st.caption("The new run reads the string differently; the string above comes from the earlier confirmation.")
+        with st.expander("As read"):
+            sections_table(ctx, page_key, table_key)
+    words = R.unwritten_words(ctx.review)
+    if words:
+        st.info(plain(words), icon=":material/info:")
+    checks_box(ctx, v["sections"], R.string_rows(ctx.review))
+
+
+CHECK_LOOK = {True: ":green[:material/check_circle:]", False: ":orange[:material/error:]",
+              "pass": ":green[:material/check_circle:]", "fail": ":orange[:material/error:]"}
+
+
+def checks_box(ctx, sections, rows):
+    """The string's checks in words: on its sections as they stand, then those about the document as read."""
+    st.markdown("**Checks on the sections as they stand**")
+    if ctx.names is None:
+        st.caption(NO_CATALOGUE)
+    for ok, words in R.string_checks(sections, rows, ctx.names) if ctx.names else []:
+        st.caption(f"{CHECK_LOOK[ok]} {plain(words)}")
+    found = R.document_checks(ctx.entry)
+    if found:
+        st.markdown("**About the document as read**: edits do not change these")
+        for result, words in found:
+            st.caption(f"{CHECK_LOOK.get(result, ':gray[:material/remove_circle:]')} {plain(words)}")
 
 
 def string_block(ctx):
@@ -1220,10 +1274,142 @@ def string_block(ctx):
     with st.container(border=True, key=f"line-{rid}-{key}"):
         head = st.container(horizontal=True, vertical_alignment="center", gap="small")
         head.markdown(f"**{R.label(key)}**")
-        head.caption(f"{len(ctx.entry['review']['pump_string']['sections'])} sections as read")
+        n = len(ctx.entry["review"]["pump_string"]["sections"])
+        head.caption(f"{n} section{'s' * (n != 1)} as read")
         status_badges(ctx, head, key)
-        sections_table(ctx, ctx.page_key, f"sections-{rid}")
-        actions(ctx, key)
+        if ctx.review.get("editor") is not None:
+            editor_view(ctx)
+        else:
+            string_view(ctx, ctx.page_key, f"sections-{rid}")
+            actions(ctx, key)
+
+
+# ---- the string's editor: app/review.py keeps the copy; each change goes there through a callback ----
+
+def edit(run_id, how, *args):
+    """An editor action on the run's review: `how(review, *args)`."""
+    how(st.session_state[f"review-{run_id}"]["review"], *args)
+
+
+def edit_entry(run_id, how):
+    state = st.session_state[f"review-{run_id}"]
+    how(state["review"], state["entry"])
+
+
+def edit_field(run_id, row_id, field, key):
+    """A field changed on screen, into the copy as review.set_field takes it; why not, if it does not."""
+    state = st.session_state[f"review-{run_id}"]
+    st.session_state[f"ed-{run_id}-problem"] = R.set_field(state["review"], row_id, field, st.session_state.get(key),
+                                                           names=catalogue_names()[1])
+
+
+def edit_reason(run_id, key):
+    st.session_state[f"review-{run_id}"]["review"]["editor"]["reason"] = st.session_state.get(key) or ""
+
+
+def save_edits(run_id):
+    state = st.session_state[f"review-{run_id}"]
+    R.save(state["review"], state["entry"], at=now_text())
+
+
+def whole(value):
+    return None if value is None else int(value)
+
+
+def feet(value):
+    return None if value is None else float(value)
+
+
+def editor_view(ctx):
+    """The string's sections, edited in place: a row per section, the checks after every change, Save, Cancel and
+    Back to the string as read."""
+    rid, ed = ctx.run_id, ctx.review["editor"]
+    rows, n = ed["rows"], len(ed["rows"])
+    st.caption("Editing the sections. Order numbers follow the rows: section 1, the first row, is the deepest.")
+    if R.order_unprinted(ctx.entry):
+        st.warning("The document's order numbers were not read, so the order shown is unchecked. Check it against the "
+                   "document before you save.", icon=":material/swap_vert:")
+    if ctx.names is None:
+        st.warning(NO_CATALOGUE)
+    for i, row in enumerate(rows, 1):
+        editor_row(ctx, i, row, n)
+    if not rows:
+        st.caption("No sections yet: add them from the document, the deepest first.")
+    add = st.container(horizontal=True, vertical_alignment="bottom")
+    place = add.selectbox("Place for a new section", range(1, n + 2), index=n, key=f"ed-{rid}-{ed['gen']}-place-{n}",
+                          format_func=lambda p: "1, the deepest" if p == 1 else f"{p}, the top" if p == n + 1 else str(p),
+                          width=220)
+    add.button("Add a section", icon=":material/add:", key=f"ed-{rid}-add", on_click=edit, args=(rid, R.add_section, place))
+    if problem := st.session_state.get(f"ed-{rid}-problem"):
+        st.error(plain(problem))
+    checks_box(ctx, R.rows_sections(rows), rows)
+    if R.not_written(rows):                     # a section not in the catalogue, or without its stage count
+        st.text_area("Why record the string without writing it?", value=ed["reason"], key=f"ed-{rid}-{ed['gen']}-reason",
+                     on_change=edit_reason, args=(rid, f"ed-{rid}-{ed['gen']}-reason"),
+                     placeholder="Recorded with the string, which puts no pump string in the well's entry")
+    problems = R.save_problems(ctx.review)
+    buttons = st.container(horizontal=True, vertical_alignment="center")
+    buttons.button("Save", type="primary", icon=":material/save:", key=f"ed-{rid}-save", disabled=bool(problems),
+                   on_click=save_edits, args=(rid,))
+    buttons.button("Cancel", key=f"ed-{rid}-cancel", on_click=edit, args=(rid, R.close_editor))
+    buttons.button("Back to the string as read", icon=":material/undo:", key=f"ed-{rid}-reset", on_click=edit_entry,
+                   args=(rid, R.reset_editor))
+    if problems:
+        st.caption(plain(" ".join(problems)))
+
+
+def editor_row(ctx, i, row, n):
+    """One section of the copy: its place and page chips, moves and removal, then its fields."""
+    rid, r = ctx.run_id, row["id"]
+    k = f"ed-{rid}-{ctx.review['editor']['gen']}-{r}"
+
+    def field(name):
+        return {"key": f"{k}-{name}", "on_change": edit_field, "args": (rid, r, FIELD_OF.get(name, name), f"{k}-{name}")}
+
+    def number(parent, label, name, value, **kwargs):
+        """A number the engineer can clear: a field whose own default is a value snaps back to it when emptied, so its
+        default is empty and its value is seeded."""
+        st.session_state.setdefault(f"{k}-{name}", value)
+        parent.number_input(label, value=None, placeholder="not given", **kwargs, **field(name))
+
+    with st.container(border=True, key=f"{k}-box"):
+        head = st.container(horizontal=True, vertical_alignment="center", gap="small")
+        head.markdown(f"**{R.sentence_case(R.section_name(i))}**")
+        chips(head, row["page"], ctx.page_key, k)
+        head.button("Up", icon=":material/arrow_upward:", key=f"{k}-up", disabled=i == 1, on_click=edit,
+                    args=(rid, R.move_section, r, -1), help="Move it towards section 1, the deepest")
+        head.button("Down", icon=":material/arrow_downward:", key=f"{k}-down", disabled=i == n, on_click=edit,
+                    args=(rid, R.move_section, r, 1), help="Move it away from section 1, the deepest")
+        head.button("Remove", icon=":material/delete:", key=f"{k}-remove", on_click=edit, args=(rid, R.remove_section, r))
+        if row["printed"] and not row["absent"]:
+            st.caption(f"printed “{plain(row['printed'])}”")
+        model, mark = st.columns([3, 2], vertical_alignment="bottom")
+        if row["absent"]:
+            model.text_input("Model as printed", value=row["printed"] or "", help=PRINTED_HELP, **field("printed"))
+        else:
+            options = R.model_options(ctx.names, row) if ctx.names else []
+            model.selectbox("Model", options, index=options.index(row["pump_model"]) if row["pump_model"] in options
+                            else None, placeholder="Search the pump catalogue", disabled=ctx.names is None,
+                            **field("model"))
+        mark.checkbox("Not in the catalogue", value=row["absent"], help="The model is not in the pump catalogue: the "
+                      "string is recorded with it, and no pump string is written to the well's entry", **field("absent"))
+        if row["pump_model"] and (ctx.models or {}).get(row["pump_model"]) is False:
+            st.caption("In the pump catalogue, without a head curve.")
+        counts = st.columns(4)
+        number(counts[0], "Stages", "stages", whole(row["stages"]), min_value=1, step=1)
+        number(counts[1], "Housings", "housings", whole(row["housings"]), min_value=1, step=1)
+        counts[2].text_input("Stages per housing", value=row["stages_per_housing_as_printed"] or "",
+                             placeholder="e.g. 100, 100, 100", **field("per"))
+        roles = [None, *R.ROLES, *([row["section_role"]] if row["section_role"] not in (None, *R.ROLES) else [])]
+        counts[3].selectbox("Role", roles, index=roles.index(row["section_role"]),
+                            format_func=lambda role: ROLE_WORDS.get(role, R.words_of(role)), **field("role"))
+        depths = st.columns(4)
+        number(depths[0], "Top MD (ft)", "top", feet(row["top_md_ft"]), min_value=0.0, step=10.0, format="%.1f")
+        number(depths[1], "Bottom MD (ft)", "bottom", feet(row["bottom_md_ft"]), min_value=0.0, step=10.0, format="%.1f")
+
+
+FIELD_OF = {"model": "pump_model", "per": "stages_per_housing_as_printed", "role": "section_role", "top": "top_md_ft",
+            "bottom": "bottom_md_ft"}               # an editor field's key -> the section field it sets
 
 
 def review_view(store, run_id, record, entry, get, page_key):
@@ -1291,7 +1477,7 @@ def batch_dialog(ctx, step):
         with items:
             anyway = step == "string" and R.blocking(ctx.review, ctx.entry, R.STRING)
             if step == "string":
-                sections_table(ctx, page_key, f"dlg-sections-{rid}")
+                string_view(ctx, page_key, f"dlg-sections-{rid}")
                 if anyway:
                     st.warning("The string blocks publish. It can be accepted anyway, with a reason recorded with it, "
                                "or left to check.", icon=":material/block:")
@@ -1312,9 +1498,13 @@ def batch_dialog(ctx, step):
                                    f"Pull {'it' if len(keys) == 1 else f'all {len(keys)}'} out",
                                    type="primary" if chosen else "secondary", key=f"dlg-go-{rid}-{step}")
                 pull = False
-            if step == "string":
-                go.button("Edit sections", icon=":material/table_edit:", key=f"dlg-sections-edit-{rid}", disabled=True,
-                          help="Editing the string's sections comes later")
+            if step == "string" and go.button("Edit sections", icon=":material/table_edit:", key=f"dlg-sections-edit-{rid}",
+                                              help="Pull the string out of this batch and edit its sections on the "
+                                                   "review, beside the document"):
+                R.batch(ctx.review, ctx.entry, "string", set(), at=now_text())      # this batch's pull-out step
+                R.open_editor(ctx.review)
+                close_dialog()
+                st.rerun()
             if step != "string":
                 st.caption("Unticked values are pulled out: they stay to check and are marked on the review. A value "
                            "that blocks publish cannot be ticked: decide it one by one.")
@@ -1397,15 +1587,19 @@ def confirmed_view(store, run_id, record, version, get, page_key):
     with right:
         document_pane(store, record, page_key)
     with left, st.container(height=PANE, border=False):
+        final_sections = version["pump_string"]["final_sections"]
+        unwritten = final_sections and not dig(next(v for v in version["values"] if v["key"] == R.STRING), "final")
         rows = [{"value": R.label(v["key"]),
-                 "as written": "the string below" if v["key"] == R.STRING and v["final"] else shown(v["final"]),
+                 "as written": (("recorded below, not written" if unwritten else "the string below")
+                                if v["key"] == R.STRING and final_sections else shown(v["final"])),
                  "from": R.SOURCE_WORDS.get(dig(v, "final", "source")), "status": v["status"],
                  "started as": v["starting_status"], "accepted anyway because": v.get("accept_anyway"),
                  "how it was decided": decided_words(v, earlier)}
                 for v in version["values"]]
         st.dataframe(cells(rows), hide_index=True)
-        st.markdown("#### The pump string as written")
-        st.dataframe(cells(section_rows(version["pump_string"]["final_sections"])), hide_index=True)
+        st.markdown("#### The pump string as recorded, not written" if unwritten else "#### The pump string as written")
+        history = next(v for v in version["values"] if v["key"] == R.STRING).get("history") or []
+        st.dataframe(cells(section_rows(final_sections, R.carried_display(final_sections, history)[0])), hide_index=True)
         failed = [R.in_words(f"{c['check']}: {c['why']}") for c in version["pump_string"]["checks_on_final_sections"]
                   if c["result"] == "fail"]
         if failed:
