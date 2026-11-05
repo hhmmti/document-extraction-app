@@ -36,6 +36,11 @@ The record is each value's `history` in the request, a list of {status, by, at, 
 <n> numbers this confirmation's batches from 1, <group> is string, found or not found, and <sentence> is the pop-up's
 button, verbatim.  An edited step's counts are against the string before that save, and each part shows only when it
 is not zero (`edited_reason`).  `by` is the confirmer for every step this confirmation adds.  The README has the same.
+
+A run whose source PDF is a transcription (app/transcription.py) is reviewed against the original scan (`start`'s
+`scan`): a value settled one by one, or settled as empty, records CHECKED as its step's reason; the batch sentences
+name the original scan; and the request goes as entry_method `transcription`.  On the template route such a run first
+starts as a generic run would (`from_scan`).
 """
 
 from __future__ import annotations
@@ -53,8 +58,8 @@ from extraction import confirm_writer as W
 from extraction import confirmation as C
 from extraction.validate.rules import v09
 from extraction.well_entries_schema import VALUE_TYPE
-from extraction.well_entry import (KEYS, SOURCE, UNITS, FinalSections, envelope_problem, final_string_checks,
-                                   order_check, section_incomplete)
+from extraction.well_entry import (KEYS, NOT_FROM_THE_DOCUMENT, SOURCE, UNITS, FinalSections, envelope_problem,
+                                   final_string_checks, order_check, section_incomplete)
 
 LAB_CHECK = "lab-check"                    # the lab's own organisation: it writes to dev, every other one to prd
 OFFLINE_ENV = "ESP_CONFIRM_OFFLINE_AS"     # local mode: write into the local store under this name, writer in process
@@ -64,6 +69,9 @@ GROUPS = ("string", "found", "not found")  # the batch pop-ups, in order; Write 
 UNDECIDED = (C.TO_CHECK, C.BLOCKS)
 SOURCES = (SOURCE, "ops_entered")
 STRING_SENTENCE, STRING_ANYWAY = "The string matches the document.", "Accept the string anyway"
+SCAN_STRING_SENTENCE = "The string matches the original scan."
+CHECKED = "checked against the original scan"          # a one-by-one step's reason on a transcription
+SCAN_REASON = "typed_from_scan"                         # a transcription's value read on the template route
 BATCH = re.compile(r'batch (\d+) · (string|found|not found) · (?:"(.*)"|pulled out)')   # a batch step's reason
 QUOTED = r'"(?:[^"\\]|\\.)*"'                                   # a JSON string: text as printed or typed, quotes escaped
 EDITED = re.compile(rf"edited(?: · added (\d+))?(?: · removed (\d+))?(?: · moved (\d+))?"
@@ -100,6 +108,7 @@ LABELS = {
 REASONS = {
     "generic_path": "The document is not a known vendor report, so nothing cross-checked this reading. Check it "
                     "against the page.",
+    SCAN_REASON: "Typed from a scan: check it against the original.",
     "varies_by_scenario": "The scenarios print different values; scenario 1's is proposed. Check which scenario is "
                           "the design case.",
     "depth_basis_pump_setting": "No intake depth is printed; the pump setting depth stands in for it. Check that it "
@@ -268,9 +277,10 @@ def order_words(why: str) -> str:
 
 # ---- the review ----
 
-def start(entry, run, version=None, *, at: str, names=None) -> dict:
+def start(entry, run, version=None, *, at: str, names=None, scan=False) -> dict:
     """A review's first state: every value as the entry proposes it (the string at `starting`'s status, given the
-    catalogue's `names`), then what `version`, the document's latest confirmed version for the well, carries."""
+    catalogue's `names`), then what `version`, the document's latest confirmed version for the well, carries.
+    `scan`: the run's source PDF is a transcription, reviewed against its original scan."""
     proposed_at = run.get("ended_at") or run.get("started_at") or "unknown"        # the CLI's proposal step
     values = {}
     for v in entry["review"]["values"]:
@@ -280,10 +290,26 @@ def start(entry, run, version=None, *, at: str, names=None) -> dict:
                             "since": 1, "carried": False, "moved": False}
     values[STRING].update(sections=sections(entry), display=display(entry), unwritten=None,
                           starting=values[STRING]["status"])
-    review = {"values": values, "batches": 0, "carried_from": None, "editor": None}
+    review = {"values": values, "batches": 0, "carried_from": None, "editor": None, "scan": bool(scan)}
     if version:
         carry(review, entry, version, at=at)
     return review
+
+
+def from_scan(entry) -> dict:
+    """A transcription's entry as the review starts it: on the template route, as extraction/well_entry.build_entry
+    starts a generic run.  Every value from the document, every section and the string gain SCAN_REASON and start to
+    check, unless they block publish; the values not from the document stay as they are.  On the generic route, the
+    entry as it is.  The stored entry is not changed: the review works on a copy."""
+    if entry["review"].get("route") != "template":
+        return entry
+    out = json.loads(json.dumps(entry))
+    string = out["review"]["pump_string"]
+    for item in [*(v for v in out["review"]["values"] if v["key"] not in NOT_FROM_THE_DOCUMENT), *string["sections"],
+                 string]:
+        item["reasons"] = list(dict.fromkeys([*item["reasons"], SCAN_REASON]))
+        item["status"] = C.BLOCKS if item["status"] == C.BLOCKS else C.TO_CHECK
+    return out
 
 
 def starting(entry, names=None) -> tuple[str, list[str]]:
@@ -366,20 +392,23 @@ def _kept_anyway(review, reason, at, step_reason=None):
 
 
 def settle(review, entry, key, *, at):
-    """As proposed.  A value whose proposal blocks publish needs a correction or accept anyway instead."""
+    """As proposed.  A value whose proposal blocks publish needs a correction or accept anyway instead.  On a
+    transcription the step's reason is CHECKED."""
     if proposal_blocks(entry, key):
         raise ValueError(f"{key} blocks publish: correct it, or accept it anyway with a reason")
-    _decided(review, entry, key, C.SETTLED, proposal(entry, key), at)
+    _decided(review, entry, key, C.SETTLED, proposal(entry, key), at, reason=CHECKED if review.get("scan") else None)
 
 
 def settle_empty(review, entry, key, *, at):
-    """Final null: settled when nothing was proposed, else manually corrected."""
+    """Final null: settled when nothing was proposed, else manually corrected.  On a transcription the step's reason
+    is CHECKED."""
     if key == STRING:
         raise ValueError("the string is settled as proposed, accepted anyway or edited")
     empty = proposal(entry, key) is None
     if empty and blocking(review, entry, key):
         raise ValueError(f"{key} blocks publish: accept it anyway with a reason")
-    _decided(review, entry, key, C.SETTLED if empty else C.CORRECTED, None, at)
+    _decided(review, entry, key, C.SETTLED if empty else C.CORRECTED, None, at,
+             reason=CHECKED if review.get("scan") else None)
 
 
 def accept_anyway(review, entry, key, reason, *, at):
@@ -440,16 +469,16 @@ def join(parts) -> str:
     return parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} and {parts[-1]}"
 
 
-def sentence(group, entry, ticked, *, anyway=False) -> str:
-    """A pop-up's button: the affirmation, recorded verbatim."""
-    n = len(ticked)
+def sentence(group, entry, ticked, *, anyway=False, scan=False) -> str:
+    """A pop-up's button: the affirmation, recorded verbatim.  On a transcription (`scan`) it names the original scan."""
+    n, document = len(ticked), "the original scan" if scan else "the document"
     if group == "string":
-        return STRING_ANYWAY if anyway else STRING_SENTENCE
+        return STRING_ANYWAY if anyway else SCAN_STRING_SENTENCE if scan else STRING_SENTENCE
     if group == "not found":
-        return f"I looked through the document: {'this 1 value is' if n == 1 else f'these {n} values are'} not printed."
+        return f"I looked through {document}: {'this 1 value is' if n == 1 else f'these {n} values are'} not printed."
     reasons = {r for key in ticked for r in reviewed(entry)[key]["reasons"]}
     clauses = [text for code, text in JUDGEMENTS if code in reasons]
-    return (f"{'This 1 value matches' if n == 1 else f'These {n} values match'} the document as printed"
+    return (f"{'This 1 value matches' if n == 1 else f'These {n} values match'} {document} as printed"
             + (f", with {join(clauses)}" if clauses else "") + ".")
 
 
@@ -466,7 +495,7 @@ def batch(review, entry, group, chosen, *, at, reason=None) -> tuple[int, str]:
     if any(blocking(review, entry, k) for k in ticked if k != STRING):
         raise ValueError("a value that blocks publish cannot be ticked")
     review["batches"] += 1
-    n, said = review["batches"], sentence(group, entry, ticked, anyway=anyway)
+    n, said = review["batches"], sentence(group, entry, ticked, anyway=anyway, scan=review.get("scan"))
     for key in keys:
         if key in ticked and anyway and review["values"][STRING]["status"] == C.CORRECTED:     # edits kept
             _kept_anyway(review, reason.strip(), at, f'batch {n} · {group} · "{said}"')
@@ -873,12 +902,14 @@ def tally(review) -> Counter:
 
 
 def request(review, entry, run, *, cid, confirmed_at, confirmed_by, environment) -> dict:
-    """The request: the CLI's, with each value as this review decided it.  A value not decided goes `to check`, so
-    the writer refuses it by name."""
+    """The request: the CLI's, with each value as this review decided it, and, for a transcription, the entry method
+    `transcription`.  A value not decided goes `to check`, so the writer refuses it by name."""
     document = ((run.get("source") or {}).get("pdf") or {}).get("sha256")
     q = CLI.build_request(entry, run, cid=cid, run_id=run["run_id"], document=document, confirmed_at=confirmed_at,
                           confirmed_by=confirmed_by, environment=environment, as_proposed=False, finals={},
                           sections=None, accept_anyway=None, leave=set())
+    if review.get("scan"):
+        q["entry_method"] = "transcription"
     for item in [*q["values"], q["pump_string"]]:
         v = review["values"][item.get("key", STRING)]
         item.pop("accept_anyway", None)
@@ -1042,20 +1073,35 @@ def words_of(text) -> str:
     return str(text).replace("_", " ")
 
 
-def report_words(run) -> str:
-    """What kind of document the run read, for the header: a known vendor's report, or none."""
+def report_words(run, scan=None) -> str:
+    """What kind of document the run read, for the header: typed from a scan (`scan`, app/transcription.py's), a known
+    vendor's report, or none."""
+    if scan is not None:
+        return "typed from a scan"
     if run.get("route") == "generic":
         return "read without its known layout, on purpose" if run.get("forced") is True else "not a known vendor report"
     return f"{VENDORS[run['family']]} report" if run.get("family") in VENDORS else "not recorded"
 
 
-def document_name(run) -> str | None:
-    """The document's file name: the one the run recorded (`source.source_name`), else its PDF path's; None when the
-    name is an id (an upload named by its SHA-256 or its run id), so it is not shown."""
+def document_name(run, scan=None) -> str | None:
+    """The document's file name: a transcription's original scan's (`scan`), else the one the run recorded
+    (`source.source_name`), else its PDF path's; None when the name is an id (an upload named by its SHA-256 or its run
+    id), so it is not shown."""
     source = run.get("source") or {}
     path = (source.get("pdf") or {}).get("path")
-    name = str(source.get("source_name") or (Path(str(path)).name if path else ""))
+    name = str((scan and scan.name) or source.get("source_name") or (Path(str(path)).name if path else ""))
     return name if name and not ID_LIKE.search(name) else None
+
+
+def scan_words(scan) -> str:
+    """The review's warning on a transcription, with its pages marked unsure; or, broken, why Write stays off."""
+    if scan.problem:
+        return (f"This file is marked as a transcription, but {scan.problem}, so Write stays off. Upload the file "
+                "exactly as the skill made it, as a new run.")
+    unsure = (f"Readings marked unsure: {pages_words(', '.join(map(str, scan.unsure)))}." if scan.unsure
+              else "No reading is marked unsure.")
+    return ("This document is a transcription typed by Claude from the scan's page images. Check every value against "
+            f"the original scan beside the review. {unsure}")
 
 
 def when_words(at) -> str:
@@ -1213,5 +1259,5 @@ def step_words(step, earlier=None) -> str:
         what = "sections edited" + (f" ({'; '.join(parts)})" if parts else "")
     else:
         what = {C.SETTLED: "settled one by one", C.CORRECTED: "corrected", C.TO_CHECK: "left to check"}.get(
-            step.get("status"), "decided")
+            step.get("status"), "decided") + (" against the original scan" if reason == CHECKED else "")
     return f"{what}, by {by}, {when_words(step.get('at'))}"

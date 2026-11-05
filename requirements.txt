@@ -8,3 +8,4 @@ numpy==2.5.0
 streamlit==1.65.0
 plotly==7.1.0
 pypdfium2==5.14.0
+reportlab==5.1.0

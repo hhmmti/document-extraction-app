@@ -40,6 +40,7 @@ if ROOT not in sys.path:              # `streamlit run` puts only app/ on the pa
 
 from app import intake  # noqa: E402
 from app import review as R  # noqa: E402
+from app import transcription as T  # noqa: E402
 from app.store import (MODE_ENV, PDF_DIRS_ENV, S3_ENV, STORE_ENV, local_store_from_env, run_status,  # noqa: E402
                        s3_store_from_env)
 from app.wells import WELL_LIST_ENV, SnapshotError, load as load_wells  # noqa: E402
@@ -86,6 +87,9 @@ RAMP = ["#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6", "#256abf", "#1c5c
 COST = ("This calls Opus on Bedrock in the datascience account; recent runs cost about USD 0.55–1.32 "
         "and take 3–8 minutes.")
 POLL_S = 3
+IMAGE_ONLY = ("This document is a scan: its pages are pictures, with no text to read, so it cannot be read here. "
+              "Transcribe the scan with the transcribe-design-scan skill, then upload the transcription it makes as a "
+              "new run.")
 FINAL = {"launch failed", "succeeded", "failed", "stale", "expired"}
 WAITING = ("queued", "not picked up", "expired")        # S3 mode: an upload with no run record yet
 MODE = os.environ.get(MODE_ENV) or "local"
@@ -416,6 +420,12 @@ def error_line(record):
                  f"{plain(text(error.get('message')))}")
 
 
+def image_only(record):
+    """A run that failed because its document has no text layer: what to do, in plain words."""
+    if dig(record, "error", "code") == "IMAGE_ONLY":
+        st.info(IMAGE_ONLY, icon=":material/document_scanner:")
+
+
 def title_block(run_id, record, problem, labels=None):
     """`labels`: in S3 mode the upload's, for a record that does not name its organisation and well yet."""
     org, well = dig(record, "organization_id"), dig(record, "well_id")
@@ -445,6 +455,7 @@ def title_block(run_id, record, problem, labels=None):
                 review_cell(record)
             st.info(BANNER)
             error_line(record)
+            image_only(record)
             if stale:
                 st.warning(f"Still recorded as running, but its deadline ({plain(dig(record, 'deadline_at'))}) has "
                            "passed, so it reads as failed. The process most likely stopped before writing its "
@@ -889,6 +900,7 @@ PRINTED_HELP = ("Give every name the document prints for this section, as printe
                 "schematic's, for instance, separated by semicolons.")
 NO_PDF = ("The document's PDF is not available here, so its pages cannot be shown. Check the values against your own "
           "copy.")
+SCAN_VIEWS = ("Original scan", "Transcription")
 BAD_PDF = "The document's PDF could not be opened, so its pages cannot be shown. Check the values against your own copy."
 
 
@@ -956,9 +968,13 @@ def review_state(store, run_id, record, entry) -> dict:
         org, well = record.get("organization_id"), record["well_id"]
         environment, kept = R.environment_for(org), R.Kept(store.objects)
         version = store.latest_version(dig(record, "source", "pdf", "sha256"), org, well)
+        pdf = source_pdf(store, record)
+        scan = None if pdf is None else T.recognise(pdf)            # a transcription: reviewed against its scan
+        typed = scan is not None and scan.problem is None
+        entry = R.from_scan(entry) if typed else entry
         st.session_state[key] = {
-            "entry": entry, "kept": kept, "environment": environment,
-            "review": R.start(entry, record, version, at=now_text(), names=catalogue_names()[1]),
+            "entry": entry, "kept": kept, "environment": environment, "scan": scan,
+            "review": R.start(entry, record, version, at=now_text(), names=catalogue_names()[1], scan=typed),
             "version": version and {k: version.get(k) for k in ("confirmation_id", "confirmed_by", "confirmed_at")},
             "dates": R.design_dates(kept, run_id, store.current_entry(environment, org, well))}
     return st.session_state[key]
@@ -974,7 +990,7 @@ def context(store, run_id, record, state, page_key) -> SimpleNamespace:
                            review=state["review"], kept=state["kept"], env=state["environment"],
                            dates=state["dates"], version=state["version"], name=name, who=who,
                            offline=MODE == "local" and name is not None, sha=sha, pdf=pdf, page_key=page_key,
-                           models=models, names=names)
+                           models=models, names=names, scan=state["scan"])
 
 
 def source_pdf(store, record) -> bytes | None:
@@ -986,18 +1002,31 @@ def source_pdf(store, record) -> bytes | None:
         return None
 
 
+def shown_pdf(scan, pdf, sha, key):
+    """The pages a viewer shows: a transcription's original scan, with a switch to the transcription, page N being page
+    N in both; else the PDF itself.  (bytes, SHA-256)."""
+    if scan is None or scan.problem:
+        return pdf, sha
+    view = st.segmented_control("Pages shown", SCAN_VIEWS, default=SCAN_VIEWS[0], required=True, key=key,
+                                label_visibility="collapsed")
+    return (scan.original, scan.sha256) if view == SCAN_VIEWS[0] else (pdf, sha)
+
+
 def document_pane(store, record, page_key, pdf=None):
-    """The source document beside an engineer's screen: its file name and its pages, nothing technical."""
+    """The source document beside an engineer's screen: its file name and its pages, nothing technical.  A
+    transcription opens on its original scan."""
     st.markdown("#### Source document")
-    name = R.document_name(record)
-    if name:
-        st.caption(plain(name))
     sha = dig(record, "source", "pdf", "sha256")
     pdf = pdf if pdf is not None else source_pdf(store, record)
+    scan = None if pdf is None else T.recognise(pdf)
+    name = R.document_name(record, scan)
+    if name:
+        st.caption(plain(name))
     if pdf is None:
         st.info(NO_PDF)
         return
     try:
+        pdf, sha = shown_pdf(scan, pdf, sha, f"{page_key}-shown")
         total = page_count(sha, pdf)
         page = st.number_input("Page", min_value=1, step=1, key=page_key)
         if page > total:
@@ -1010,8 +1039,11 @@ def document_pane(store, record, page_key, pdf=None):
 
 
 def gate(ctx) -> tuple[bool, str]:
-    """(whether Write is on, why not).  On only when the writer would accept the request as it stands, and the
-    string's editor holds no unsaved edits."""
+    """(whether Write is on, why not).  On only when the writer would accept the request as it stands, the string's
+    editor holds no unsaved edits, and the source PDF is not a broken transcription."""
+    if ctx.scan is not None and ctx.scan.problem:
+        return False, (f"Write is off: this file is marked as a transcription, but {ctx.scan.problem}. Upload the file "
+                       "exactly as the skill made it, as a new run.")
     if R.unsaved(ctx.review):
         return False, " ".join(filter(None, (ctx.who if ctx.name is None else "", R.UNSAVED)))
     groups = R.groups(ctx.review, ctx.entry)
@@ -1098,7 +1130,7 @@ def review_header(ctx, on, why):
     with st.container(border=True):
         facts_ = st.container(horizontal=True, gap="large")
         for label, value in (("Organisation", visible(text(org))), ("Well", visible(well)),
-                             ("Writes to", R.place(ctx.env)), ("Report", R.report_words(ctx.record)),
+                             ("Writes to", R.place(ctx.env)), ("Report", R.report_words(ctx.record, ctx.scan)),
                              ("Design date", ctx.dates["incoming"] or "not printed"),
                              ("Confirming as", ctx.name or "nobody")):
             with facts_.container(gap=None, width="content"):
@@ -1109,6 +1141,8 @@ def review_header(ctx, on, why):
             notes.badge(R.NOT_KNOWN, icon=":material/rate_review:", color="orange")
         if ctx.who:
             notes.caption(plain(ctx.who))
+        if ctx.scan is not None:                            # a transcription: checked against its original scan
+            st.warning(plain(R.scan_words(ctx.scan)), icon=":material/document_scanner:")
         if problem := R.run_problem_words(ctx.record):     # a run that stopped after reading keeps its entry
             st.warning(plain(problem), icon=":material/report:")
         dates_note(ctx)
@@ -1448,12 +1482,13 @@ def dialog_pages(ctx, step, keys):
         st.info(NO_PDF)
         return
     try:
-        total = page_count(ctx.sha, ctx.pdf)
+        pdf, sha = shown_pdf(ctx.scan, ctx.pdf, ctx.sha, f"{page_key}-shown")
+        total = page_count(sha, pdf)
         if page_key not in st.session_state:
             pages = [p for k in keys for p in pages_of(ctx, k)]
             st.session_state[page_key] = min(pages[0], total) if pages else 1
         page = st.number_input("Page", min_value=1, max_value=total, step=1, key=page_key)
-        st.image(page_png(ctx.sha, page - 1, ctx.pdf), caption=f"Page {page} of {total}", width="stretch")
+        st.image(page_png(sha, page - 1, pdf), caption=f"Page {page} of {total}", width="stretch")
     except Exception:  # noqa: BLE001 - a PDF that will not open: say so, the pop-up carries on
         st.warning(BAD_PDF)
 
@@ -1494,8 +1529,8 @@ def batch_dialog(ctx, step):
                 affirm = go.button(R.STRING_ANYWAY, type="primary", key=f"dlg-go-{rid}-{step}", disabled=not chosen)
                 pull = go.button("Leave it to check", key=f"dlg-pull-{rid}-{step}")
             else:                       # nothing ticked: the button pulls everything out
-                affirm = go.button(R.sentence(step, ctx.entry, sorted(chosen)) if chosen else
-                                   f"Pull {'it' if len(keys) == 1 else f'all {len(keys)}'} out",
+                affirm = go.button(R.sentence(step, ctx.entry, sorted(chosen), scan=ctx.review.get("scan"))
+                                   if chosen else f"Pull {'it' if len(keys) == 1 else f'all {len(keys)}'} out",
                                    type="primary" if chosen else "secondary", key=f"dlg-go-{rid}-{step}")
                 pull = False
             if step == "string" and go.button("Edit sections", icon=":material/table_edit:", key=f"dlg-sections-edit-{rid}",
@@ -1550,8 +1585,9 @@ def write_dialog(ctx, on, why):
     def body():
         st.markdown(f"Writes to **{R.place(ctx.env)}**, organisation **{plain(visible(text(org)))}**, well "
                     f"**{plain(visible(well))}**, confirming as **{plain(ctx.name or 'nobody')}**.")
-        name = R.document_name(ctx.record)
-        st.caption(f"Document: {plain(name) if name else 'the design document'}, design dated "
+        name = R.document_name(ctx.record, ctx.scan)
+        st.caption(f"Document: {plain(name) if name else 'the design document'}"
+                   f"{', typed from the scan' if ctx.review.get('scan') else ''}, design dated "
                    f"{ctx.dates['incoming'] or 'not printed'}.")
         dates_note(ctx)
         tally = R.tally(ctx.review)
@@ -1577,15 +1613,17 @@ def confirmed_view(store, run_id, record, version, get, page_key):
     """What was written, read only, beside the PDF."""
     outcome_box(run_id)
     earlier = earlier_confirmations(store, record, version)
+    pdf = source_pdf(store, record)
     with st.container(border=True):
         st.markdown(f"**Confirmed**: written to **{R.place(version['environment'])}** by "
                     f"**{plain(version['confirmed_by'])}** on {R.when_words(version['confirmed_at'])}.")
-        name = R.document_name(record)
-        st.caption(f"Document: {plain(name) if name else 'the design document'}, design dated "
-                   f"{plain(version.get('design_date') or 'not printed')}.")
+        name = R.document_name(record, None if pdf is None else T.recognise(pdf))
+        st.caption(f"Document: {plain(name) if name else 'the design document'}"
+                   f"{', typed from the scan' if version.get('entry_method') == 'transcription' else ''}, design "
+                   f"dated {plain(version.get('design_date') or 'not printed')}.")
     left, right = st.columns([1, 1], gap="medium")
     with right:
-        document_pane(store, record, page_key)
+        document_pane(store, record, page_key, pdf)
     with left, st.container(height=PANE, border=False):
         final_sections = version["pump_string"]["final_sections"]
         unwritten = final_sections and not dig(next(v for v in version["values"] if v["key"] == R.STRING), "final")
@@ -1700,7 +1738,15 @@ def show_upload(store):
         st.error("This file is empty.")
     elif upload is not None and not data.startswith(b"%PDF-"):
         st.error("This file is not a PDF: it does not start with %PDF-.")
-    ready = well is not None and data.startswith(b"%PDF-")
+    scan = T.recognise(data) if data.startswith(b"%PDF-") else None
+    if scan is not None and scan.problem:
+        st.error(f"This file is marked as a transcription, but {scan.problem}, so it is refused. Upload the file "
+                 "exactly as the skill made it.")
+    elif scan is not None:
+        st.info(f"A transcription of {plain(scan.name)}, {scan.pages} page{'s' * (scan.pages != 1)} typed from the "
+                "scan. The original scan is inside the file, and the review shows it beside the values.",
+                icon=":material/document_scanner:")
+    ready = well is not None and data.startswith(b"%PDF-") and not (scan is not None and scan.problem)
     if ready and (dup := running_duplicate(store, hashlib.sha256(data).hexdigest(), org, well)):
         dup, state = dup
         st.warning(f"Run {plain(dup)} for this PDF, organisation and well is still running. You can start "
@@ -1801,6 +1847,7 @@ def render_watch(store, run_id) -> str:
         else:
             review_cell(record)
             error_line(record)
+            image_only(record)
             st.button("Open the run", type="primary", on_click=goto, kwargs={"run": run_id})
     return state
 

@@ -10,7 +10,8 @@ scanned.
 
 The rest needs no input: every message the app makes, scanned the same way.  What a scan leaves out (`exempt`): the
 organisation and the well, as the well list names them; pump models, the catalogue's names among them; values and
-text as printed; the document's file name; who confirms; and what the engineer typed.
+text as printed; the document's file name (a transcription's, its scan's); who confirms; and what the
+engineer typed.
 """
 
 import json
@@ -25,6 +26,7 @@ from streamlit.testing.v1 import AppTest
 from streamlit.testing.v1.element_tree import Dataframe
 
 import app.review as R
+import app.transcription as T
 import extraction.confirmation as C
 from extraction.catalogue import CatalogueNames
 from extraction.validate.validate import catalogue as read_catalogue
@@ -152,7 +154,7 @@ SAMPLE_REASONS = [
     "head sum: 1 vs TDH 2", "rule: V-06", "rule: V-X3", "rule: V-12", "rule: D16", "rule: V-08", "rule: D17",
     "rule: V-99", "grounding: not_found on any kept page", "grounding: other_page (cited p1; found on p2, p6)",
     "quarantined: empty_string", "quarantined: composite_value", "quarantined: unrecognized_unit_token",
-    "quarantined: something_new", "a_code_never_seen"]
+    "quarantined: something_new", "typed_from_scan", "a_code_never_seen"]
 SAMPLE_NOTES = [
     "not from the document: points to the design record", "not from the document: entered by hand",
     "intake; depth_reference_basis intake", "intake; pump setting 11099 ft; depth_reference_basis pump_setting",
@@ -199,7 +201,7 @@ SAMPLE_REFUSALS = [
 def test_every_reason_says_what_was_noticed_and_what_to_check_without_a_code():
     said = [R.in_words(r) for r in SAMPLE_REASONS]
     assert ids(said) == []
-    assert all(s.endswith(".") and re.search(r"\b(?:Check|Look for|Find)\b", s) for s in said), said
+    assert all(s.endswith(".") and re.search(r"\b(?:[Cc]heck|Look for|Find)\b", s) for s in said), said
 
 
 def test_every_note_reads_without_a_key():
@@ -234,6 +236,19 @@ def test_the_apps_own_messages_are_plain(tmp_path):
         C.step(C.SETTLED, "tester", "2026-10-31T20:19:21.134313", f"carried from {CID}"),
         C.step(C.CORRECTED, "tester", "2026-10-31T20:19:21.134313", None))]
     notes += [R.confirmation_words({"confirmed_by": "tester", "confirmed_at": "2026-10-31T20:19:21.134313"})]
+    # a transcription: its header, its warning or why Write stays off, its sentences and its one-by-one step
+    scans = [T.Scan(name="scan.pdf", pages=3, sha256="0" * 64, unsure=(2, 5)), T.Scan(name="scan.pdf", pages=1)]
+    scans += [T.Scan(problem=p) for p in (
+        "its transcription mark cannot be read", "its transcription mark is not one this app knows",
+        "its transcription mark is incomplete", "the files attached to it cannot be read",
+        "the original scan is not attached to it", "the original scan is attached to it more than once",
+        "the original scan attached to it cannot be opened",
+        "its pages do not match the original scan's: 2 typed, 3 in the scan attached, 3 in its mark")]
+    notes += [R.scan_words(scan) for scan in scans] + [R.report_words({}, scans[0])]
+    entry_ = {"review": {"values": [{"key": "oil_sg", "reasons": ["varies_by_scenario", "typed_from_scan"]}]}}
+    notes += [R.sentence(g, entry_, ["oil_sg"], scan=True) for g in ("found", "not found", "string")]
+    notes += [R.step_words(C.step(status, "tester", "2026-11-04T10:00:00.000001", R.CHECKED))
+              for status in (C.SETTLED, C.CORRECTED)]
     for status in (C.WRITTEN, C.REFUSED, C.FAILED, C.STALE, C.RUNNING):
         notes.append(R.outcome(C.LocalObjects(tmp_path), CID, "prd", {"status": status, "reasons": []})["note"] or "")
     notes.append(R.outcome(C.LocalObjects(tmp_path), CID, "prd", None)["note"])
@@ -390,8 +405,10 @@ def test_no_id_or_code_on_any_engineer_screen(monkeypatch):
             continue
         versions = [json.loads(p.read_text(encoding="utf-8")) for p in root.glob("design-records/*/versions/*.json")]
         mine = [v for v in versions if (v.get("run") or {}).get("run_id") == rid]
+        pdf = root / "intake" / f"{((record.get('source') or {}).get('pdf') or {}).get('sha256')}.pdf"
+        scan = T.recognise(pdf.read_bytes()) if pdf.is_file() else None     # a transcription goes by its scan's name
         leave_out = exempt(record, entry, mine[0] if mine else None, "reviewer", REASON,
-                           *(v["confirmed_by"] for v in versions), *names)
+                           *(v["confirmed_by"] for v in versions), *names, *([scan.name] if scan and scan.name else []))
         for name, at in walk(open_run(rid), rid):
             screens += 1
             hits += [f"{rid} · {name} · {hit}" for hit in unplain(at, *leave_out)]

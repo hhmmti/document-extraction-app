@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.DS_Store/
 # Stage assets live in $ESP_EXTRACTION_ASSETS_DIR, never in this tree
 m2-d31-seed-aliases.csv
 alias-evidence-v*.json

@@ -187,6 +187,7 @@ ESP_APP_MODE=s3 AWS_PROFILE=roam-ai .venv/bin/python -m extraction.confirm --run
     | settled in a batch | `settled` | `batch <n> · <group> · "<sentence>"` |
     | pulled out of a batch | `to check` | `batch <n> · <group> · pulled out` |
     | one by one (settle, correct, settle as empty, accept anyway) | the status reached | null; an accept-anyway reason is the item's `accept_anyway` |
+    | one by one on a transcription (settle, settle as empty) | the status reached | `checked against the original scan` (`review.CHECKED`); a correction and an accept anyway stay null |
     | the string's sections saved in the editor, one step per save | `manually corrected` (a save that brings the sections back to the proposal: the string's starting status; one that changes only the marks: its status) | `edited · added <n> · removed <n> · moved <n> · changed <field>, <field>`, then, for a string not written, ` · not in the catalogue: "<printed>", "<printed>"` when a section is marked, and ` · not written: "<reason>"` always |
     | carried on a re-run | the carried status | `carried from <confirmation_id>`, after the earlier version's steps, which keep their own `by` and `at` |
 
@@ -204,11 +205,45 @@ Detect decides the route (`extraction.detect.route`, which wraps `detect` unchan
 | a family, with all its required pages | `template`: the family's contract, unchanged | `route = template` |
 | a family, with required pages missing | `generic` (`REQUIRED_PAGES_MISSING` no longer ends the run) | `family_hint`, `missing_roles` |
 | no family, and a text layer | `generic` | `near_misses`, `family_hint = null` |
-| `IMAGE_ONLY`, `AMBIGUOUS_TEMPLATE`, `PREP_FAILED` | none: the run fails, as before | `error` |
+| `IMAGE_ONLY`, `AMBIGUOUS_TEMPLATE`, `PREP_FAILED` | none: the run fails, as before (a scan: "The transcription route") | `error` |
 
 On the generic route, `prep_generic` keeps every page whose text reaches the 20-character floor and drops the rest (manifest role `unmapped`). The prompt is `generic-pass-a.md` and `generic-contract.md` in the family frame (report contract, both schema blocks, and every family's proposed fields as `family` and `field_as_printed`), with one line of route context naming the family hint and its missing pages. A prompt over 322,766 bytes, the largest parity prompt, fails `GENERIC_TOO_LARGE` before any model call. Staging expects `vendor_family: generic`; D31 resolves a model only by an exact match (case and outer spaces aside) to a canonical name, from the catalogue or the seed, or to a seed alias that every family maps to one canonical, so anything else is an unknown model. Only the validator's general rules run, never `V-F*`. Every review item carries `generic_path` and needs review, `spec_validation_status` is at least `needs_review`, and a notice reads "Extracted without a vendor template: every value is unverified." `--force-generic` sends a template document down the generic route, with no hint, for the yardstick; the record shows `forced` and `forced_from`.
 
 `tools/yardstick.py --template <store or run> --generic <store or run>` pairs each generic run with the template run of the same PDF (by SHA-256), or compares two run directories as given, and pairs their `stg_pump_config` and `stg_design_context` rows as `extraction/compare` does. Per document it prints the row alignment (rows per table on each side, template rows matched, the cases each side covers), agreement on matched rows only, every dropped or conflicting template value by cause (`grain`: rows that do not line up; `scenario`: a case one side lacks; `vocabulary`: a field the generic contract decides differently, a value under another key, or one not repeated per case; `genuine`: printed, in scope, and left out or wrong), and the genuine misses by field. `--fields` adds per-field counts and `--diff` every differing value. The command-line summary prints the report's staged rows beside the loaded ones (`staged 2/1/14 · load 0/0/0`), so a run without a well does not read as empty.
+
+## The transcription route
+
+A scanned design document has no text layer, so its run fails `IMAGE_ONLY` at Detect, before any model call; the run's page then says, in plain words, to transcribe the scan with the skill and upload the transcription. The skill is `skills/transcribe-design-scan/`: `SKILL.md` (the method, written for Claude Opus 5.5 reading the page images; no OCR engine), `reading-aids.md` (drawings, charts, tables, sideways vendor tables), `scripts/render_pages.py` (the scan's SHA-256 and page count, every page as a PNG at 200 dpi, a crop of a region at a higher resolution), `scripts/build_transcription.py` (the transcription) and `fonts/` (DejaVu Sans Mono and its licence). It is used, on claude.ai or in Claude Code, as a zip with the folder at its root, built outside this tree:
+
+```bash
+(cd skills && zip -r -X "<out dir>/transcribe-design-scan.zip" transcribe-design-scan)
+```
+
+`fonts/LICENSE` is the font's licence, verbatim, as its terms require.
+
+The scripts need pypdf, reportlab and a renderer (pypdfium2 with Pillow, or pdftoppm), and install packages only in claude.ai's sandbox (where `/mnt/user-data/` exists): there each installs what it misses with pip, with `--break-system-packages` only when plain pip refuses. Anywhere else, Claude Code on an engineer's Mac among them, they install nothing: the method has Claude make a virtual environment in the working folder (`python3 -m venv .venv`, then `.venv/bin/pip install pypdf reportlab pypdfium2 pillow`) and run both scripts with its Python, never the machine's own. Outside the sandbox, a script that misses a package names it, prints those two commands and stops with exit code 4.
+
+The transcription is one PDF, `<scan name without .pdf> - transcription.pdf`, written to `/mnt/user-data/outputs/` when that folder exists, else beside the scan:
+
+- one typed page per scan page, in order, each starting with the line `Transcription - page N of M - check every value against the original scan attached to this file.`, then a blank line, then the page as typed (the page files `page-001.txt`, … hold only the page's content). The pages are DejaVu Sans Mono 12 pt on pdfplumber's layout grid, 7.25 pt columns and 13 pt lines (`DEFAULT_X_DENSITY` and `DEFAULT_Y_DENSITY` in 0.11.9), each grown from Letter to fit its longest line and its line count with a margin of 5 columns and 3 lines, so no line wraps, each scan page stays one page, and Detect and Prep read every typed line back with its columns, 5 columns in. The run then goes as any PDF with a text layer does;
+- the scan, attached byte for byte under its own file name (`original-scan.pdf` when that name cannot name a PDF);
+- the mark, the document-information entry `/RoamTranscription`, one JSON object: `schema` 1, `skill` `transcribe-design-scan`, `skill_version` `"1"`, `original` (`name`, `sha256`, `pages`, `bytes`), `attachment` (the attached file's name), `transcribed_at` (UTC, ISO 8601), `model` (as the transcriber names itself, given to the build script) and `unsure` (one `{page, line}` per `[?]`, the line counted in its page file).
+
+The build script refuses on any gap (a page file missing or empty, or a count of page files that is not the scan's) and writes nothing then. Tests: `tests/test_transcription_skill.py`.
+
+**Recognition** (`app/transcription.py`, from the PDF's bytes alone, kept by their SHA-256): a transcription when the mark parses with schema 1, exactly one attachment has the mark's SHA-256, and that attachment's page count is the mark's and the transcription's; a broken transcription when the mark is there and anything else is not so, with the reason in plain words; otherwise an ordinary PDF. The upload form says a transcription is one, with the original's name and page count, and that the original scan is inside the file; it refuses a broken one, with its reason, asking for the file exactly as the skill made it.
+
+**Review** of a run whose source PDF is a transcription (`tests/test_transcription.py`):
+
+- the header's report reads "typed from a scan", and a warning says that the document is a transcription typed by Claude from the scan's page images, that every value must be checked against the original scan beside the review, and which pages have readings marked unsure;
+- the PDF pane and every pop-up's viewer open on the original scan, with a switch to the transcription; a page chip turns whichever is showing, page N being page N in both. The document goes by the original's file name, unless that name is an id (`review.document_name`);
+- the batch sentences name the original scan: `These N values match the original scan as printed` (the judgement clauses unchanged), `I looked through the original scan: these N values are not printed.` and `The string matches the original scan.`;
+- a value settled one by one, or settled as empty, records `checked against the original scan` as its step's reason (the record's table above);
+- the request goes as `entry_method` `transcription`, set by the app after the CLI's builder, which `extraction/confirm.py` keeps; the writer takes it;
+- on the template route the review starts as a generic run does (`review.from_scan`): every value from the document, every section and the string gain the reason `typed_from_scan`, shown as "Typed from a scan: check it against the original.", and start to check unless they block publish; `design_document_ref` and `vapor_pressure_psia` stay as they are. The stored entry is not changed: the review's proposal step records that start, and the version's `starting_status` stays the stored entry's. On the generic route nothing changes;
+- a run whose source is a broken transcription opens with a warning, and Write stays off, saying why.
+
+An ordinary run is reviewed as before. A run whose PDF the app cannot read cannot be told for a transcription: its pane says the pages cannot be shown, and its request goes as `extracted`.
 
 ## Run the viewer
 
