@@ -27,7 +27,7 @@ from pathlib import Path
 
 from extraction import confirmation as C
 from extraction.errors import ExtractionError
-from extraction.intake import RUN_ID, decode_labels, intake_key, intake_run_id
+from extraction.intake import RUN_ID, decode_labels, intake_key, intake_run_id, optional_labels
 
 STORE_ENV = "ESP_RUN_STORE_DIR"
 PDF_DIRS_ENV = "ESP_SOURCE_PDF_DIRS"
@@ -72,7 +72,8 @@ class RunStore(ABC):
         return None
 
     def intake_labels(self, run_id: str) -> dict | None:
-        """The labels this run was uploaded with.  None for a backend without uploads, or labels it cannot read."""
+        """The labels this run was uploaded with: the four, and the optional ones the upload carries
+        (extraction.intake.optional_labels).  None for a backend without uploads, or labels it cannot read."""
         return None
 
     def refresh(self, run_id: str | None = None) -> None:
@@ -279,7 +280,8 @@ class S3RunStore(RunStore):
             if run_id in self._list()[2]:
                 try:
                     head = self.client.head_object(Bucket=self.bucket, Key=intake_key(self.intake_prefix, run_id))
-                    self._labels[run_id] = decode_labels(head.get("Metadata", {}))
+                    meta = head.get("Metadata", {})
+                    self._labels[run_id] = {**decode_labels(meta), **optional_labels(meta)}
                 except Exception:  # noqa: BLE001 - unreadable or refused labels: nothing to show or compare
                     pass
         return self._labels[run_id]

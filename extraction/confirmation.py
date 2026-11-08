@@ -311,7 +311,9 @@ class Exists(Exception):
 
 
 class LocalObjects:
-    """A local store as objects: the key `ROOT<path>` is the file `<root>/<path>`."""
+    """A local store as objects: the key `ROOT<path>` is the file `<root>/<path>`.  An object's metadata, when it has
+    any, is the file `meta(key)` beside it: `.<name>.metadata.json`, one JSON object of the metadata as S3 returns an
+    object's (lower-case names, the values as stored).  Tests and replays write it there; nothing here does."""
 
     def __init__(self, root):
         self.root = Path(root)
@@ -325,6 +327,17 @@ class LocalObjects:
     def get(self, key: str) -> bytes:
         """FileNotFoundError when the key is not there."""
         return self.path(key).read_bytes()
+
+    def meta(self, key: str) -> Path:
+        """Where the object's metadata is kept (a dot file, so `keys` never lists it)."""
+        path = self.path(key)
+        return path.with_name(f".{path.name}.metadata.json")
+
+    def head(self, key: str) -> dict | None:
+        """The object's metadata, {} when none is kept; None when the object is not there."""
+        if not self.path(key).is_file():
+            return None
+        return json.loads(self.meta(key).read_text(encoding="utf-8")) if self.meta(key).is_file() else {}
 
     def put(self, key: str, body: bytes, *, create: bool = False) -> None:
         """Written whole under a temporary name, then renamed into place; with `create`, linked into place,
@@ -368,7 +381,8 @@ def forbidden(err) -> bool:
 
 class S3Objects:
     """The bucket as objects.  A missing key reads as missing only when S3 answers 404, which needs s3:ListBucket on
-    its prefix; without it S3 answers 403, which is raised like any other error (the writer reads it as not there)."""
+    its prefix; without it S3 answers 403, which is raised like any other error (the writer reads it as not there).
+    `head`, which reads an object's metadata, takes either answer as no object."""
 
     def __init__(self, client, bucket: str = BUCKET):
         self.client, self.bucket = client, bucket
@@ -380,6 +394,16 @@ class S3Objects:
             status, code = _response(err)
             if status == 404 or code in ("NoSuchKey", "404"):
                 raise FileNotFoundError(key) from err
+            raise
+
+    def head(self, key: str) -> dict | None:
+        """The object's metadata (HeadObject); None when S3 answers 403 or 404, which it answers for a key that is not
+        there (403 to a caller that cannot list).  Any other error is raised."""
+        try:
+            return self.client.head_object(Bucket=self.bucket, Key=key).get("Metadata", {})
+        except Exception as err:
+            if _response(err)[0] in (403, 404):
+                return None
             raise
 
     def put(self, key: str, body: bytes, *, create: bool = False) -> None:

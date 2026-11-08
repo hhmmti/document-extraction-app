@@ -56,12 +56,14 @@ from pathlib import Path
 from extraction import confirm as CLI
 from extraction import confirm_writer as W
 from extraction import confirmation as C
+from extraction.intake import PRODUCT_UPLOAD
 from extraction.validate.rules import v09
 from extraction.well_entries_schema import VALUE_TYPE
 from extraction.well_entry import (KEYS, NOT_FROM_THE_DOCUMENT, SOURCE, UNITS, FinalSections, envelope_problem,
                                    final_string_checks, order_check, section_incomplete)
 
-LAB_CHECK = "lab-check"                    # the lab's own organisation: it writes to dev, every other one to prd
+LAB_CHECK = "lab-check"                    # the lab's own organisation: dev, every other one prd (`environment_for`)
+AUTOMATIC = "Started automatically by an upload in the product"     # a run whose upload's origin is product-upload
 OFFLINE_ENV = "ESP_CONFIRM_OFFLINE_AS"     # local mode: write into the local store under this name, writer in process
 WAIT_S = 180                               # the CLI's --wait
 STRING = C.PUMP_SECTIONS
@@ -922,7 +924,16 @@ def request(review, entry, run, *, cid, confirmed_at, confirmed_by, environment)
 
 # ---- around the write ----
 
-def environment_for(organization_id) -> str:
+def automatic(labels) -> bool:
+    """Whether an upload in the product started the run: its upload's origin label (the store's `intake_labels`)."""
+    return (labels or {}).get("origin") == PRODUCT_UPLOAD
+
+
+def environment_for(organization_id, labels=None) -> str:
+    """Where the entry goes.  A run started by an upload in the product: its upload's environment label.  Every other
+    run: dev for lab-check, prd for every other organisation."""
+    if automatic(labels) and labels.get("environment") in C.ENVIRONMENTS:
+        return labels["environment"]
     return "dev" if organization_id == LAB_CHECK else "prd"
 
 
@@ -975,6 +986,14 @@ class Kept:
         if key not in self.reads:
             self.reads[key] = self.objects.get(key)
         return self.reads[key]
+
+    def head(self, key):
+        """The object's metadata, kept as a read is."""
+        if not key.startswith(self.PREFIXES):
+            return self.objects.head(key)
+        if ("head", key) not in self.reads:
+            self.reads["head", key] = self.objects.head(key)
+        return self.reads["head", key]
 
     def put(self, key, body, *, create=False):
         self.objects.put(key, body, create=create)
@@ -1208,6 +1227,9 @@ REFUSALS = (
                                                      "written. Ask whoever runs the app to put the PDF back."),
     (r"intake/[^/]+\.pdf is not the document.*", lambda m: "The PDF kept for this run is not the document it read. "
                                                             "Ask whoever runs the app to put the right PDF back."),
+    (r"environment is '(\w+)'; the upload's is '(\w+)'",
+     lambda m: f"This document was uploaded to the product's {place(m[2])} system, so its entry can be written to "
+               f"{place(m[2])} only, not to {place(m[1])}. Report it to whoever runs the app."),
     (r"(organization_id|well_id) is (.+); the run's is (.+)",
      lambda m: f"The {'organisation' if m[1] == 'organization_id' else 'well'} is {m[2]} here but {m[3]} in the run. "
                "Reopen the run and try again."),

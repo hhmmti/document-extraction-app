@@ -14,6 +14,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -25,6 +26,7 @@ import extraction.confirmation as C
 import lambda_function as L
 import test_app_s3 as TA
 import test_lambda as TL
+from extraction.intake import encode_labels
 from extraction.well_entry import KEYS
 from test_confirm import BLOCKED, CATALOGUE, ORG, PDF, RUN_ID, SHA, WELL, entry, put_run, run_record
 from test_screens import exempt, screen, unplain
@@ -556,22 +558,26 @@ def test_a_rerun_says_what_comes_back_and_from_whose_confirmation(offline):
     plain_words(at, e2)
 
 
-def test_s3_mode_writes_the_request_and_the_writer_lambda_answers(tmp_path, monkeypatch):
+class Triggered(TA.FakeS3):
+    """The app can list; a request's creation invokes the writer, as S3 invokes its Lambda."""
+
+    def get_object(self, *, Bucket, Key):
+        if Key not in self.objects:
+            self._call("GetObject", Bucket, Key)
+            raise TL.client_error(404, "NoSuchKey", "GetObject")
+        return super().get_object(Bucket=Bucket, Key=Key)
+
+    def put_object(self, **kwargs):
+        super().put_object(**kwargs)
+        if C.request_id(kwargs["Key"]):
+            L.confirm_handler(TL.s3_event(kwargs["Key"]), TL.Context(60_000), s3=self, table=TL.FakeTable(),
+                              catalogue=lambda: CATALOGUE)
+
+
+@pytest.fixture
+def s3_mode(tmp_path, monkeypatch):
+    """The app in S3 mode on a fake bucket holding the synthetic run; the writer answers through the trigger."""
     import extraction.confirm as CLI
-
-    class Triggered(TA.FakeS3):          # the app can list; a request's creation invokes the writer
-        def get_object(self, *, Bucket, Key):
-            if Key not in self.objects:
-                self._call("GetObject", Bucket, Key)
-                raise TL.client_error(404, "NoSuchKey", "GetObject")
-            return super().get_object(Bucket=Bucket, Key=Key)
-
-        def put_object(self, **kwargs):
-            super().put_object(**kwargs)
-            if C.request_id(kwargs["Key"]):
-                L.confirm_handler(TL.s3_event(kwargs["Key"]), TL.Context(60_000), s3=self, table=TL.FakeTable(),
-                                  catalogue=lambda: CATALOGUE)
-
     fake = Triggered()
     put_run(C.S3Objects(fake), to_check())
     for name, value in {S.MODE_ENV: "s3", "ESP_BUCKET": TL.BUCKET, "ESP_INTAKE_PREFIX": TL.INTAKE,
@@ -582,6 +588,11 @@ def test_s3_mode_writes_the_request_and_the_writer_lambda_answers(tmp_path, monk
     monkeypatch.setattr(L, "CONFIRM_WORK", tmp_path / "work")
     monkeypatch.setattr(CLI, "caller", lambda: "analyst-1")
     monkeypatch.setattr(VALIDATE, "catalogue", lambda: CATALOGUE)      # the app reads it at each run
+    return fake
+
+
+def test_s3_mode_writes_the_request_and_the_writer_lambda_answers(s3_mode):
+    fake = s3_mode
     at = app(run=RUN_ID)
     assert "**analyst-1**" in " ".join(texts(at.markdown))
     plain_words(at)
@@ -595,3 +606,109 @@ def test_s3_mode_writes_the_request_and_the_writer_lambda_answers(tmp_path, monk
     [key] = [k for k in fake.objects if k.endswith("/request.json")]
     assert C.load(fake.objects[key])["confirmed_by"] == "analyst-1"
     assert [k for k in fake.objects if k.startswith(C.row_prefix("prd"))]
+
+
+# ---- a run an upload in the product started ----
+
+UPLOADER = "engineer-7@example.com"
+PUSHED_FROM = "s3://esp-design-extraction-product-uploads-640168431387/dev/org-1/well-documents/Well  #1/esp_design/" \
+              "current.pdf?versionId=v1"
+TO_TEST = ("This document was uploaded to the product's test system, so its entry can be written to test only, not to "
+           "production. Report it to whoever runs the app.")
+
+
+def pushed(environment="dev") -> dict:
+    """The run's PDF's metadata as the starter writes it: the four labels and the optional ones."""
+    return {**encode_labels(ORG, WELL, "design.pdf", SHA), "origin": "product-upload", "environment": environment,
+            "uploaded-by": quote(UPLOADER, safe=""), "pushed-from": quote(PUSHED_FROM, safe="")}
+
+
+def test_a_run_the_product_started_writes_to_its_uploads_environment_and_every_other_run_as_before():
+    product = {"origin": "product-upload", "environment": "dev"}
+    assert R.automatic(product) and not R.automatic({"environment": "dev"}) and not R.automatic(None)
+    assert [R.environment_for("org-1", product), R.environment_for(R.LAB_CHECK, {**product, "environment": "prd"})] == [
+        "dev", "prd"]
+    for labels in (None, {}, {"environment": "dev"}, {"origin": "product-upload"},
+                   {"origin": "product-upload", "environment": "qa"}, {"origin": "upload-form", "environment": "dev"}):
+        assert [R.environment_for(o, labels) for o in (R.LAB_CHECK, "org-1")] == ["dev", "prd"]
+    assert R.environment_problem(R.LAB_CHECK, R.environment_for(R.LAB_CHECK, {**product, "environment": "prd"})) == \
+        "lab-check writes to test only, never to production."                   # still refused in prd
+
+
+def test_the_writers_environment_refusal_in_plain_words():
+    assert R.refusal_words("environment is 'prd'; the upload's is 'dev'") == TO_TEST
+    assert R.refusal_words("environment is 'dev'; the upload's is 'prd'") == (
+        "This document was uploaded to the product's production system, so its entry can be written to production "
+        "only, not to test. Report it to whoever runs the app.")
+
+
+def test_s3_mode_says_the_product_started_the_run_writes_to_its_uploads_environment_and_never_names_the_uploader(
+        s3_mode):
+    s3_mode.metadata[C.pdf_key(RUN_ID)] = pushed()          # org-1, which writes to prd but for the label
+    at = app(run=RUN_ID)
+    md = " ".join(texts(at.markdown))
+    assert R.AUTOMATIC in md and "**test**" in md and write_button(at).label == "Write to test"
+    plain_words(at)
+    at.button(key=f"batch-{RUN_ID}").click().run()
+    at.button(key=f"dlg-go-{RUN_ID}-found").click().run()
+    at.button(key=f"dlg-go-{RUN_ID}-not found").click().run()
+    assert at.button(key=f"write-go-{RUN_ID}").label == "Write to test"
+    plain_words(at)
+    at.button(key=f"write-go-{RUN_ID}").click().run()
+    assert texts(at.success)[0].startswith("**Written to test**")
+    plain_words(at)
+    assert [k for k in s3_mode.objects if k.startswith(C.row_prefix("dev"))]
+    assert not [k for k in s3_mode.objects if k.startswith(C.row_prefix("prd"))]
+    [version] = [C.load(body) for key, body in s3_mode.objects.items() if "/versions/" in key]
+    assert {k: version["labels"].get(k) for k in ("origin", "uploaded_by", "pushed_from")} == {
+        "origin": "product-upload", "uploaded_by": UPLOADER, "pushed_from": PUSHED_FROM}
+    assert not [s for s in screen(at) if UPLOADER in s]
+
+
+def test_local_mode_reads_no_upload_labels_and_the_writers_environment_refusal_shows_in_plain_words(offline):
+    offline.meta(C.pdf_key(RUN_ID)).write_text(json.dumps(pushed()))      # kept as LocalObjects keeps metadata
+    at = app(run=RUN_ID)
+    assert R.AUTOMATIC not in " ".join(texts(at.markdown)) and write_button(at).label == "Write to production"
+    for key in FOUND:
+        at.button(key=f"settle-{RUN_ID}-{key}").click().run()
+    for key in NOT_FOUND:
+        at.button(key=f"empty-{RUN_ID}-{key}").click().run()
+    assert write_button(at).disabled and f"Write is off. {TO_TEST}" in texts(at.caption)
+    plain_words(at)
+    at.session_state["dialog"] = (RUN_ID, "write")                         # the Write pop-up says it too
+    at.run()
+    assert f"Write is off. {TO_TEST}" in texts(at.warning)
+    plain_words(at)
+    assert offline.keys(f"{C.ROOT}confirmations/") == []
+
+
+@pytest.mark.parametrize("environment", ["prd", "dev"])
+def test_the_gate_keeps_a_lab_check_run_out_of_production_from_the_start_in_s3_mode(s3_mode, environment):
+    """A lab-check run the product pushed from prd: its header says production, and Write is off from the start with
+    the lab-check reason, whatever is decided; R.write keeps its own refusal.  From dev: the gate as before."""
+    lab, e = run_record(organization_id=R.LAB_CHECK), {**to_check(), "organization_id": R.LAB_CHECK}
+    put_run(C.S3Objects(s3_mode), e, run=lab)
+    s3_mode.metadata[C.pdf_key(RUN_ID)] = {**encode_labels(R.LAB_CHECK, WELL, "design.pdf", SHA),
+                                           "origin": "product-upload", "environment": environment}
+    at = app(run=RUN_ID)
+    md, why = " ".join(texts(at.markdown)), [c for c in texts(at.caption) if c.startswith(("Write is off", "5 values"))]
+    assert R.AUTOMATIC in md and f"**{R.place(environment)}**" in md and write_button(at).disabled
+    off = "Write is off. lab-check writes to test only, never to production."
+    assert why == ([off] if environment == "prd" else ["5 values left to check"])       # before any decision
+    plain_words(at, e)
+    at.button(key=f"batch-{RUN_ID}").click().run()
+    at.button(key=f"dlg-go-{RUN_ID}-found").click().run()
+    at.button(key=f"dlg-go-{RUN_ID}-not found").click().run()
+    go = at.button(key=f"write-go-{RUN_ID}")                                             # every value decided
+    plain_words(at, e)
+    if environment == "prd":
+        assert go.disabled and off in texts(at.warning)
+        assert not [k for k in s3_mode.objects if "/confirmations/" in k]               # nothing was sent
+        assert R.write(C.S3Objects(s3_mode), at.session_state[f"review-{RUN_ID}"]["review"], e, lab,
+                       environment="prd", confirmed_by="analyst-1", catalogue=lambda: CATALOGUE, offline=False)[
+            "reasons"] == ["lab-check writes to test only, never to production."]        # its own refusal, kept
+    else:
+        assert not go.disabled
+        go.click().run()
+        assert texts(at.success)[0].startswith("**Written to test**")
+        assert [k for k in s3_mode.objects if k.startswith(C.row_prefix("dev"))]

@@ -17,6 +17,7 @@ DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
 VIEW_SQL = Path(__file__).resolve().parents[1] / "esp_design_extraction" / "well_entries_current.sql"
 SCHEMA_PATH = Path(__file__).resolve().parents[2] / "extraction" / "well_entries_schema.py"
 S3 = "arn:aws:s3:::roam-ds-assets/esp-design-extraction/"
+PUSH = "esp-design-extraction-product-uploads-640168431387"
 PROFILE_ARN = "arn:aws:bedrock:us-east-1:640168431387:inference-profile/us.anthropic.claude-opus-5-5"
 INVOKE = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
 
@@ -52,14 +53,14 @@ def schema():
 
 
 def test_resources_are_exactly_these(template):
-    # Ours: two functions, each with its invoke config, role, log group and S3 invoke permission; the run-log table;
-    # the notification; the Glue database and its two tables (the table and the view).
-    # CDK's notification helper: its function, role and policy.
+    # Ours: three functions, each with its invoke config, role, log group and S3 invoke permission; the run-log table;
+    # a notification on each bucket; the Glue database and its two tables (the table and the view); the product-upload
+    # bucket and its policy.  CDK's notification helper: its function and role, and a policy for each bucket.
     assert Counter(r["Type"] for r in template.values()) == Counter({
-        "AWS::Lambda::Function": 3, "AWS::IAM::Role": 3, "AWS::IAM::Policy": 1,
-        "AWS::Lambda::EventInvokeConfig": 2, "AWS::Lambda::Permission": 2, "AWS::Logs::LogGroup": 2,
-        "AWS::DynamoDB::Table": 1, "Custom::S3BucketNotifications": 1, "AWS::Glue::Database": 1,
-        "AWS::Glue::Table": 2})
+        "AWS::Lambda::Function": 4, "AWS::IAM::Role": 4, "AWS::IAM::Policy": 2,
+        "AWS::Lambda::EventInvokeConfig": 3, "AWS::Lambda::Permission": 3, "AWS::Logs::LogGroup": 3,
+        "AWS::DynamoDB::Table": 1, "Custom::S3BucketNotifications": 2, "AWS::Glue::Database": 1,
+        "AWS::Glue::Table": 2, "AWS::S3::Bucket": 1, "AWS::S3::BucketPolicy": 1})
 
 
 def test_function(template):
@@ -100,10 +101,28 @@ def test_writer(template):
     assert invoke["Properties"]["MaximumRetryAttempts"] == 0
 
 
+def test_starter(template):
+    fn_id, fn = only(template, "AWS::Lambda::Function", FunctionName="esp-design-extraction-product-intake")
+    _, extraction = only(template, "AWS::Lambda::Function", FunctionName="esp-design-extraction")
+    log_id, _ = only(template, "AWS::Logs::LogGroup", LogGroupName="/aws/lambda/esp-design-extraction-product-intake")
+    p = fn["Properties"]
+    assert (p["PackageType"], p["Architectures"]) == ("Image", ["x86_64"])
+    assert "Handler" not in p and "Runtime" not in p
+    assert p["Code"] == extraction["Properties"]["Code"]                 # the same image
+    assert p["ImageConfig"] == {"Command": ["lambda_function.product_upload_handler"]}
+    assert (p["Timeout"], p["MemorySize"]) == (120, 2048) and "ReservedConcurrentExecutions" not in p
+    assert p["LoggingConfig"] == {"LogGroup": {"Ref": log_id}}
+    assert p["Environment"]["Variables"] == {
+        "ESP_BUCKET": "roam-ds-assets", "ESP_INTAKE_PREFIX": "esp-design-extraction/intake/",
+        "ESP_RUN_LOG_TABLE": "esp_design_extraction_logging", "ESP_PUSH_BUCKET": PUSH}
+    _, invoke = only(template, "AWS::Lambda::EventInvokeConfig", FunctionName={"Ref": fn_id})
+    assert invoke["Properties"]["MaximumRetryAttempts"] == 2
+
+
 def test_image(stack):
     assembly = stack.node.root.synth()
     manifest = json.loads((Path(assembly.directory) / f"{stack.artifact_id}.assets.json").read_text())
-    [image] = manifest["dockerImages"].values()                          # one image, for both functions
+    [image] = manifest["dockerImages"].values()                          # one image, for all three functions
     assert image["source"]["platform"] == "linux/amd64"
     # The runtime is the lab's Python, from a dated tag rather than a moving one.
     assert re.search(r"^FROM public\.ecr\.aws/lambda/python:3\.12\.\d{4}\.\d{2}\.\d{2}\.\d{2}-x86_64$",
@@ -183,11 +202,81 @@ def test_writer_role_has_only_these_statements(template):
     assert not any(a.split(":")[0] in ("glue", "athena", "bedrock") for a in actions)
 
 
+def test_starter_role_has_only_these_statements(template):
+    """It reads a push's version under dev/ or prd/, writes only the intake object, and lists nothing."""
+    statements = role_statements(template, "esp-design-extraction-product-intake")
+    table_id, _ = only(template, "AWS::DynamoDB::Table")
+    log_id, _ = only(template, "AWS::Logs::LogGroup", LogGroupName="/aws/lambda/esp-design-extraction-product-intake")
+    expected = [
+        {"Effect": "Allow", "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+         "Resource": [f"arn:aws:s3:::{PUSH}/dev/*", f"arn:aws:s3:::{PUSH}/prd/*"]},
+        {"Effect": "Allow", "Action": "s3:PutObject", "Resource": f"{S3}intake/*"},
+        {"Effect": "Allow", "Action": ["dynamodb:PutItem", "dynamodb:UpdateItem"],
+         "Resource": {"Fn::GetAtt": [table_id, "Arn"]}},
+        {"Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+         "Resource": {"Fn::GetAtt": [log_id, "Arn"]}},
+    ]
+    assert sorted(map(canonical, statements)) == sorted(map(canonical, expected))
+    actions = [a for s in map(json.loads, map(canonical, statements)) for a in s["Action"]]
+    assert not [a for a in actions if a.startswith("s3:List")]          # implied by the equality; the stated rule
+
+
+def test_product_upload_bucket(template):
+    """Owned by the stack: versioned, S3-managed encryption, no public access, ACLs off, retained, no lifecycle."""
+    bucket_id, bucket = only(template, "AWS::S3::Bucket")
+    assert bucket["Properties"] == {
+        "BucketName": PUSH,
+        "VersioningConfiguration": {"Status": "Enabled"},
+        "BucketEncryption": {"ServerSideEncryptionConfiguration": [
+            {"ServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]},
+        "PublicAccessBlockConfiguration": {"BlockPublicAcls": True, "BlockPublicPolicy": True,
+                                           "IgnorePublicAcls": True, "RestrictPublicBuckets": True},
+        "OwnershipControls": {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]},
+    }
+    assert (bucket["DeletionPolicy"], bucket["UpdateReplacePolicy"]) == ("Retain", "Retain")
+
+
+def test_product_upload_bucket_policy(template):
+    """CDK's TLS-only deny, and one PutObject allow for each of the product's accounts, on its own prefix only."""
+    bucket_id, _ = only(template, "AWS::S3::Bucket")
+    _, policy = only(template, "AWS::S3::BucketPolicy", Bucket={"Ref": bucket_id})
+    arn = {"Fn::GetAtt": [bucket_id, "Arn"]}
+    assert policy["Properties"]["PolicyDocument"]["Statement"] == [
+        {"Action": "s3:*", "Condition": {"Bool": {"aws:SecureTransport": "false"}}, "Effect": "Deny",
+         "Principal": {"AWS": "*"}, "Resource": [arn, {"Fn::Join": ["", [arn, "/*"]]}]},
+        {"Action": "s3:PutObject", "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::411237692998:root"},
+         "Resource": f"arn:aws:s3:::{PUSH}/dev/*"},
+        {"Action": "s3:PutObject", "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::826771500263:root"},
+         "Resource": f"arn:aws:s3:::{PUSH}/prd/*"},
+    ]
+
+
+def test_the_product_upload_trigger(template):
+    """Every .pdf created in the product-upload bucket, to the starter, through CDK's helper for an owned bucket."""
+    bucket_id, _ = only(template, "AWS::S3::Bucket")
+    starter_id, _ = only(template, "AWS::Lambda::Function", FunctionName="esp-design-extraction-product-intake")
+    _, notification = only(template, "Custom::S3BucketNotifications", BucketName={"Ref": bucket_id})
+    assert (notification["Properties"]["Managed"], notification["Properties"]["NotificationConfiguration"]) == (True, {
+        "LambdaFunctionConfigurations": [{
+            "Events": ["s3:ObjectCreated:*"], "Filter": {"Key": {"FilterRules": [{"Name": "suffix", "Value": ".pdf"}]}},
+            "LambdaFunctionArn": {"Fn::GetAtt": [starter_id, "Arn"]}}]})
+    _, permission = only(template, "AWS::Lambda::Permission", FunctionName={"Fn::GetAtt": [starter_id, "Arn"]})
+    assert permission["Properties"]["Principal"] == "s3.amazonaws.com"
+    assert permission["Properties"]["SourceAccount"] == "640168431387"
+    assert permission["Properties"]["SourceArn"] == {"Fn::GetAtt": [bucket_id, "Arn"]}
+    [helper] = [r for r in template.values() if r["Type"] == "AWS::IAM::Policy"
+                and r["Properties"]["PolicyDocument"]["Statement"][0]["Resource"] == {"Fn::GetAtt": [bucket_id, "Arn"]}]
+    assert helper["Properties"]["PolicyDocument"]["Statement"] == [
+        {"Action": "s3:PutBucketNotification", "Effect": "Allow", "Resource": {"Fn::GetAtt": [bucket_id, "Arn"]}}]
+
+
 def test_triggers(template):
-    """Both configurations through the one notification helper: the intake trigger as it was, and the writer's."""
+    """Both configurations through the one notification helper: the intake trigger as it was, and the writer's.  The
+    notification on roam-ds-assets keeps its logical id."""
     fn_id, _ = only(template, "AWS::Lambda::Function", FunctionName="esp-design-extraction")
     writer_id, _ = only(template, "AWS::Lambda::Function", FunctionName="esp-design-extraction-writer")
-    _, notification = only(template, "Custom::S3BucketNotifications")
+    notification_id, notification = only(template, "Custom::S3BucketNotifications", BucketName="roam-ds-assets")
+    assert notification_id == "BucketNotifications8F2E257D"
     p = notification["Properties"]
     assert (p["BucketName"], p["Managed"]) == ("roam-ds-assets", False)
     assert p["NotificationConfiguration"] == {"LambdaFunctionConfigurations": [{
@@ -231,7 +320,8 @@ def test_table(template):
     assert (table["DeletionPolicy"], table["UpdateReplacePolicy"]) == ("RetainExceptOnCreate", "Retain")
 
 
-@pytest.mark.parametrize("name", ["esp-design-extraction", "esp-design-extraction-writer"])
+@pytest.mark.parametrize("name", ["esp-design-extraction", "esp-design-extraction-writer",
+                                  "esp-design-extraction-product-intake"])
 def test_log_groups(template, name):
     _, group = only(template, "AWS::Logs::LogGroup", LogGroupName=f"/aws/lambda/{name}")
     assert group["Properties"]["RetentionInDays"] == 90

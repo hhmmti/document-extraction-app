@@ -8,9 +8,12 @@ scanned.
                                              a model marked not in the catalogue, and the string saved so); or, once
                                              written, its confirmed view
 
-The rest needs no input: every message the app makes, scanned the same way.  What a scan leaves out (`exempt`): the
-organisation and the well, as the well list names them; pump models, the catalogue's names among them; values and
-text as printed; the document's file name (a transcription's, its scan's); who confirms; and what the
+The rest needs no input: every message the app makes, scanned the same way, among them the line on a run an upload in
+the product started and the writer's refusal of an environment other than the upload's.  The screens in those states
+are scanned where tests/test_review.py reaches them (S3 mode, and local mode, which reads no upload labels), and so
+are those of a lab-check run pushed from production, its Write off from the start.  What a scan leaves out
+(`exempt`): the organisation and the well, as the well list names them; pump models, the catalogue's names among them;
+values and text as printed; the document's file name (a transcription's, its scan's); who confirms; and what the
 engineer typed.
 """
 
@@ -195,7 +198,9 @@ SAMPLE_REFUSALS = [
     "#1218: pump_parameters.pump_sections: expected a non-empty list of sections, deepest section first",
     "#1218: wellbore_parameters: expected a map of parameters", "row: confirmed_by is not a string",
     f"runs/{RUN}/report.md is not there", "INTERNAL_ERROR at version: OSError: disk full",
-    f"a request {CID} is already there", R.environment_problem(R.LAB_CHECK, "prd"), "something the app has not seen"]
+    f"a request {CID} is already there", R.environment_problem(R.LAB_CHECK, "prd"),
+    "environment is 'prd'; the upload's is 'dev'", "environment is 'dev'; the upload's is 'prd'",
+    "something the app has not seen"]
 
 
 def test_every_reason_says_what_was_noticed_and_what_to_check_without_a_code():
@@ -223,7 +228,7 @@ def test_the_apps_own_messages_are_plain(tmp_path):
     notes = [R.confirmer("s3", {}, caller=broken)[1], R.confirmer("local", {}, tmp_path)[1],
              R.confirmer("local", {R.OFFLINE_ENV: "tester"}, tmp_path)[1],
              R.confirmer("local", {R.OFFLINE_ENV: "tester"}, Path(R.CLI.LAB) / "store")[1],
-             R.environment_problem(R.LAB_CHECK, "prd")]
+             R.environment_problem(R.LAB_CHECK, "prd"), R.AUTOMATIC]
     notes += [R.place(e) for e in C.ENVIRONMENTS]
     notes += [R.report_words({"route": "template", "family": code}) for code in R.VENDORS]
     notes += [R.report_words({"route": "generic"}), R.report_words({"route": "generic", "forced": True}), R.NOT_KNOWN]

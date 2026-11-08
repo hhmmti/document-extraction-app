@@ -5,6 +5,12 @@ four object-metadata values, each percent-encoded UTF-8: `organization-id`, `wel
 (a plain file name) and `sha256` (the PDF's, lower-case hex).  The app encodes the labels, the Lambda
 decodes them, and both read the key here.  Standard library only, so the viewer can import it
 without loading the AWS SDK.
+
+Four optional labels may sit beside them, percent-encoded UTF-8 alike: `origin` (only `product-upload`: an upload in
+the ESP product started the run, through lambda_function.product_upload_handler), `environment` (only `dev` or `prd`:
+where that upload was made), `uploaded-by` and `pushed-from` (the object the product pushed,
+`s3://<bucket>/<key>?versionId=<id>`).  The app's form sets none of them, and the extraction reads none.
+`optional_labels` reads them for the app and the confirmation writer.
 """
 
 from __future__ import annotations
@@ -16,6 +22,10 @@ from urllib.parse import quote, unquote
 from .errors import ExtractionError
 
 LABELS = ("organization-id", "well-id", "source-name", "sha256")
+PRODUCT_UPLOAD = "product-upload"
+# Each optional label, with the values it may take (None: any that decodes).  extraction.confirmation.ENVIRONMENTS,
+# restated: that module imports this one.
+OPTIONAL_LABELS = {"origin": (PRODUCT_UPLOAD,), "environment": ("dev", "prd"), "uploaded-by": None, "pushed-from": None}
 RUN_ID = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}")    # extraction.run.RUN_ID, restated: that module loads botocore
 PERCENT_ENCODED = re.compile(r"(?:[^%]|%[0-9A-Fa-f]{2})+")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -62,3 +72,16 @@ def decode_labels(metadata: dict) -> dict:
         raise ExtractionError("INTAKE_INVALID", f"object metadata missing or undecodable: {', '.join(bad)}",
                               {"labels": bad})
     return labels
+
+
+def optional_labels(metadata) -> dict:
+    """The optional labels the upload carries, percent-decoded as UTF-8 as `decode_label` decodes one: {name: value}
+    for each that is there and valid, `origin` and `environment` only with a value they may take.  One missing or
+    invalid is left out, as absent.  Never raises."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    out = {}
+    for name, allowed in OPTIONAL_LABELS.items():
+        value = decode_label(name, metadata.get(name))
+        if value is not None and (allowed is None or value in allowed):
+            out[name] = value
+    return out

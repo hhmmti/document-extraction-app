@@ -9,7 +9,9 @@
 2. The request is checked (`check`).  Each refusal names its reason; a refused request gets only its result.  The
    writer cannot list, so S3 answers 403, not 404, for a key that is not there: a 403 on the request, on
    runs/<run_id>/... or on intake/<run_id>.pdf reads as not there, and its reason names the key and says so.  A 403
-   on assets/ is a failure (ASSET_INVALID).
+   on assets/ is a failure (ASSET_INVALID).  When intake/<run_id>.pdf carries a valid environment label (an upload in
+   the ESP product: extraction/intake.py), the request's environment must be it; a run without one is checked as
+   before.
 3. An accepted one is written in this order: the document (design-records/<sha>/document.pdf, create-only; already
    there is fine), the version (design-records/<sha>/versions/<id>.json, create-only), the row
    (well-entries/environment=<env>/<id>.json, create-only: the commit point), then the result, overwritten once.
@@ -30,6 +32,7 @@ from . import confirmation as C
 from . import well_entries_schema as schema
 from .catalogue import EXACT, CatalogueNames
 from .errors import ExtractionError
+from .intake import optional_labels
 from .stage import values as V
 from .stage.reports_reader import read_report
 from .validate.validate import catalogue as read_catalogue
@@ -158,6 +161,9 @@ def check(objects, request, cid: str, catalogue) -> tuple[list[str], dict]:
         reasons.append(f"intake/{run_id}.pdf is not there{why}")
     elif hashlib.sha256(pdf).hexdigest() != sha:
         reasons.append(f"intake/{run_id}.pdf is not the document: its SHA-256 is {hashlib.sha256(pdf).hexdigest()}")
+    upload = optional_labels(objects.head(C.pdf_key(run_id)))            # an upload in the product carries them
+    if upload.get("environment", environment) != environment:
+        reasons.append(f"environment is {environment!r}; the upload's is {upload['environment']!r}")
     if entry is None:
         return reasons, {}
 
@@ -220,7 +226,7 @@ def check(objects, request, cid: str, catalogue) -> tuple[list[str], dict]:
     if reasons:
         return list(dict.fromkeys(reasons)), {}
     return [], {**keys_, "pdf": pdf, "row": row,
-                "version": version_record(request, run, entry, row, checks, keys_)}
+                "version": version_record(request, run, entry, row, checks, keys_, upload)}
 
 
 def printed_design_date(objects, run_id: str, reasons: list) -> str | None:
@@ -234,8 +240,10 @@ def printed_design_date(objects, run_id: str, reasons: list) -> str | None:
     return V.parse_date(read_report(body.decode("utf-8", errors="replace")).frontmatter.get("effective_from"))
 
 
-def version_record(request, run, entry, row, checks, keys) -> dict:
-    """The design record's version: what was confirmed against what was proposed, the row, and where the rest is."""
+def version_record(request, run, entry, row, checks, keys, upload=None) -> dict:
+    """The design record's version: what was confirmed against what was proposed, the row, and where the rest is.  Its
+    labels gain origin, uploaded_by and pushed_from from `upload`, the upload's optional labels, when it carries them."""
+    upload = upload or {}
     given = {v["key"]: v for v in request["values"]} | {C.PUMP_SECTIONS: request["pump_string"]}
     values = []
     for v in entry["review"]["values"]:
@@ -250,7 +258,9 @@ def version_record(request, run, entry, row, checks, keys) -> dict:
         "request_key": C.request_key(request["confirmation_id"]),
         "labels": {"organization_id": run["organization_id"], "well_id": run["well_id"],
                    "source_name": (run.get("source") or {}).get("source_name"),
-                   "document_sha256": request["document_sha256"]},
+                   "document_sha256": request["document_sha256"],
+                   **{name.replace("-", "_"): upload[name] for name in ("origin", "uploaded-by", "pushed-from")
+                      if name in upload}},
         "run": {"run_id": request["run_id"], "family": run.get("family"), "route": run.get("route"),
                 "ended_at": run.get("ended_at")},
         "environment": request["environment"], "entry_method": request["entry_method"],

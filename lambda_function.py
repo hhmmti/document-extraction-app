@@ -1,5 +1,6 @@
 """The Lambda's entry point, `lambda_function.lambda_handler`: an intake PDF in, a run folder out.  The same image's
-second entry point, `confirm_handler`, is the confirmation writer (at the end of this file).
+second entry point, `confirm_handler`, is the confirmation writer, and its third, `product_upload_handler`, the starter
+that turns a design PDF pushed by the ESP product into an intake upload (both at the end of this file).
 
 S3 calls it for each `.pdf` created under ESP_INTAKE_PREFIX in ESP_BUCKET (the stack sets these and
 the other ESP_* variables).  For each record of the event (S3 sends one):
@@ -38,11 +39,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import unquote_plus
+from urllib.parse import quote, unquote_plus
 
 import boto3
 from botocore.exceptions import ClientError
@@ -54,7 +56,8 @@ from extraction.confirm_writer import confirm
 from extraction.confirmation import ASSETS_PREFIX, BUCKET, WRITTEN, S3Objects, request_id
 from extraction.confirmation import ROOT as CONFIRMATION_ROOT
 from extraction.errors import ExtractionError
-from extraction.intake import LABELS, decode_label, decode_labels, intake_run_id
+from extraction.intake import (LABELS, PRODUCT_UPLOAD, RUN_ID, decode_label, decode_labels, encode_labels, intake_key,
+                               intake_run_id)
 from extraction.run import run, sha256, utc
 from extraction.stage.stage import CATALOGUE, EVIDENCE, MANIFEST, SEED
 from extraction.validate.validate import catalogue as read_catalogue
@@ -389,3 +392,121 @@ def confirm_one(s3_record, context, s3, table, catalogue) -> dict:
         write_row(table, cid, failed_row(outcome["organization_id"], cid, outcome["well_id"], data))
     log(cid, "end", status=outcome["status"], run=outcome["run_id"], reasons=len(outcome["reasons"]))
     return {"confirmation_id": cid, "status": outcome["status"]}
+
+
+# ---- the product-upload starter: a third entry point in the same image ----
+
+PUSH_KEY = re.compile(r"(dev|prd)/([^/]+)/well-documents/([^/]+)/esp_design/([^/]+\.pdf)")
+PUSH_KEY_WORDS = "<dev|prd>/<organization id>/well-documents/<well id>/esp_design/<file>.pdf"
+NOT_THERE = ("NoSuchKey", "NoSuchVersion", "AccessDenied")     # S3's codes for a read refused as not there (with 403, 404)
+
+
+def product_upload_handler(event, context, *, s3=None, table=None):
+    """The starter's entry point, `lambda_function.product_upload_handler`.  The ESP product puts each design PDF an
+    engineer uploads there into ESP_PUSH_BUCKET, at dev/ or prd/ followed by the product's own key, so
+    `<dev|prd>/<organization id>/well-documents/<well id>/esp_design/<file>.pdf`, with the metadata `uploaded-by` and
+    `original-filename`; S3 calls this for each .pdf created.  Each record starts one run, as the app's upload form
+    does: the PDF is put at `<ESP_INTAKE_PREFIX><run_id>.pdf` in ESP_BUCKET with its labels (extraction/intake.py),
+    create-only, and that upload starts the extraction.
+
+    1. The key, decoded with unquote_plus as the extraction decodes its own, must be a push's, with an organisation and
+       a well, in ESP_PUSH_BUCKET.
+    2. The run id: the event's eventTime to the second, in extraction.run's format, then the first 8 hex digits of the
+       SHA-256 of `<bucket>/<key>@<versionId, or the event's sequencer>`: a repeated event is the same run, and each
+       version of a key its own.
+    3. The event's object version (its versionId when the event has one) is read, with its metadata.
+    4. The labels: organization-id and well-id from the key, exactly as decoded; sha256 of the bytes; source-name the
+       push's original-filename when that decodes to a plain file name ending .pdf, else the key's file name; and the
+       optional ones: origin product-upload, environment from the key, uploaded-by when the push carries it, and
+       pushed-from `s3://<bucket>/<key>?versionId=<id>`.
+    5. The intake object, ContentType application/pdf, create-only.  A 412, or a 409 ConditionalRequestConflict, is a
+       duplicate: logged, and nothing else is written.
+
+    A key or an event refused, an object S3 refuses as not there (it answers 403 or 404, or NoSuchKey, NoSuchVersion or
+    AccessDenied), or a label refused (as the required labels' rules refuse it) gets one FAILED row in the run log
+    (INTAKE_INVALID), made as the extraction's bad-key row is, under the run id once there is one (else ADHOC#<request
+    id>), and nothing is put.  A read that fails otherwise (a 500, a throttle, a timeout: INTERNAL_ERROR, stage read,
+    with the trace) and an intake put that fails otherwise (STORE_FAILED) each get a FAILED row and are raised, so
+    that Lambda retries the event: the same run, create-only.  A run that starts writes no row: the extraction's is
+    the run's.  Each step prints one JSON line with the run id.  The event is never logged or stored, as it names the
+    uploader and their IP, and the uploader goes only on the intake object, as its label.  The keywords stand in for
+    AWS in tests."""
+    s3 = s3 or boto3.client("s3")
+    table = table or boto3.resource("dynamodb").Table(os.environ["ESP_RUN_LOG_TABLE"])
+    return [start_run(s3_record, context, s3, table) for s3_record in event.get("Records", [])]
+
+
+def start_run(s3_record, context, s3, table) -> dict:
+    push, bucket, intake = os.environ["ESP_PUSH_BUCKET"], os.environ["ESP_BUCKET"], os.environ["ESP_INTAKE_PREFIX"]
+    source, pushed = s3_record["s3"]["bucket"]["name"], s3_record["s3"]["object"]
+    key, version = unquote_plus(pushed["key"]), pushed.get("versionId")
+    # The row's data_json: the pushed object by its location and version, never the event.
+    row_data = {"request_id": context.aws_request_id, "bucket": source, "key": key, "version_id": version}
+    run_id = organization_id = well_id = None
+
+    def rejected(stage, message) -> dict:
+        log(run_id, stage, key=key, error="INTAKE_INVALID", message=message)
+        write_row(table, run_id, failed_row(organization_id, run_id or f"ADHOC#{context.aws_request_id}", well_id,
+                                            {**row_data, **failure("INTAKE_INVALID", stage, message, None)}))
+        return {"key": key, "status": "rejected"}
+
+    match = PUSH_KEY.fullmatch(key)
+    if source != push or match is None:
+        return rejected("key", f"the key is not {PUSH_KEY_WORDS} in {push}")
+    environment, organization_id, well_id, file_name = match.groups()
+    try:
+        at, sequence = datetime.fromisoformat(s3_record["eventTime"]), version or pushed["sequencer"]
+        made = f"{at.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}-{sha256(f'{push}/{key}@{sequence}'.encode())[:8]}"
+        if at.tzinfo is None or not sequence or not RUN_ID.fullmatch(made):
+            raise ValueError(made)
+    except (KeyError, TypeError, ValueError):
+        return rejected("run_id", "the event gives no run id: it needs an eventTime with its zone, and a versionId "
+                                  "or a sequencer")
+    run_id = made
+
+    try:
+        got = s3.get_object(Bucket=push, Key=key, **({"VersionId": version} if version else {}))
+        data, metadata = got["Body"].read(), got.get("Metadata") or {}
+    except Exception as err:
+        response = getattr(err, "response", None) or {}
+        status, code = response.get("ResponseMetadata", {}).get("HTTPStatusCode"), response.get("Error", {}).get("Code")
+        if status in (403, 404) or code in NOT_THERE:          # refused as not there: retrying would not change it
+            return rejected("read", f"s3://{push}/{key} could not be read ({code or status})")
+        trace = traceback.format_exc()                          # a reason that may pass: a row, then Lambda retries
+        log(run_id, "read", error="INTERNAL_ERROR", trace=trace)
+        write_row(table, run_id, failed_row(organization_id, run_id, well_id, {
+            **row_data, **failure("INTERNAL_ERROR", "read", f"reading s3://{push}/{key}: {type(err).__name__}: {err}",
+                                  trace)}))
+        raise
+    log(run_id, "read", bytes=len(data), version_id=version)
+
+    original = decode_label("source-name", metadata.get("original-filename"))
+    optional = {"origin": PRODUCT_UPLOAD, "environment": environment,
+                "uploaded-by": decode_label("uploaded-by", metadata.get("uploaded-by")),
+                "pushed-from": f"s3://{push}/{key}" + (f"?versionId={version}" if version else "")}
+    try:
+        labels = encode_labels(organization_id, well_id, original if original and original.lower().endswith(".pdf")
+                               else file_name, sha256(data))
+    except ExtractionError as err:
+        return rejected("labels", err.message)
+    labels |= {name: quote(value, safe="") for name, value in optional.items() if value is not None}
+    log(run_id, "labels", organization_id=organization_id, well_id=well_id, environment=environment,
+        optional=[name for name, value in optional.items() if value is not None])
+
+    target = intake_key(intake, run_id)
+    try:
+        s3.put_object(Bucket=bucket, Key=target, Body=data, ContentType="application/pdf", Metadata=labels,
+                      IfNoneMatch="*")
+    except Exception as err:
+        response = getattr(err, "response", None) or {}
+        status, code = response.get("ResponseMetadata", {}).get("HTTPStatusCode"), response.get("Error", {}).get("Code")
+        if status == 412 or (status == 409 and code == "ConditionalRequestConflict"):
+            log(run_id, "duplicate", http_status=status, code=code)
+            return {"run_id": run_id, "status": "duplicate"}
+        trace = traceback.format_exc()
+        log(run_id, "intake", error="STORE_FAILED", trace=trace)
+        write_row(table, run_id, failed_row(organization_id, run_id, well_id, {
+            **row_data, **failure("STORE_FAILED", "intake", f"putting {target}: {err}", trace)}))
+        raise
+    log(run_id, "intake", key=target)
+    return {"run_id": run_id, "status": "started"}

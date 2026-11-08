@@ -1,5 +1,6 @@
 """The design-extraction Lambda and the confirmation writer (each with its role, S3 trigger and log group), the run-log
-table, and the well-entries table and its current-entry view in the Glue catalogue."""
+table, the well-entries table and its current-entry view in the Glue catalogue, and the product-upload bucket with its
+starter (role, trigger and log group), which turns each design PDF the ESP product pushes into a run."""
 
 import base64
 import importlib.util
@@ -26,6 +27,10 @@ RECORDS_PREFIX = "esp-design-extraction/design-records/"
 ENTRIES_PREFIX = "esp-design-extraction/well-entries/"
 FUNCTION_NAME = "esp-design-extraction"
 WRITER_NAME = "esp-design-extraction-writer"
+STARTER_NAME = "esp-design-extraction-product-intake"
+PUSH_BUCKET = "esp-design-extraction-product-uploads-640168431387"
+# The ESP product's accounts, each putting only under its own prefix: products dev and products prd.
+PUSHERS = {"dev/": "411237692998", "prd/": "826771500263"}
 TABLE_NAME = "esp_design_extraction_logging"         # in the layout of the ESP product's esp_logging_v2
 PROFILE_ID = "us.anthropic.claude-opus-5-5"
 PROFILE_ARN = f"arn:aws:bedrock:us-east-1:640168431387:inference-profile/{PROFILE_ID}"
@@ -175,8 +180,9 @@ class EspDesignExtractionStack(Stack):
             role=writer_role, log_group=writer_log_group, environment={"ESP_RUN_LOG_TABLE": TABLE_NAME},
         )
 
-        # Neither function's output can trigger it: the extraction writes only under runs/, the writer under
-        # design-records/, well-entries/ and confirmations/<id>/result.json.
+        # No function's output can trigger itself: the extraction writes only under runs/, the writer under
+        # design-records/, well-entries/ and confirmations/<id>/result.json.  The starter (below) writes only
+        # intake/<run_id>.pdf, which starts the extraction: that is what it is for.
         bucket = s3.Bucket.from_bucket_name(self, "Bucket", BUCKET)
         bucket.add_event_notification(
             s3.EventType.OBJECT_CREATED, s3n.LambdaDestination(function),
@@ -186,6 +192,47 @@ class EspDesignExtractionStack(Stack):
             s3.EventType.OBJECT_CREATED, s3n.LambdaDestination(writer),
             s3.NotificationKeyFilter(prefix=CONFIRMATIONS_PREFIX, suffix="request.json"),
         )
+
+        # The product-upload bucket, owned by this stack: the ESP product's dev account may put only under dev/, its
+        # prd account only under prd/; nothing else may (CDK's deny refuses any request without TLS).  Each PDF put
+        # there starts the starter, which reads that version and puts it at intake/<run_id>.pdf in roam-ds-assets with
+        # its labels, create-only.  Its role can list nothing, and cannot write to the bucket it reads.
+        push_bucket = s3.Bucket(
+            self, "ProductUploads", bucket_name=PUSH_BUCKET, versioned=True, encryption=s3.BucketEncryption.S3_MANAGED,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL, object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+            enforce_ssl=True, removal_policy=RemovalPolicy.RETAIN,
+        )
+        for prefix, account in PUSHERS.items():       # the account principal as a literal ARN, as this stack's ARNs are
+            push_bucket.add_to_resource_policy(iam.PolicyStatement(
+                actions=["s3:PutObject"], principals=[iam.ArnPrincipal(f"arn:aws:iam::{account}:root")],
+                resources=[f"arn:aws:s3:::{PUSH_BUCKET}/{prefix}*"]))
+        starter_log_group = logs.LogGroup(
+            self, "StarterLogGroup", log_group_name=f"/aws/lambda/{STARTER_NAME}",
+            retention=logs.RetentionDays.THREE_MONTHS, removal_policy=RemovalPolicy.RETAIN_ON_UPDATE_OR_DELETE,
+        )
+        starter_role = iam.Role(
+            self, "StarterRole", assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            inline_policies={STARTER_NAME: iam.PolicyDocument(statements=[
+                iam.PolicyStatement(actions=["s3:GetObject", "s3:GetObjectVersion"], resources=[
+                    f"arn:aws:s3:::{PUSH_BUCKET}/{prefix}*" for prefix in PUSHERS]),
+                iam.PolicyStatement(actions=["s3:PutObject"], resources=[f"arn:aws:s3:::{BUCKET}/{INTAKE_PREFIX}*"]),
+                iam.PolicyStatement(actions=["dynamodb:PutItem", "dynamodb:UpdateItem"], resources=[table.table_arn]),
+                iam.PolicyStatement(actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                                    resources=[starter_log_group.log_group_arn]),
+            ])},
+        )
+        # Retried twice: a start is the same run each time (the run id comes from the event), and its put is
+        # create-only, so a retry starts it or finds it started.
+        starter = lambda_.DockerImageFunction(
+            self, "Starter", function_name=STARTER_NAME, architecture=lambda_.Architecture.X86_64,
+            code=image("lambda_function.product_upload_handler"),
+            timeout=Duration.seconds(120), memory_size=2048, retry_attempts=2,
+            role=starter_role, log_group=starter_log_group,
+            environment={"ESP_BUCKET": BUCKET, "ESP_INTAKE_PREFIX": INTAKE_PREFIX, "ESP_RUN_LOG_TABLE": TABLE_NAME,
+                         "ESP_PUSH_BUCKET": PUSH_BUCKET},
+        )
+        push_bucket.add_event_notification(s3.EventType.OBJECT_CREATED, s3n.LambdaDestination(starter),
+                                           s3.NotificationKeyFilter(suffix=".pdf"))
 
         # The well-entries table, its columns from the schema module, and the view of each well's current entry.
         schema = load_schema()

@@ -92,6 +92,8 @@ IMAGE_ONLY = ("This document is a scan: its pages are pictures, with no text to 
               "new run.")
 FINAL = {"launch failed", "succeeded", "failed", "stale", "expired"}
 WAITING = ("queued", "not picked up", "expired")        # S3 mode: an upload with no run record yet
+ORIGIN = "How it started"                              # the run list's column for a run an upload in the product started
+AUTOMATIC_ICON = ":material/cloud_upload:"
 MODE = os.environ.get(MODE_ENV) or "local"
 SECTIONS = ((True, "Whole string", "observation_is_composite = true"),
             (False, "Per section", "observation_is_composite = false"),
@@ -295,8 +297,11 @@ def list_rows(store) -> pd.DataFrame:
         row = {"Run id": run_id, "Started (UTC)": started({}, run_id), "Organisation": "—", "Well": "—",
                "Latest": "", "Family": "—", "Route": "—", "Pipeline": "", "Document review": "—",
                "Error": "", "Cost (USD)": None}
+        labels = store.intake_labels(run_id) or {}                           # S3 mode: the upload's
+        if R.automatic(labels):
+            row[ORIGIN] = R.AUTOMATIC
         if run_id in queue:
-            (state, waited), labels = queue[run_id], store.intake_labels(run_id) or {}
+            state, waited = queue[run_id]
             rows.append({**row, "Organisation": text(labels.get("organization-id")),
                          "Well": text(labels.get("well-id")), "Pipeline": state, "Waited": wait_text(waited)})
             continue
@@ -306,7 +311,7 @@ def list_rows(store) -> pd.DataFrame:
         try:
             record = store.record(run_id)
             org, well, error = dig(record, "organization_id"), dig(record, "well_id"), dig(record, "error")
-            if org is None and (labels := store.intake_labels(run_id)):      # S3: a running record names neither
+            if org is None and labels:                                          # S3: a running record names neither
                 org, well = labels["organization-id"], labels["well-id"]
             run = pipeline(record, now)
             key = (text(org), text(well))
@@ -329,7 +334,10 @@ def list_rows(store) -> pd.DataFrame:
         except Exception:  # noqa: BLE001 - an unreadable record still gets its row
             row["Pipeline"] = "run.json unreadable"
         rows.append(row)
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if ORIGIN in df:                    # beside the organisation and the well, in view; empty for every other run
+        df.insert(df.columns.get_loc("Well") + 1, ORIGIN, df.pop(ORIGIN).fillna(""))
+    return df
 
 
 def show_list(store):
@@ -369,6 +377,10 @@ def show_list(store):
             help=f"S3 mode: how long an upload has waited for the function. Queued; not picked up after "
                  f"{intake.PICKUP_S // 60} min with no run running; expired after {intake.EXPIRY_S // 3600} h")}
            if "Waited" in view else {}),
+        **({ORIGIN: st.column_config.TextColumn(
+            width="large", help="S3 mode: the upload's `origin` label. A design PDF an engineer uploaded in the ESP "
+                                "product, pushed here and started by the product-upload function, with no form")}
+           if ORIGIN in view else {}),
     })
 
 
@@ -965,15 +977,15 @@ def review_state(store, run_id, record, entry) -> dict:
     confirmed version for the well carries, and the design dates."""
     key = f"review-{run_id}"
     if key not in st.session_state:
-        org, well = record.get("organization_id"), record["well_id"]
-        environment, kept = R.environment_for(org), R.Kept(store.objects)
+        org, well, labels = record.get("organization_id"), record["well_id"], store.intake_labels(run_id)
+        environment, kept = R.environment_for(org, labels), R.Kept(store.objects)
         version = store.latest_version(dig(record, "source", "pdf", "sha256"), org, well)
         pdf = source_pdf(store, record)
         scan = None if pdf is None else T.recognise(pdf)            # a transcription: reviewed against its scan
         typed = scan is not None and scan.problem is None
         entry = R.from_scan(entry) if typed else entry
         st.session_state[key] = {
-            "entry": entry, "kept": kept, "environment": environment, "scan": scan,
+            "entry": entry, "kept": kept, "environment": environment, "scan": scan, "automatic": R.automatic(labels),
             "review": R.start(entry, record, version, at=now_text(), names=catalogue_names()[1], scan=typed),
             "version": version and {k: version.get(k) for k in ("confirmation_id", "confirmed_by", "confirmed_at")},
             "dates": R.design_dates(kept, run_id, store.current_entry(environment, org, well))}
@@ -990,7 +1002,7 @@ def context(store, run_id, record, state, page_key) -> SimpleNamespace:
                            review=state["review"], kept=state["kept"], env=state["environment"],
                            dates=state["dates"], version=state["version"], name=name, who=who,
                            offline=MODE == "local" and name is not None, sha=sha, pdf=pdf, page_key=page_key,
-                           models=models, names=names, scan=state["scan"])
+                           models=models, names=names, scan=state["scan"], automatic=state["automatic"])
 
 
 def source_pdf(store, record) -> bytes | None:
@@ -1039,11 +1051,14 @@ def document_pane(store, record, page_key, pdf=None):
 
 
 def gate(ctx) -> tuple[bool, str]:
-    """(whether Write is on, why not).  On only when the writer would accept the request as it stands, the string's
-    editor holds no unsaved edits, and the source PDF is not a broken transcription."""
+    """(whether Write is on, why not).  On only when the writer would accept the request as it stands, the run's
+    organisation may write where the entry goes (`R.environment_problem`: lab-check to test only, as R.write refuses it),
+    the string's editor holds no unsaved edits, and the source PDF is not a broken transcription."""
     if ctx.scan is not None and ctx.scan.problem:
         return False, (f"Write is off: this file is marked as a transcription, but {ctx.scan.problem}. Upload the file "
                        "exactly as the skill made it, as a new run.")
+    if refused := R.environment_problem(ctx.record.get("organization_id"), ctx.env):      # whatever is decided
+        return False, f"Write is off. {refused}"
     if R.unsaved(ctx.review):
         return False, " ".join(filter(None, (ctx.who if ctx.name is None else "", R.UNSAVED)))
     groups = R.groups(ctx.review, ctx.entry)
@@ -1137,6 +1152,8 @@ def review_header(ctx, on, why):
                 st.caption(label)
                 st.markdown(f"**{plain(value)}**")
         notes = st.container(horizontal=True, vertical_alignment="center")
+        if ctx.automatic:                                   # who uploaded is never shown
+            notes.badge(R.AUTOMATIC, icon=AUTOMATIC_ICON, color="blue")
         if dig(ctx.record, "route") == "generic":
             notes.badge(R.NOT_KNOWN, icon=":material/rate_review:", color="orange")
         if ctx.who:
@@ -1858,6 +1875,8 @@ def show_watch(store, run_id):
     if run_id not in store.run_ids() and run_id not in store.launch_ids():
         st.warning(f"There is no run {plain(run_id)} in this store.")
         return
+    if R.automatic(store.intake_labels(run_id)):
+        st.badge(R.AUTOMATIC, icon=AUTOMATIC_ICON, color="blue")
     if watch_now(store, run_id)[0] in FINAL:
         render_watch(store, run_id)
         return

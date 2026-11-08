@@ -6,6 +6,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -21,9 +22,12 @@ from extraction.intake import LABELS, RUN_ID, decode_labels, encode_labels, inta
 from test_bedrock import FakeClient, events
 from test_intake import WELLS, app
 from test_run import GOOD
+from test_screens import screen
 from test_viewer import FULL, PDF, PDF_SHA, record, texts
 
 BUCKET, INTAKE, RUNS = TL.BUCKET, TL.INTAKE, TL.RUNS
+# The run list's column (app/main.py) and its words (app/review.py) for a run an upload in the product started.
+ORIGIN, AUTOMATIC = "How it started", "Started automatically by an upload in the product"
 ORG, WELL = "Org Alpha", "Well  #1"            # test_intake's invented ids, the form's first choices below
 COST = ("This calls Opus on Bedrock in the datascience account; recent runs cost about USD 0.55–1.32 and "
         "take 3–8 minutes.")
@@ -376,3 +380,47 @@ def test_an_unknown_mode_is_refused_and_s3_needs_its_variables(fake, monkeypatch
 def test_an_s3_failure_is_said_plainly(fake):
     fake.fail["ListObjectsV2", INTAKE] = TL.client_error(400, "ExpiredToken", "ListObjectsV2")
     assert any(e.startswith("S3 could not be read (ClientError") and "aws sso login" in e for e in texts(app().error))
+
+
+# ---- a run an upload in the product started ----
+
+UPLOADER = "engineer-7@example.com"
+
+
+def pushed_labels() -> dict:
+    """An upload as the product-upload starter labels it: the four, and the optional ones."""
+    return {**encode_labels(ORG, WELL, "doc.pdf", PDF_SHA), "origin": "product-upload", "environment": "dev",
+            "uploaded-by": quote(UPLOADER, safe=""), "pushed-from": quote("s3://b/dev/k.pdf?versionId=v", safe="")}
+
+
+def test_the_store_gives_the_optional_labels_beside_the_four(fake):
+    pushed, form = rid(1), rid(2)
+    upload(fake, pushed, metadata=pushed_labels())
+    upload(fake, form)
+    store = S.s3_store_from_env()
+    four = decode_labels(encode_labels(ORG, WELL, "doc.pdf", PDF_SHA))
+    assert store.intake_labels(pushed) == {**four, "origin": "product-upload", "environment": "dev",
+                                           "uploaded-by": UPLOADER, "pushed-from": "s3://b/dev/k.pdf?versionId=v"}
+    assert store.intake_labels(form) == four
+
+
+def test_a_run_the_product_started_says_so_in_the_list_and_on_its_queue_and_watch_pages(fake):
+    pushed, form, queued = rid(1), rid(2), rid(3)
+    upload(fake, form)
+    assert ORIGIN not in app().dataframe[0].value                      # the form's uploads alone: the list as before
+    for run_id in (pushed, queued):
+        upload(fake, run_id, metadata=pushed_labels())
+    stored_run(fake, pushed, record(pushed))                           # one has its run, one is queued
+    S.s3_store_from_env().refresh()
+    at = app()
+    df = at.dataframe[0].value.set_index("Run id")
+    assert df.loc[[queued, pushed], ORIGIN].tolist() == [AUTOMATIC, AUTOMATIC]
+    assert df.loc[[queued, pushed], "Pipeline"].tolist() == ["queued", "completed"] and df.loc[form, ORIGIN] == ""
+    assert list(df.reset_index().columns[3:5]) == ["Well", ORIGIN]              # beside the organisation and well
+    pages = [at]
+    for run_id, says in ((queued, True), (form, False)):
+        watch = app(watch=run_id)
+        assert any(i.startswith("Queued for") for i in texts(watch.info))
+        assert (AUTOMATIC in " ".join(texts(watch.markdown))) == says
+        pages.append(watch)
+    assert not [s for page in pages for s in screen(page) if UPLOADER in s]       # who uploaded is never shown

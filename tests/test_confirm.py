@@ -18,6 +18,7 @@ import sys
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 import pytest
 from botocore.exceptions import ClientError
@@ -31,6 +32,7 @@ import lambda_function as L
 import test_app_s3 as TA
 import test_lambda as TL
 from extraction.assets_dir import ASSETS_ENV
+from extraction.intake import encode_labels
 from extraction.well_entry import (BLOCKS, KEYS, SETTLED, TO_CHECK, parameter_problems, section_incomplete,
                                    section_value)
 from test_validate import report_text
@@ -400,6 +402,82 @@ def test_once_the_row_is_written_the_confirmation_stands(store, monkeypatch):
     assert store.keys(C.row_prefix("prd")) == [C.row_key("prd", CID)]
 
 
+# ---- a run an upload in the product started: its environment, and its labels in the version ----
+
+PUSHED_FROM = "s3://esp-design-extraction-product-uploads-640168431387/dev/org-1/well-documents/Well  #1/esp_design/" \
+              "current.pdf?versionId=v1"
+PUSHED = {"origin": "product-upload", "environment": "dev", "uploaded-by": quote("engineer 7", safe=""),
+          "pushed-from": quote(PUSHED_FROM, safe="")}
+
+
+def labelled(objects, **changes):
+    """The run's PDF labelled as the starter labels it, kept as LocalObjects keeps metadata: the four, then the optional
+    ones with `changes` on top (None leaves one out)."""
+    meta = {**encode_labels(ORG, WELL, "design.pdf", SHA), **PUSHED, **changes}
+    objects.meta(C.pdf_key(RUN_ID)).write_text(json.dumps({k: v for k, v in meta.items() if v is not None}))
+
+
+def test_local_objects_keep_an_objects_metadata_beside_it(tmp_path):
+    objects, key = C.LocalObjects(tmp_path), C.pdf_key(RUN_ID)
+    assert objects.head(key) is None                                   # no object
+    objects.put(key, PDF)
+    assert objects.head(key) == {}                                     # an object with no metadata
+    assert objects.meta(key) == tmp_path / "intake" / f".{RUN_ID}.pdf.metadata.json"
+    objects.meta(key).write_text(json.dumps({"environment": "dev"}))
+    assert objects.head(key) == {"environment": "dev"} and objects.keys(f"{C.ROOT}intake/") == [key]
+
+
+def test_s3_objects_read_metadata_with_a_head_and_a_403_or_404_reads_as_none():
+    fake, key = TA.FakeS3(), C.pdf_key(RUN_ID)                         # a key not there: 403, as S3 answers the writer
+    objects = C.S3Objects(fake)
+    assert objects.head(key) is None
+    fake.add(key, PDF, metadata={"environment": "prd"})
+    assert objects.head(key) == {"environment": "prd"} and fake.calls[-1] == ("HeadObject", key)
+    fake.fail["HeadObject", key] = TL.client_error(404, "404", "HeadObject")
+    assert objects.head(key) is None
+    fake.fail["HeadObject", key] = TL.client_error(500, "InternalError", "HeadObject")
+    with pytest.raises(ClientError):
+        objects.head(key)
+
+
+def test_a_request_for_another_environment_than_the_uploads_is_refused(store):
+    labelled(store)
+    out = submit(store, request())                                     # prd; the upload's is dev
+    assert (out["status"], out["reasons"]) == (C.REFUSED, ["environment is 'prd'; the upload's is 'dev'"])
+    assert written_keys(store) == [C.request_key(CID), C.result_key(CID)]
+
+
+def test_a_request_for_the_uploads_environment_is_written_its_version_carrying_the_uploads_labels(store):
+    labelled(store)
+    assert submit(store, request(environment="dev"))["status"] == C.WRITTEN
+    version = C.load(store.get(C.version_key(SHA, CID)))
+    assert version["labels"] == {"organization_id": ORG, "well_id": WELL, "source_name": "design.pdf",
+                                 "document_sha256": SHA, "origin": "product-upload", "uploaded_by": "engineer 7",
+                                 "pushed_from": PUSHED_FROM}
+    row = json.loads(store.get(C.row_key("dev", CID)))                 # the row as ever: the uploader is not in it
+    assert list(row) == [n for n, _ in schema.COLUMNS + schema.PARTITION_KEYS] and row["environment"] == "dev"
+    assert "engineer 7" not in json.dumps(row)
+
+
+@pytest.mark.parametrize("changes", [None, {"environment": "qa"}, {"environment": None}],
+                         ids=["no labels", "an invalid environment", "no environment"])
+def test_a_run_without_a_valid_environment_label_is_checked_as_today(store, changes):
+    if changes is not None:
+        labelled(store, **changes)
+    others = "20261028T140000Z-0000beef"
+    for environment, cid in (("prd", CID), ("dev", others)):
+        out = submit(store, request(environment=environment, confirmation_id=cid), cid=cid)
+        assert (out["status"], out["reasons"]) == (C.WRITTEN, [])
+    version = C.load(store.get(C.version_key(SHA, others)))
+    assert set(version["labels"]) == {"organization_id", "well_id", "source_name", "document_sha256",
+                                      *(("origin", "uploaded_by", "pushed_from") if changes is not None else ())}
+
+
+def test_a_valid_environment_label_binds_without_the_origin_label(store):
+    labelled(store, origin=None)
+    assert submit(store, request())["reasons"] == ["environment is 'prd'; the upload's is 'dev'"]
+
+
 # ---- the Lambda entry point: write order, the run log, duplicates, failures ----
 
 class Bucket(TA.FakeS3):
@@ -555,6 +633,14 @@ def test_a_403_on_the_request_is_a_refusal_naming_the_key(bucket):
     assert out == [{"confirmation_id": CID, "status": C.REFUSED}]
     assert TL.data(table.items[0])["reasons"] == [
         f"contract: the request is not there (S3 answered 403 for {C.request_key(CID)}: {FORBIDDEN})"]
+
+
+def test_the_writer_lambda_reads_the_uploads_environment_with_a_head(bucket):
+    bucket.metadata[C.pdf_key(RUN_ID)] = {**encode_labels(ORG, WELL, "design.pdf", SHA), **PUSHED}
+    out, table = handle(bucket, request())
+    assert out == [{"confirmation_id": CID, "status": C.REFUSED}]
+    assert TL.data(table.items[0])["reasons"] == ["environment is 'prd'; the upload's is 'dev'"]
+    assert ("HeadObject", C.pdf_key(RUN_ID)) in bucket.calls
 
 
 def test_a_403_on_assets_stays_a_failure(bucket):

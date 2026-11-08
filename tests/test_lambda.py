@@ -1,11 +1,13 @@
-"""The Lambda handler, offline.  S3 and DynamoDB are hand-written fakes; Bedrock is test_bedrock's stub
-client, built per run as the handler builds the real one.  A run that gets past the assets needs the real
-ones (ESP_EXTRACTION_ASSETS_DIR), which the fake bucket then serves; the rest need nothing."""
+"""The Lambda handler, and the product-upload starter (at the end), offline.  S3 and DynamoDB are hand-written fakes;
+Bedrock is test_bedrock's stub client, built per run as the handler builds the real one.  A run that gets past the
+assets needs the real ones (ESP_EXTRACTION_ASSETS_DIR), which the fake bucket then serves; the rest need nothing."""
 
+import hashlib
 import io
 import json
 import os
 import re
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, quote_plus, unquote
@@ -16,6 +18,7 @@ from botocore.exceptions import ClientError
 import extraction.run as R
 import lambda_function as L
 from extraction.assets_dir import ASSETS_ENV
+from extraction.intake import decode_labels, encode_labels, optional_labels
 from test_bedrock import FakeClient, events
 from test_run import GOOD
 from test_unit import F4_P1, F4_P2, make_pdf
@@ -506,3 +509,331 @@ def test_the_fake_table_refuses_what_dynamodb_would():
     table.update_item(Key=key, UpdateExpression="SET #s = :s", ExpressionAttributeNames={"#s": "status"},
                       ExpressionAttributeValues={":s": "FAILED"})
     assert table.items == [{**key, "status": "FAILED"}]
+
+
+# ---- the product-upload starter ----
+
+PUSH = "esp-design-extraction-product-uploads-640168431387"
+STARTER = "esp-design-extraction-product-intake"
+PUSH_WELL = "Well  #1 A"                         # a space, a # and a double space
+PUSH_KEY = f"dev/org-1/well-documents/{PUSH_WELL}/esp_design/current.pdf"
+VERSION, SEQUENCER = "3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY", "0055AED6DCD90281E5"
+EVENT_TIME = "2026-11-05T18:00:07.123Z"
+UPLOADED_BY = "engineer-7@example.com"
+ORIGINAL = "Désign report 1.pdf"                 # the push's original-filename, sent percent-encoded
+
+
+class Pushes(FakeS3):
+    """roam-ds-assets as FakeS3 keeps it, beside the product-upload bucket, which keeps each pushed version of a key
+    and reads one only by its VersionId (None for a push with no version).  A version not there is a 403: the
+    starter cannot list.  `fail` takes ("GetObject", "<push bucket>/<key>") too."""
+
+    def __init__(self):
+        super().__init__()
+        self.versions, self.headers = {}, {}
+
+    def push(self, key=PUSH_KEY, body=PDF, version=VERSION, metadata=None):
+        self.versions[key, version] = (body, {"uploaded-by": UPLOADED_BY, "original-filename": quote(ORIGINAL, safe="")}
+                                       if metadata is None else metadata)
+
+    def get_object(self, *, Bucket, Key, VersionId=None):
+        if Bucket == BUCKET:
+            return super().get_object(Bucket=Bucket, Key=Key)
+        assert Bucket == PUSH
+        self.calls.append(("GetObject", f"{PUSH}/{Key}", VersionId))
+        if ("GetObject", f"{PUSH}/{Key}") in self.fail:
+            raise self.fail["GetObject", f"{PUSH}/{Key}"]
+        if (Key, VersionId) not in self.versions:
+            raise client_error(403, "AccessDenied", "GetObject")
+        body, metadata = self.versions[Key, VersionId]
+        return {"Body": io.BytesIO(body), "Metadata": dict(metadata)}
+
+    def put_object(self, *, Bucket, Key, Body, IfNoneMatch=None, ContentType=None, Metadata=None):
+        super().put_object(Bucket=Bucket, Key=Key, Body=Body, IfNoneMatch=IfNoneMatch)
+        self.metadata[Key] = dict(Metadata or {})
+        self.headers[Key] = {"ContentType": ContentType, "IfNoneMatch": IfNoneMatch}
+
+
+def push_event(key=PUSH_KEY, *, version=VERSION, sequencer=SEQUENCER, at=EVENT_TIME, bucket=PUSH):
+    """One record as S3 sends it for a push: the key URL-encoded, who uploaded and from where."""
+    pushed = {"key": quote_plus(key, safe="/"), "size": len(PDF), **({"versionId": version} if version else {}),
+              **({"sequencer": sequencer} if sequencer else {})}
+    return {"Records": [{"eventSource": "aws:s3", "eventName": "ObjectCreated:Put", **({"eventTime": at} if at else {}),
+                         "userIdentity": UPLOADER, "requestParameters": {"sourceIPAddress": UPLOADER_IP},
+                         "s3": {"bucket": {"name": bucket}, "object": pushed}}]}
+
+
+@pytest.fixture
+def pushes(monkeypatch):
+    for name, value in {"ESP_PUSH_BUCKET": PUSH, "ESP_BUCKET": BUCKET, "ESP_INTAKE_PREFIX": INTAKE,
+                        "ESP_RUN_LOG_TABLE": "esp_design_extraction_logging", "AWS_LAMBDA_FUNCTION_NAME": STARTER}.items():
+        monkeypatch.setenv(name, value)
+    fake = Pushes()
+    fake.push()
+    return fake
+
+
+def start(fake, event=None, table=None):
+    table = table or FakeTable()
+    return L.product_upload_handler(event or push_event(), Context(120_000), s3=fake, table=table), table
+
+
+def pushed_run(key=PUSH_KEY, sequence=VERSION, second="20261105T180007Z") -> str:
+    return f"{second}-{hashlib.sha256(f'{PUSH}/{key}@{sequence}'.encode()).hexdigest()[:8]}"
+
+
+def assert_starter_row(row, *, stage, code="INTAKE_INVALID", organization_id="_unknown", well_ids=(),
+                       execution_id=f"ADHOC#{REQUEST_ID}", key=PUSH_KEY, version=VERSION):
+    """The one FAILED row of a push that started no run: made as the extraction's bad-key row is, by the starter."""
+    assert set(row) == ENDED and row["end_timestamp"] == row["timestamp"]
+    assert (row["type"], row["status"], row["success"], row["resource_name"]) == (
+        "PIPELINE_EXECUTION", "FAILED", False, STARTER)
+    assert (row["organization_id"], row["organization_id_type"], row["well_ids"]) == (
+        organization_id, f"{organization_id}#PIPELINE_EXECUTION", list(well_ids))
+    assert (row["pipeline_execution_id"], row["uuid"]) == (execution_id, execution_id)
+    assert {k: data(row)[k] for k in ("request_id", "bucket", "key", "version_id", "error_code", "stage")} == {
+        "request_id": REQUEST_ID, "bucket": PUSH, "key": key, "version_id": version, "error_code": code,
+        "stage": stage}
+
+
+def test_a_push_becomes_one_intake_object_the_pdf_with_its_eight_labels(pushes, capsys):
+    out, table = start(pushes)
+    run_id, key = pushed_run(), f"{INTAKE}{pushed_run()}.pdf"
+    assert out == [{"run_id": run_id, "status": "started"}]
+    assert pushes.calls[0] == ("GetObject", f"{PUSH}/{PUSH_KEY}", VERSION)          # the event's version
+    assert put_keys(pushes) == [key] and pushes.objects[key] == PDF
+    assert pushes.headers[key] == {"ContentType": "application/pdf", "IfNoneMatch": "*"}
+    pushed_from = f"s3://{PUSH}/{PUSH_KEY}?versionId={VERSION}"
+    assert pushes.metadata[key] == {**encode_labels("org-1", PUSH_WELL, ORIGINAL, R.sha256(PDF)),
+                                    "origin": "product-upload", "environment": "dev",
+                                    "uploaded-by": quote(UPLOADED_BY, safe=""), "pushed-from": quote(pushed_from, safe="")}
+    assert decode_labels(pushes.metadata[key]) == {"organization-id": "org-1", "well-id": PUSH_WELL,
+                                                   "source-name": ORIGINAL, "sha256": R.sha256(PDF)}
+    assert optional_labels(pushes.metadata[key]) == {"origin": "product-upload", "environment": "dev",
+                                                     "uploaded-by": UPLOADED_BY, "pushed-from": pushed_from}
+    assert table.items == []                             # a run that starts writes no row: the extraction's is the run's
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [(line["run_id"], line["stage"]) for line in lines] == [(run_id, "read"), (run_id, "labels"),
+                                                                   (run_id, "intake")]
+
+
+@pytest.mark.parametrize("status", [412, 409])
+def test_the_same_event_twice_is_one_run_and_one_duplicate(pushes, capsys, status):
+    first, _ = start(pushes)
+    key = f"{INTAKE}{pushed_run()}.pdf"
+    if status == 409:                                   # another create of the key racing this one
+        pushes.fail["PutObject", key] = client_error(409, "ConditionalRequestConflict", "PutObject")
+    again, table = start(pushes)
+    assert first == [{"run_id": pushed_run(), "status": "started"}]
+    assert again == [{"run_id": pushed_run(), "status": "duplicate"}]
+    assert put_keys(pushes) == [key] and table.items == []
+    last = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert (last["run_id"], last["stage"], last["http_status"]) == (pushed_run(), "duplicate", status)
+
+
+def test_two_versions_of_a_key_are_two_runs(pushes):
+    pushes.push(body=PDF + b"\n% the second version\n", version="v2-0000000000000000000000000000")
+    first, _ = start(pushes)
+    second, _ = start(pushes, push_event(version="v2-0000000000000000000000000000", sequencer="0055AED6DCD90281F0"))
+    runs = [first[0]["run_id"], second[0]["run_id"]]
+    assert runs == [pushed_run(), pushed_run(sequence="v2-0000000000000000000000000000")] and runs[0] != runs[1]
+    assert [pushes.objects[f"{INTAKE}{r}.pdf"] for r in runs] == [PDF, PDF + b"\n% the second version\n"]
+
+
+@pytest.mark.parametrize("key", [
+    "qa/org-1/well-documents/W 1/esp_design/current.pdf",                 # outside dev/ and prd/
+    "org-1/well-documents/W 1/esp_design/current.pdf",                    # the product's key without its prefix
+    "dev/org-1/wells/W 1/esp_design/current.pdf",                         # another shape
+    "dev/org-1/well-documents/W 1/current.pdf",
+    "dev/org-1/well-documents/W 1/esp_design/old/current.pdf",
+    "dev/org-1/well-documents/W 1/esp_design/.pdf",                       # no file name
+    "dev//well-documents/W 1/esp_design/current.pdf",                     # no organisation
+    "dev/org-1/well-documents//esp_design/current.pdf",                   # no well
+])
+def test_a_key_of_another_shape_writes_one_failed_row_and_no_intake_object(pushes, key):
+    pushes.push(key=key)
+    out, table = start(pushes, push_event(key))
+    assert out == [{"key": key, "status": "rejected"}] and pushes.calls == [] and pushes.puts == []
+    [row] = table.items
+    assert_starter_row(row, stage="key", key=key)
+    assert data(row)["message"] == f"the key is not {L.PUSH_KEY_WORDS} in {PUSH}"
+
+
+def test_an_event_from_another_bucket_is_refused(pushes):
+    out, table = start(pushes, push_event(bucket="another-bucket"))
+    assert out == [{"key": PUSH_KEY, "status": "rejected"}] and pushes.calls == []
+    [row] = table.items
+    assert data(row)["bucket"] == "another-bucket" and data(row)["stage"] == "key"
+
+
+@pytest.mark.parametrize("fail,code", [
+    (None, "AccessDenied"),                                         # the version not there: S3 answers the starter 403
+    (client_error(404, "NoSuchKey", "GetObject"), "NoSuchKey"),
+    (client_error(404, "NoSuchVersion", "GetObject"), "NoSuchVersion"),
+    (client_error(400, "AccessDenied", "GetObject"), "AccessDenied"),     # the code alone is enough
+], ids=["403 version not there", "404 NoSuchKey", "404 NoSuchVersion", "AccessDenied"])
+def test_an_object_refused_as_not_there_is_rejected_with_one_failed_row_and_not_raised(pushes, fail, code):
+    if fail:
+        pushes.fail["GetObject", f"{PUSH}/{PUSH_KEY}"] = fail
+    else:
+        pushes.versions.clear()
+    out, table = start(pushes)                                      # returns: no retry would change it
+    assert out == [{"key": PUSH_KEY, "status": "rejected"}] and pushes.puts == []
+    [row] = table.items
+    assert_starter_row(row, stage="read", organization_id="org-1", well_ids=(PUSH_WELL,), execution_id=pushed_run())
+    assert data(row)["message"] == f"s3://{PUSH}/{PUSH_KEY} could not be read ({code})"
+
+
+PASSING = [client_error(500, "InternalError", "GetObject"), client_error(503, "SlowDown", "GetObject"),
+           socket.timeout("timed out")]
+
+
+@pytest.mark.parametrize("fail", PASSING, ids=["500 InternalError", "503 SlowDown", "socket timeout"])
+def test_a_read_that_fails_for_a_passing_reason_writes_a_failed_row_and_raises_so_that_lambda_retries(pushes, capsys,
+                                                                                                      fail):
+    pushes.fail["GetObject", f"{PUSH}/{PUSH_KEY}"] = fail
+    table = FakeTable()
+    with pytest.raises(type(fail)):
+        start(pushes, table=table)
+    assert pushes.puts == []
+    [row] = table.items
+    assert_starter_row(row, stage="read", code="INTERNAL_ERROR", organization_id="org-1", well_ids=(PUSH_WELL,),
+                       execution_id=pushed_run())
+    assert data(row)["message"] == f"reading s3://{PUSH}/{PUSH_KEY}: {type(fail).__name__}: {fail}"
+    assert "Traceback" in data(row)["stack_trace"]
+    [line] = [json.loads(line) for line in capsys.readouterr().out.splitlines() if '"stage": "read"' in line]
+    assert (line["run_id"], line["error"], "Traceback" in line["trace"]) == (pushed_run(), "INTERNAL_ERROR", True)
+
+
+def test_a_retry_after_a_passing_read_failure_starts_the_run_once(pushes):
+    pushes.fail["GetObject", f"{PUSH}/{PUSH_KEY}"] = client_error(503, "SlowDown", "GetObject")
+    table = FakeTable()
+    with pytest.raises(ClientError):
+        start(pushes, table=table)                                  # the event: S3 throttles the read
+    del pushes.fail["GetObject", f"{PUSH}/{PUSH_KEY}"]
+    retries = [start(pushes, table=table)[0] for _ in range(2)]     # Lambda's two retries of the same event
+    assert retries == [[{"run_id": pushed_run(), "status": "started"}], [{"run_id": pushed_run(), "status": "duplicate"}]]
+    assert put_keys(pushes) == [f"{INTAKE}{pushed_run()}.pdf"]      # one intake object: one run
+    assert [data(row)["error_code"] for row in table.items] == ["INTERNAL_ERROR"]
+
+
+@pytest.mark.parametrize("well,bad", [("W\t1", "well-id"), ("  ", "well-id")], ids=["a tab", "only spaces"])
+def test_a_label_the_required_rules_refuse_writes_one_failed_row_and_no_intake_object(pushes, well, bad):
+    key = f"prd/org-1/well-documents/{well}/esp_design/current.pdf"
+    pushes.push(key=key)
+    out, table = start(pushes, push_event(key))
+    assert out == [{"key": key, "status": "rejected"}] and pushes.puts == []
+    [row] = table.items
+    assert_starter_row(row, stage="labels", organization_id="org-1", well_ids=(well,), key=key,
+                       execution_id=pushed_run(key=key))
+    assert data(row)["message"] == f"object metadata missing or undecodable: {bad}"
+
+
+@pytest.mark.parametrize("change", ["no eventTime", "no zone", "not a time", "no versionId or sequencer"])
+def test_an_event_that_makes_no_run_id_is_refused(pushes, change):
+    event = push_event(**{"no eventTime": {"at": None}, "no zone": {"at": "2026-11-05T18:00:07"},
+                          "not a time": {"at": "yesterday"},
+                          "no versionId or sequencer": {"version": None, "sequencer": None}}[change])
+    out, table = start(pushes, event)
+    assert out == [{"key": PUSH_KEY, "status": "rejected"}] and pushes.calls == []
+    [row] = table.items
+    assert_starter_row(row, stage="run_id", organization_id="org-1", well_ids=(PUSH_WELL,),
+                       version=None if change.startswith("no versionId") else VERSION)
+
+
+@pytest.mark.parametrize("at,second", [("2026-11-05T18:00:07.999Z", "20261105T180007Z"),
+                                       ("2026-11-05T18:00:07Z", "20261105T180007Z"),
+                                       ("2026-11-05T20:00:07.5+02:00", "20261105T180007Z"),
+                                       ("2026-12-31T23:59:59.999Z", "20261231T235959Z")])
+def test_the_run_id_carries_the_events_second_in_the_run_id_format(pushes, at, second):
+    out, _ = start(pushes, push_event(at=at))
+    assert out[0]["run_id"] == pushed_run(second=second) and R.RUN_ID.fullmatch(out[0]["run_id"])
+
+
+def test_without_a_version_the_sequencer_names_the_run(pushes):
+    pushes.push(version=None)
+    out, _ = start(pushes, push_event(version=None))
+    assert out == [{"run_id": pushed_run(sequence=SEQUENCER), "status": "started"}]
+    meta = pushes.metadata[f"{INTAKE}{pushed_run(sequence=SEQUENCER)}.pdf"]
+    assert optional_labels(meta)["pushed-from"] == f"s3://{PUSH}/{PUSH_KEY}"
+
+
+@pytest.mark.parametrize("original,source_name", [
+    (None, "current.pdf"),                                        # not carried
+    (quote("x/y.pdf", safe=""), "current.pdf"),                   # not a plain file name
+    ("notes.txt", "current.pdf"),                                 # not a PDF's name
+    ("%FF.pdf", "current.pdf"),                                   # not UTF-8
+    ("report%2.pdf", "current.pdf"),                              # a broken escape
+    ("Design 2.PDF", "Design 2.PDF"),                             # sent as it is; .pdf in any case
+    (quote("Désign.pdf", safe=""), "Désign.pdf"),                 # sent percent-encoded
+])
+def test_the_source_name_is_the_pushs_file_name_when_it_is_a_pdfs_plain_name(pushes, original, source_name):
+    pushes.push(metadata={"uploaded-by": UPLOADED_BY, **({"original-filename": original} if original else {})})
+    start(pushes)
+    assert decode_labels(pushes.metadata[f"{INTAKE}{pushed_run()}.pdf"])["source-name"] == source_name
+
+
+@pytest.mark.parametrize("uploaded_by", [None, "%FF", "  "], ids=["not carried", "not UTF-8", "blank"])
+def test_an_uploader_not_carried_or_unreadable_is_left_out(pushes, uploaded_by):
+    pushes.push(metadata={"original-filename": "a.pdf", **({"uploaded-by": uploaded_by} if uploaded_by else {})})
+    start(pushes)
+    meta = pushes.metadata[f"{INTAKE}{pushed_run()}.pdf"]
+    assert "uploaded-by" not in meta and set(optional_labels(meta)) == {"origin", "environment", "pushed-from"}
+
+
+@pytest.mark.parametrize("organization_id,well_id", [("org-1", "Well  #1 A"), ("Org Alpha", " W 1 "),
+                                                     ("org-1", "Puits É-1"), ("org-1", "W+1 #2"), ("org-1", "100% W")])
+def test_the_labels_decode_back_to_the_keys_organisation_and_well_exactly(pushes, organization_id, well_id):
+    key = f"prd/{organization_id}/well-documents/{well_id}/esp_design/current.pdf"
+    pushes.push(key=key)
+    [out], _ = start(pushes, push_event(key))
+    meta = pushes.metadata[f"{INTAKE}{out['run_id']}.pdf"]
+    labels = decode_labels(meta)
+    assert (labels["organization-id"], labels["well-id"]) == (organization_id, well_id)
+    assert all(value.isascii() for value in meta.values())
+    assert {k: optional_labels(meta)[k] for k in ("environment", "pushed-from")} == {
+        "environment": "prd", "pushed-from": f"s3://{PUSH}/{key}?versionId={VERSION}"}
+
+
+def test_an_intake_put_that_fails_writes_a_failed_row_and_raises_so_that_lambda_retries(pushes):
+    key = f"{INTAKE}{pushed_run()}.pdf"
+    pushes.fail["PutObject", key] = client_error(500, "InternalError", "PutObject")
+    table = FakeTable()
+    with pytest.raises(ClientError):
+        start(pushes, table=table)
+    [row] = table.items
+    assert_starter_row(row, stage="intake", code="STORE_FAILED", organization_id="org-1", well_ids=(PUSH_WELL,),
+                       execution_id=pushed_run())
+    assert "Traceback" in data(row)["stack_trace"]
+    del pushes.fail["PutObject", key]
+    assert start(pushes)[0] == [{"run_id": pushed_run(), "status": "started"}]     # the retry: the same run
+
+
+def test_neither_the_event_nor_the_uploader_is_logged_or_in_the_run_log(pushes, capsys):
+    table = FakeTable()
+    start(pushes, table=table)                                                   # started
+    start(pushes, table=table)                                                   # a duplicate
+    start(pushes, push_event("qa/x/well-documents/W/esp_design/a.pdf"), table)   # refused
+    pushes.fail["GetObject", f"{PUSH}/{PUSH_KEY}"] = client_error(404, "NoSuchVersion", "GetObject")
+    start(pushes, table=table)                                                   # not there
+    pushes.fail["GetObject", f"{PUSH}/{PUSH_KEY}"] = client_error(500, "InternalError", "GetObject")
+    with pytest.raises(ClientError):
+        start(pushes, table=table)                                               # failed, with its trace: retried
+    said = capsys.readouterr().out + json.dumps(table.writes, default=str)
+    assert table.items and said
+    assert all(leak not in said for leak in ("Records", "userIdentity", "requestParameters", UPLOADER["principalId"],
+                                             UPLOADER_IP, UPLOADED_BY, quote(UPLOADED_BY, safe="")))
+
+
+def test_the_optional_labels_read_as_absent_when_missing_or_invalid_and_never_raise():
+    good = {"origin": "product-upload", "environment": "prd", "uploaded-by": quote("engineer 7", safe=""),
+            "pushed-from": quote("s3://b/k 1.pdf?versionId=v", safe="")}
+    assert optional_labels(good) == {"origin": "product-upload", "environment": "prd", "uploaded-by": "engineer 7",
+                                     "pushed-from": "s3://b/k 1.pdf?versionId=v"}
+    assert optional_labels({**good, "origin": "upload-form", "environment": "qa", "uploaded-by": "%FF",
+                            "pushed-from": "%20"}) == {}
+    assert optional_labels({**good, "environment": "Dev"}) == {k: v for k, v in optional_labels(good).items()
+                                                               if k != "environment"}
+    assert optional_labels(labels()) == {}                  # the form's upload: the four labels only
+    for odd in (None, [], "origin", {"origin": 1, "environment": None, "uploaded-by": b"x"}):
+        assert optional_labels(odd) == {}
