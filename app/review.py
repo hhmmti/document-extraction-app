@@ -41,6 +41,10 @@ A run whose source PDF is a transcription (app/transcription.py) is reviewed aga
 `scan`): a value settled one by one, or settled as empty, records CHECKED as its step's reason; the batch sentences
 name the original scan; and the request goes as entry_method `transcription`.  On the template route such a run first
 starts as a generic run would (`from_scan`).
+
+A run that ended and stored no entry can be entered by hand (`by_hand`): the review starts from the empty proposal
+(extraction/well_entry.empty_entry, which `manual` tells), every value typed from the document; Write waits for one
+value or section typed (`entered`), and the request goes as entry_method `manual`, a transcription's too.
 """
 
 from __future__ import annotations
@@ -53,14 +57,15 @@ from collections import Counter
 from datetime import timedelta
 from pathlib import Path
 
+from app.store import SHA256, run_status
 from extraction import confirm as CLI
 from extraction import confirm_writer as W
 from extraction import confirmation as C
 from extraction.intake import PRODUCT_UPLOAD
 from extraction.validate.rules import v09
 from extraction.well_entries_schema import VALUE_TYPE
-from extraction.well_entry import (KEYS, NOT_FROM_THE_DOCUMENT, SOURCE, UNITS, FinalSections, envelope_problem,
-                                   final_string_checks, order_check, section_incomplete)
+from extraction.well_entry import (ENTERED_BY_HAND, KEYS, MANUAL, NOT_FROM_THE_DOCUMENT, SOURCE, UNITS, FinalSections,
+                                   envelope_problem, final_string_checks, order_check, section_incomplete)
 
 LAB_CHECK = "lab-check"                    # the lab's own organisation: dev, every other one prd (`environment_for`)
 AUTOMATIC = "Started automatically by an upload in the product"     # a run whose upload's origin is product-upload
@@ -91,6 +96,8 @@ JUDGEMENTS = (("pressure_basis_unstated", "bare-psi pressures taken as absolute"
               ("pressure_unit_not_printed", "pressures printed with no unit taken as absolute"),
               ("varies_by_scenario", "scenario 1 as the design case"),
               ("depth_basis_pump_setting", "the pump-setting depth for the intake depth"))
+PRESSURES = tuple(k for k, (_, unit) in KEYS.items() if unit == "psia")    # absolute: the correction form says so
+RETRY = ("MODEL_TIMEOUT", "MODEL_ERROR")    # failures that uploading the document again retries
 
 # #1218's labels, as the product's UI writes them (v2-ui/utils/text/managementPage.js at 6831cbd6).
 LABELS = {
@@ -111,6 +118,8 @@ REASONS = {
     "generic_path": "The document is not a known vendor report, so nothing cross-checked this reading. Check it "
                     "against the page.",
     SCAN_REASON: "Typed from a scan: check it against the original.",
+    ENTERED_BY_HAND: "Entered by hand: nothing was read. Find the value in the document and type it, or settle it as "
+                     "empty if the document does not print it.",
     "varies_by_scenario": "The scenarios print different values; scenario 1's is proposed. Check which scenario is "
                           "the design case.",
     "depth_basis_pump_setting": "No intake depth is printed; the pump setting depth stands in for it. Check that it "
@@ -162,6 +171,11 @@ def proposal(entry, key):
 def reviewed(entry) -> dict:
     """{key: the entry's review item}."""
     return {v["key"]: v for v in entry["review"]["values"]}
+
+
+def manual(entry) -> bool:
+    """Whether the entry is the empty proposal of a run entered by hand (extraction/well_entry.empty_entry)."""
+    return entry["review"].get("route") == MANUAL
 
 
 def sections(entry) -> list[dict]:
@@ -904,13 +918,16 @@ def tally(review) -> Counter:
 
 
 def request(review, entry, run, *, cid, confirmed_at, confirmed_by, environment) -> dict:
-    """The request: the CLI's, with each value as this review decided it, and, for a transcription, the entry method
-    `transcription`.  A value not decided goes `to check`, so the writer refuses it by name."""
+    """The request: the CLI's, with each value as this review decided it, and the entry method `manual` for an entry
+    by hand, else `transcription` for a transcription.  A value not decided goes `to check`, so the writer refuses it
+    by name."""
     document = ((run.get("source") or {}).get("pdf") or {}).get("sha256")
     q = CLI.build_request(entry, run, cid=cid, run_id=run["run_id"], document=document, confirmed_at=confirmed_at,
                           confirmed_by=confirmed_by, environment=environment, as_proposed=False, finals={},
                           sections=None, accept_anyway=None, leave=set())
-    if review.get("scan"):
+    if manual(entry):                   # entered by hand, from a transcription too
+        q["entry_method"] = C.MANUAL
+    elif review.get("scan"):
         q["entry_method"] = "transcription"
     for item in [*q["values"], q["pump_string"]]:
         v = review["values"][item.get("key", STRING)]
@@ -961,10 +978,11 @@ def confirmer(mode, environ, store_root=None, caller=None) -> tuple[str | None, 
     return name, "Offline: Write saves on this computer only, and nothing reaches production or test."
 
 
-def design_dates(objects, run_id, current) -> dict:
+def design_dates(objects, run_id, current, *, by_hand=False) -> dict:
     """The run's printed design date, read with the writer's own function, against the current entry's design_date
-    in the target environment: `older`, `not older`, `can't compare` (either undated) or None (no current entry)."""
-    incoming = W.printed_design_date(objects, run_id, [])
+    in the target environment: `older`, `not older`, `can't compare` (either undated) or None (no current entry).  An
+    entry by hand has none: as the writer, nothing reads its report."""
+    incoming = None if by_hand else W.printed_design_date(objects, run_id, [])
     existing = None if current is None else current.get("design_date")
     case = (None if current is None else "can't compare" if incoming is None or existing is None
             else "older" if incoming < existing else "not older")
@@ -1062,6 +1080,34 @@ def outcome(objects, cid, environment, result, *, document=None, reasons=()) -> 
     return out
 
 
+# ---- a run entered by hand ----
+
+def by_hand(run, *, entry_stored, pdf_found, now=None) -> bool:
+    """Whether a run offers entry by hand: it has ended (a running record past its deadline counts, as `run_status`
+    reads it), stored no entry, names its organisation, well and document SHA-256, and its PDF is in the store."""
+    source = run.get("source") if isinstance(run.get("source"), dict) else {}
+    pdf = source.get("pdf") if isinstance(source.get("pdf"), dict) else {}
+    return bool(run_status(run, now)[0] in ("succeeded", "failed") and not entry_stored and pdf_found
+                and all(isinstance(run.get(k), str) and run[k] for k in ("organization_id", "well_id"))
+                and SHA256.fullmatch(str(pdf.get("sha256"))))
+
+
+def entered(review) -> bool:
+    """Whether anything is typed, as the writer counts it in the request (confirm_writer.entered): a value manually
+    corrected to a value, or a section in the pump string as it stands."""
+    values = review["values"]
+    return bool(values[STRING]["sections"]) or any(
+        v["status"] == C.CORRECTED and v["final"] is not None for key, v in values.items() if key != STRING)
+
+
+def failure_words(run) -> str:
+    """Why a run that ended has nothing to review, beside the offer to enter it by hand, for any failure but a scan's
+    (IMAGE_ONLY has its own message); for a model timeout or a model error, that uploading again retries."""
+    error = run.get("error") if isinstance(run.get("error"), dict) else {}
+    retry = " Uploading the document again retries the extraction." if error.get("code") in RETRY else ""
+    return f"Nothing was read from this document, so there is nothing to review.{retry} {OFFER}"
+
+
 # ---- the engineer's words: places, kinds of report, notes, refusals, confirmations ----
 # No rule id, key, position, run or confirmation id, object key or hash goes on an engineer's screen; the record
 # keeps all of them.
@@ -1073,6 +1119,14 @@ SOURCE_WORDS = {SOURCE: "the design document", "ops_entered": "outside the docum
 GROUP_WORDS = {"string": "the pump string", "found": "values found", "not found": "values not found"}
 NOT_KNOWN = "Not a known vendor report: check every value"
 UNSAVED = "Write is off while the pump string has edits not saved: save them, or cancel."
+OFFER = "Or enter its values by hand: the review opens with nothing read, beside the document's pages."
+BY_HAND = ("Entered by hand: nothing was read from this document, so every value is typed from it. Type each value it "
+           "prints with Correct, add the pump string's sections with Edit sections, and settle as empty what it does "
+           "not print.")
+BY_HAND_HINT = "Nothing was read: type each value the document prints with Correct, and settle as empty those it does not."
+NOTHING_ENTERED = "Nothing is entered yet: type at least one value from the document, or add the pump string's sections."
+PRESSURE_HELP = ("An absolute pressure, in psia. Where the document prints a gauge reading (psig), add 14.7, and give the "
+                 "printed value in the note, for instance printed 1,500 psig.")
 APP_FAULT = ("The app put together something Write cannot take: a fault in the app, not in the review. Report it to "
              "whoever runs the app.")
 FILES = "Ask whoever runs the app to check this run's files."
@@ -1216,9 +1270,14 @@ REFUSALS = (
      r"|changed from the proposal but not marked manually corrected: .*|pump string: its final value is not its final "
      r"sections|design_document_ref is the writer's to set.*|row: .*|.* is not .*confirmations/<id>/request\.json",
      lambda m: APP_FAULT),
-    (r"manual entry is not supported yet", lambda m: "Entering a well by hand is not supported yet."),
     (re.escape(LAB_CHECK) + r" writes to test only.*", lambda m: m[0]),
     (r"runs/[^/]+/run\.json is not there.*", lambda m: f"This run's own record is missing, so it cannot be written. {FILES}"),
+    (r"runs/[^/]+/run\.json says .*: the run has not ended.*",
+     lambda m: "This run has not ended yet, so it cannot be entered by hand. Reopen it once it has ended."),
+    (r"runs/[^/]+/well_entry\.json is there: this run has an extraction to review",
+     lambda m: "This run read the document, so its values are reviewed, not entered by hand. Reopen the run to review "
+               "them."),
+    (r"nothing was entered: .*", lambda m: NOTHING_ENTERED),
     (r"runs/[^/]+/well_entry\.json is not there.*",
      lambda m: f"This run's proposed entry is missing, so it cannot be written. {FILES}"),
     (r"runs/[^/]+/report\.md is not there.*",

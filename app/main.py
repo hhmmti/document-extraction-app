@@ -11,9 +11,10 @@ Each panel reads its own file and reports a missing, empty or malformed file in 
 so a failed run still shows everything it stored.
 
 A run with a well_entry.json opens in "Review & confirm" until it has a written confirmation, then shows what was
-written; its files are under "Run details".  The decisions are app/review.py's; S3 mode writes through the writer
-Lambda, local mode only reviews unless ESP_CONFIRM_OFFLINE_AS names who writes into the local store (README,
-"Confirming an entry").
+written; its files are under "Run details".  A run that ended with no entry offers "Enter by hand" on its page: the
+same review over the empty proposal, every value typed from the document.  The decisions are app/review.py's; S3 mode
+writes through the writer Lambda, local mode only reviews unless ESP_CONFIRM_OFFLINE_AS names who writes into the
+local store (README, "Confirming an entry").
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ from extraction.stage.reports_reader import read_report  # noqa: E402
 from extraction.stage.stage import FAMILY_LABEL  # noqa: E402
 from extraction.validate.rules import page_numbers  # noqa: E402
 from extraction.validate.validate import catalogue as read_catalogue  # noqa: E402
+from extraction.well_entry import empty_entry  # noqa: E402
 
 FAMILIES = {code: slug for slug, code in FAMILY_LABEL.items()}
 GRAINS = {"pump_config": "Pump string", "esp_well_design_context": "Design context",
@@ -438,8 +440,24 @@ def image_only(record):
         st.info(IMAGE_ONLY, icon=":material/document_scanner:")
 
 
-def title_block(run_id, record, problem, labels=None):
-    """`labels`: in S3 mode the upload's, for a record that does not name its organisation and well yet."""
+def enter_by_hand(run_id):
+    st.session_state[f"by-hand-{run_id}"] = True
+
+
+def by_hand_offer(run_id, record):
+    """Enter by hand, on the run's page: beside the image-only message (shown above it), else with a plain line."""
+    if dig(record, "error", "code") == "IMAGE_ONLY":
+        st.caption(R.OFFER)
+    else:
+        st.info(R.failure_words(record), icon=":material/edit_note:")
+    st.button("Enter by hand", type="primary", icon=":material/edit_note:", key=f"enter-{run_id}",
+              on_click=enter_by_hand, args=(run_id,),
+              help="Open the review with nothing read, and type each value from the document")
+
+
+def title_block(run_id, record, problem, labels=None, offer=False):
+    """`labels`: in S3 mode the upload's, for a record that does not name its organisation and well yet.  `offer`:
+    the run can be entered by hand (`R.by_hand`)."""
     org, well = dig(record, "organization_id"), dig(record, "well_id")
     if org is None and labels:
         org, well = labels["organization-id"], labels["well-id"]
@@ -475,6 +493,8 @@ def title_block(run_id, record, problem, labels=None):
             elif status == "running":
                 st.info(f"Still running. It reads as failed if it has not finished by "
                         f"{plain(dig(record, 'deadline_at'))}.")
+            if offer:
+                by_hand_offer(run_id, record)
 
 
 def summary_tab(record):
@@ -850,12 +870,15 @@ def show_run(store, run_id):
 
     page_key = f"page-{run_id}"
     entry = stored_entry(get) if record and dig(record, "well_id") is not None else None
-    if entry is None:
-        title_block(run_id, record, problem, store.intake_labels(run_id))
-        return run_details(store, get, record, page_key)
+    by_hand = entry is None and bool(record) and R.by_hand(record, entry_stored=stored(get, C.ENTRY),
+                                                           pdf_found=source_pdf(store, record) is not None)
     confirmed = store.latest_version(dig(record, "source", "pdf", "sha256"), record.get("organization_id"),
-                                     record["well_id"], run_id=run_id)
-    views = ("Confirmed entry" if confirmed else "Review & confirm", "Run details (technical)")
+                                     record["well_id"], run_id=run_id) if entry is not None or by_hand else None
+    if entry is None and not confirmed and not (by_hand and st.session_state.get(f"by-hand-{run_id}")):
+        title_block(run_id, record, problem, store.intake_labels(run_id), offer=by_hand)   # the offer, if any
+        return run_details(store, get, record, page_key)
+    views = ("Confirmed entry" if confirmed else "Enter by hand" if entry is None else "Review & confirm",
+             "Run details (technical)")
     view = st.segmented_control("View", views, default=views[0], required=True, label_visibility="collapsed",
                                 key=f"view-{run_id}-{bool(confirmed)}")
     if view == views[1]:
@@ -864,8 +887,9 @@ def show_run(store, run_id):
         return run_details(store, get, record, page_key)
     if confirmed:
         confirmed_view(store, run_id, record, confirmed, get, page_key)
-    else:
-        review_view(store, run_id, record, entry, get, page_key)
+    else:                                           # entered by hand: over the empty proposal
+        review_view(store, run_id, record, entry or empty_entry(record["organization_id"], record["well_id"]), get,
+                    page_key)
     return True                                     # an engineer's screen: the sidebar names no bucket
 
 
@@ -914,6 +938,17 @@ NO_PDF = ("The document's PDF is not available here, so its pages cannot be show
           "copy.")
 SCAN_VIEWS = ("Original scan", "Transcription")
 BAD_PDF = "The document's PDF could not be opened, so its pages cannot be shown. Check the values against your own copy."
+
+
+def stored(get, name) -> bool:
+    """Whether the run stored the file, readable or not."""
+    try:
+        get(name)
+    except FileNotFoundError:
+        return False
+    except Exception:  # noqa: BLE001 - there, if empty or unreadable
+        pass
+    return True
 
 
 def stored_entry(get) -> dict | None:
@@ -983,12 +1018,13 @@ def review_state(store, run_id, record, entry) -> dict:
         pdf = source_pdf(store, record)
         scan = None if pdf is None else T.recognise(pdf)            # a transcription: reviewed against its scan
         typed = scan is not None and scan.problem is None
-        entry = R.from_scan(entry) if typed else entry
+        entry = R.from_scan(entry) if typed else entry                    # an entry by hand stays as it is
         st.session_state[key] = {
             "entry": entry, "kept": kept, "environment": environment, "scan": scan, "automatic": R.automatic(labels),
             "review": R.start(entry, record, version, at=now_text(), names=catalogue_names()[1], scan=typed),
             "version": version and {k: version.get(k) for k in ("confirmation_id", "confirmed_by", "confirmed_at")},
-            "dates": R.design_dates(kept, run_id, store.current_entry(environment, org, well))}
+            "dates": R.design_dates(kept, run_id, store.current_entry(environment, org, well),
+                                    by_hand=R.manual(entry))}
     return st.session_state[key]
 
 
@@ -1002,7 +1038,8 @@ def context(store, run_id, record, state, page_key) -> SimpleNamespace:
                            review=state["review"], kept=state["kept"], env=state["environment"],
                            dates=state["dates"], version=state["version"], name=name, who=who,
                            offline=MODE == "local" and name is not None, sha=sha, pdf=pdf, page_key=page_key,
-                           models=models, names=names, scan=state["scan"], automatic=state["automatic"])
+                           models=models, names=names, scan=state["scan"], automatic=state["automatic"],
+                           manual=R.manual(state["entry"]))
 
 
 def source_pdf(store, record) -> bytes | None:
@@ -1053,7 +1090,8 @@ def document_pane(store, record, page_key, pdf=None):
 def gate(ctx) -> tuple[bool, str]:
     """(whether Write is on, why not).  On only when the writer would accept the request as it stands, the run's
     organisation may write where the entry goes (`R.environment_problem`: lab-check to test only, as R.write refuses it),
-    the string's editor holds no unsaved edits, and the source PDF is not a broken transcription."""
+    the string's editor holds no unsaved edits, the source PDF is not a broken transcription, and, entered by hand,
+    something is typed (`R.entered`, the writer's rule)."""
     if ctx.scan is not None and ctx.scan.problem:
         return False, (f"Write is off: this file is marked as a transcription, but {ctx.scan.problem}. Upload the file "
                        "exactly as the skill made it, as a new run.")
@@ -1066,8 +1104,12 @@ def gate(ctx) -> tuple[bool, str]:
     waiting = f"{left} value{'s' * (left != 1)} left to check" if left else ""
     if groups["string"] and R.blocking(ctx.review, ctx.entry, R.STRING):
         waiting += ", the string among them: it blocks publish"
+    nothing = R.NOTHING_ENTERED if ctx.manual and not R.entered(ctx.review) else ""
+    still = f"{R.sentence_case(waiting)}." if waiting else ""
     if ctx.name is None:
-        return False, " ".join(filter(None, (ctx.who, f"{R.sentence_case(waiting)}." if waiting else "")))
+        return False, " ".join(filter(None, (ctx.who, nothing, still)))
+    if nothing:
+        return False, " ".join(filter(None, (f"Write is off. {nothing}", still)))
     if left:
         return False, waiting
     try:
@@ -1134,8 +1176,9 @@ def dates_note(ctx):
                    f"current entry in {R.place(ctx.env)}. Writing it makes the older design the current entry.",
                    icon=":material/history:")
     elif d["case"] == "can't compare":
+        undated = "has no design date, entered by hand" if ctx.manual else "prints no design date"
         st.caption(f"The well's current entry in {R.place(ctx.env)} is dated {d['current'] or 'nothing'}; this document "
-                   f"{'is dated ' + d['incoming'] if d['incoming'] else 'prints no design date'}: can't compare.")
+                   f"{'is dated ' + d['incoming'] if d['incoming'] else undated}: can't compare.")
     elif d["case"] == "not older":
         st.caption(f"The well's current entry in {R.place(ctx.env)} is dated {d['current']}; this document is not older.")
 
@@ -1145,8 +1188,10 @@ def review_header(ctx, on, why):
     with st.container(border=True):
         facts_ = st.container(horizontal=True, gap="large")
         for label, value in (("Organisation", visible(text(org))), ("Well", visible(well)),
-                             ("Writes to", R.place(ctx.env)), ("Report", R.report_words(ctx.record, ctx.scan)),
-                             ("Design date", ctx.dates["incoming"] or "not printed"),
+                             ("Writes to", R.place(ctx.env)),
+                             ("Report", "entered by hand" if ctx.manual else R.report_words(ctx.record, ctx.scan)),
+                             ("Design date", "none, entered by hand" if ctx.manual else
+                              ctx.dates["incoming"] or "not printed"),
                              ("Confirming as", ctx.name or "nobody")):
             with facts_.container(gap=None, width="content"):
                 st.caption(label)
@@ -1154,14 +1199,16 @@ def review_header(ctx, on, why):
         notes = st.container(horizontal=True, vertical_alignment="center")
         if ctx.automatic:                                   # who uploaded is never shown
             notes.badge(R.AUTOMATIC, icon=AUTOMATIC_ICON, color="blue")
-        if dig(ctx.record, "route") == "generic":
+        if dig(ctx.record, "route") == "generic" and not ctx.manual:
             notes.badge(R.NOT_KNOWN, icon=":material/rate_review:", color="orange")
         if ctx.who:
             notes.caption(plain(ctx.who))
+        if ctx.manual:                                      # nothing was read: every value is typed
+            st.info(plain(R.BY_HAND), icon=":material/edit_note:")
         if ctx.scan is not None:                            # a transcription: checked against its original scan
             st.warning(plain(R.scan_words(ctx.scan)), icon=":material/document_scanner:")
-        if problem := R.run_problem_words(ctx.record):     # a run that stopped after reading keeps its entry
-            st.warning(plain(problem), icon=":material/report:")
+        if not ctx.manual and (problem := R.run_problem_words(ctx.record)):     # a run that stopped after reading
+            st.warning(plain(problem), icon=":material/report:")                # keeps its entry
         dates_note(ctx)
         if ctx.version:
             carried = sum(v["carried"] for v in ctx.review["values"].values())
@@ -1189,7 +1236,7 @@ def value_line(ctx, key):
             head.caption(f"printed “{plain(item['printed'])}”")
         chips(head, item.get("page"), ctx.page_key, f"chip-{rid}-{key}")
         status_badges(ctx, head, key)
-        if v["moved"]:
+        if v["moved"] and not ctx.manual:                  # entered by hand, the new run read nothing
             st.caption(f"The new run reads {plain(shown(R.proposal(ctx.entry, key)))}; the correction above is carried "
                        "from the earlier confirmation.")
         words = [R.in_words(r) for r in item["reasons"]] + ([f"Note: {R.note_words(item['note'])}"] if item.get("note") else [])
@@ -1218,8 +1265,9 @@ def actions(ctx, key):
     proposed, blocks = R.proposal(ctx.entry, key), R.blocking(ctx.review, ctx.entry, key)
     row = st.container(horizontal=True, gap="small")
     as_proposed = v["status"] == C.SETTLED and v["final"] == proposed and not v["accept_anyway"]
-    if not R.proposal_blocks(ctx.entry, key) and not as_proposed:
-        row.button("Settle as proposed" if key == R.STRING else "Settle", icon=":material/check:",
+    if not R.proposal_blocks(ctx.entry, key) and not as_proposed and (key == R.STRING or not ctx.manual):
+        row.button("Settle as empty" if key == R.STRING and ctx.manual else            # by hand, nothing is proposed
+                   "Settle as proposed" if key == R.STRING else "Settle", icon=":material/check:",
                    key=f"settle-{rid}-{key}", on_click=decide, args=(rid, R.settle, key))
     if key != R.STRING:
         with row.popover("Correct", icon=":material/edit:", key=f"fixpop-{rid}-{key}"):
@@ -1241,7 +1289,8 @@ def actions(ctx, key):
 def correction_form(ctx, key):
     base, v = f"fix-{ctx.run_id}-{key}", ctx.review["values"][key]
     current = v["final"] or R.proposal(ctx.entry, key) or {}
-    st.text_input("Value", value=text(current.get("value"), ""), key=f"{base}-value")
+    st.text_input("Value", value=text(current.get("value"), ""), key=f"{base}-value",
+                  help=R.PRESSURE_HELP if key in R.PRESSURES else None)
     st.selectbox("Unit", R.allowed_units(key), key=f"{base}-unit", help="The units the product takes for this value")
     st.selectbox("Source", R.SOURCES, index=R.SOURCES.index("ops_entered") if key == "vapor_pressure_psia" else 0,
                  format_func=R.SOURCE_WORDS.get, key=f"{base}-source")
@@ -1262,7 +1311,7 @@ def sections_table(ctx, page_key, table_key):
             for s in block["sections"]]
     if rows:
         table(cells(rows), table_key, page_key, "page")
-    else:
+    elif not ctx.manual:                                  # by hand, the checks below say to add them
         st.caption("No sections were read.")
 
 
@@ -1290,13 +1339,16 @@ def string_view(ctx, page_key, table_key):
         sections_table(ctx, page_key, table_key)
     else:
         carried = v["carried"] and len(v["history"]) == v["since"]
-        st.caption(f"Carried from {plain(R.confirmation_words(ctx.version or {}))}:" if carried else "As corrected:")
+        st.caption(f"Carried from {plain(R.confirmation_words(ctx.version or {}))}:" if carried else
+                   "As entered:" if ctx.manual else "As corrected:")
         st.dataframe(cells(section_rows(v["sections"], v["display"])), hide_index=True)
-        if v["moved"]:
-            st.caption("The new run reads the string differently; the string above comes from the earlier confirmation.")
-        with st.expander("As read"):
-            sections_table(ctx, page_key, table_key)
-    words = R.unwritten_words(ctx.review)
+        if not ctx.manual:                              # by hand, nothing was read to show beside it
+            if v["moved"]:
+                st.caption("The new run reads the string differently; the string above comes from the earlier "
+                           "confirmation.")
+            with st.expander("As read"):
+                sections_table(ctx, page_key, table_key)
+    words = None if ctx.manual and not v["sections"] else R.unwritten_words(ctx.review)    # by hand: nothing "as read"
     if words:
         st.info(plain(words), icon=":material/info:")
     checks_box(ctx, v["sections"], R.string_rows(ctx.review))
@@ -1326,7 +1378,8 @@ def string_block(ctx):
         head = st.container(horizontal=True, vertical_alignment="center", gap="small")
         head.markdown(f"**{R.label(key)}**")
         n = len(ctx.entry["review"]["pump_string"]["sections"])
-        head.caption(f"{n} section{'s' * (n != 1)} as read")
+        if not ctx.manual:
+            head.caption(f"{n} section{'s' * (n != 1)} as read")
         status_badges(ctx, head, key)
         if ctx.review.get("editor") is not None:
             editor_view(ctx)
@@ -1403,8 +1456,8 @@ def editor_view(ctx):
     buttons.button("Save", type="primary", icon=":material/save:", key=f"ed-{rid}-save", disabled=bool(problems),
                    on_click=save_edits, args=(rid,))
     buttons.button("Cancel", key=f"ed-{rid}-cancel", on_click=edit, args=(rid, R.close_editor))
-    buttons.button("Back to the string as read", icon=":material/undo:", key=f"ed-{rid}-reset", on_click=edit_entry,
-                   args=(rid, R.reset_editor))
+    buttons.button("Back to no sections" if ctx.manual else "Back to the string as read", icon=":material/undo:",
+                   key=f"ed-{rid}-reset", on_click=edit_entry, args=(rid, R.reset_editor))
     if problems:
         st.caption(plain(" ".join(problems)))
 
@@ -1478,7 +1531,7 @@ def review_view(store, run_id, record, entry, get, page_key):
         for group in ("found", "not found"):
             if groups[group]:
                 st.markdown(f"#### {group.capitalize()}: {len(groups[group])}")
-                st.caption(GROUP_HINT[group])
+                st.caption(R.BY_HAND_HINT if ctx.manual else GROUP_HINT[group])
                 for key in groups[group]:
                     value_line(ctx, key)
         with st.expander(f"Decided: {len(groups['decided'])}", icon=":material/task_alt:"):
@@ -1537,7 +1590,8 @@ def batch_dialog(ctx, step):
                     chosen = {R.STRING} if (reason or "").strip() else set()
                 else:
                     reason = None
-                    chosen = {R.STRING} if st.checkbox("The pump string, as read above", value=True,
+                    chosen = {R.STRING} if st.checkbox("The pump string, as it stands above" if ctx.manual else
+                                                       "The pump string, as read above", value=True,
                                                        key=f"tick-{rid}-string") else set()
             else:
                 reason, chosen = None, ticks(ctx, step, keys, page_key)
@@ -1603,13 +1657,16 @@ def write_dialog(ctx, on, why):
         st.markdown(f"Writes to **{R.place(ctx.env)}**, organisation **{plain(visible(text(org)))}**, well "
                     f"**{plain(visible(well))}**, confirming as **{plain(ctx.name or 'nobody')}**.")
         name = R.document_name(ctx.record, ctx.scan)
-        st.caption(f"Document: {plain(name) if name else 'the design document'}"
+        st.caption(f"Document: {plain(name) if name else 'the design document'}, entered by hand, no design date."
+                   if ctx.manual else
+                   f"Document: {plain(name) if name else 'the design document'}"
                    f"{', typed from the scan' if ctx.review.get('scan') else ''}, design dated "
                    f"{ctx.dates['incoming'] or 'not printed'}.")
         dates_note(ctx)
         tally = R.tally(ctx.review)
         st.markdown("What will be recorded:")
-        st.dataframe(pd.DataFrame([(k, tally[k]) for k in (
+        st.dataframe(pd.DataFrame([("left empty, as proposed" if ctx.manual and k == "settled by the extraction" else k,
+                                    tally[k]) for k in (
             "settled one by one", "settled in batches", "pulled out", "corrected", "accepted anyway", "carried",
             "settled by the extraction", "left to check")], columns=["Values", "Count"]), hide_index=True)
         if not on:
@@ -1635,9 +1692,13 @@ def confirmed_view(store, run_id, record, version, get, page_key):
         st.markdown(f"**Confirmed**: written to **{R.place(version['environment'])}** by "
                     f"**{plain(version['confirmed_by'])}** on {R.when_words(version['confirmed_at'])}.")
         name = R.document_name(record, None if pdf is None else T.recognise(pdf))
-        st.caption(f"Document: {plain(name) if name else 'the design document'}"
-                   f"{', typed from the scan' if version.get('entry_method') == 'transcription' else ''}, design "
-                   f"dated {plain(version.get('design_date') or 'not printed')}.")
+        if version.get("entry_method") == C.MANUAL:
+            st.caption(f"Document: {plain(name) if name else 'the design document'}. Entered by hand: nothing was read "
+                       "from it, and every value was typed from it. No design date.")
+        else:
+            st.caption(f"Document: {plain(name) if name else 'the design document'}"
+                       f"{', typed from the scan' if version.get('entry_method') == 'transcription' else ''}, design "
+                       f"dated {plain(version.get('design_date') or 'not printed')}.")
     left, right = st.columns([1, 1], gap="medium")
     with right:
         document_pane(store, record, page_key, pdf)
@@ -1649,7 +1710,7 @@ def confirmed_view(store, run_id, record, version, get, page_key):
                                 if v["key"] == R.STRING and final_sections else shown(v["final"])),
                  "from": R.SOURCE_WORDS.get(dig(v, "final", "source")), "status": v["status"],
                  "started as": v["starting_status"], "accepted anyway because": v.get("accept_anyway"),
-                 "how it was decided": decided_words(v, earlier)}
+                 "how it was decided": decided_words(v, earlier, by_hand=version.get("entry_method") == C.MANUAL)}
                 for v in version["values"]]
         st.dataframe(cells(rows), hide_index=True)
         st.markdown("#### The pump string as recorded, not written" if unwritten else "#### The pump string as written")
@@ -1675,11 +1736,13 @@ def earlier_confirmations(store, record, version) -> dict:
     return out
 
 
-def decided_words(v, earlier) -> str | None:
-    """How a written value was decided: its last step, in words."""
+def decided_words(v, earlier, by_hand=False) -> str | None:
+    """How a written value was decided: its last step, in words.  Entered by hand, the proposal read nothing."""
     if not v.get("history"):
         return None
     step = v["history"][-1]
+    if by_hand and step.get("by") == "extraction":
+        return "left empty, as proposed"
     return R.step_words(step, earlier.get((step.get("reason") or "").removeprefix("carried from ")))
 
 

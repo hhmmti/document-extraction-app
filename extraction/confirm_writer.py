@@ -11,7 +11,9 @@
    runs/<run_id>/... or on intake/<run_id>.pdf reads as not there, and its reason names the key and says so.  A 403
    on assets/ is a failure (ASSET_INVALID).  When intake/<run_id>.pdf carries a valid environment label (an upload in
    the ESP product: extraction/intake.py), the request's environment must be it; a run without one is checked as
-   before.
+   before.  For entry_method manual the run must have ended and stored no well_entry.json (a 403 on it reads as
+   none); the request is checked against the empty proposal (well_entry.empty_entry) with every other check, must
+   have something typed (`entered`), and no report.md is read, so its design_date is null.
 3. An accepted one is written in this order: the document (design-records/<sha>/document.pdf, create-only; already
    there is fine), the version (design-records/<sha>/versions/<id>.json, create-only), the row
    (well-entries/environment=<env>/<id>.json, create-only: the commit point), then the result, overwritten once.
@@ -36,7 +38,7 @@ from .intake import optional_labels
 from .stage import values as V
 from .stage.reports_reader import read_report
 from .validate.validate import catalogue as read_catalogue
-from .well_entry import final_string_checks, parameter_problems, section_value
+from .well_entry import empty_entry, final_string_checks, parameter_problems, section_value
 
 
 def now() -> datetime:
@@ -137,10 +139,9 @@ def check(objects, request, cid: str, catalogue) -> tuple[list[str], dict]:
         return [f"contract: {p}" for p in problems], {}
     reasons = []
     method, environment = request["entry_method"], request["environment"]
-    if method == C.MANUAL:
-        reasons.append("manual entry is not supported yet")
-    elif method not in C.ENTRY_METHODS:
-        reasons.append(f"entry_method {method!r} is not extracted or transcription")
+    manual = method == C.MANUAL
+    if method not in C.ENTRY_METHODS:
+        reasons.append(f"entry_method {method!r} is not extracted or transcription or manual")
     if environment not in C.ENVIRONMENTS:
         reasons.append(f"environment {environment!r} is not dev or prd")
 
@@ -153,9 +154,18 @@ def check(objects, request, cid: str, catalogue) -> tuple[list[str], dict]:
                     "document_sha256": ((run.get("source") or {}).get("pdf") or {}).get("sha256")}
         reasons += [f"{name} is {request[name]!r}; the run's is {value!r}"
                     for name, value in recorded.items() if value != request[name]]
-    entry, why = read_json(objects, C.run_key(run_id, C.ENTRY))
-    if entry is None:
-        reasons.append(f"runs/{run_id}/{C.ENTRY} is not there{why or ': the run stored no entry'}")
+        if manual and not ended(run):
+            reasons.append(f"runs/{run_id}/run.json says {run.get('status')!r}: the run has not ended"
+                           + (f" (its deadline_at is {run['deadline_at']})" if run.get("deadline_at") else ""))
+    if manual:                          # entered by hand, against the empty proposal; a stored entry is a refusal
+        body, _ = read(objects, C.run_key(run_id, C.ENTRY))          # a 404 or a 403 is none: the writer cannot list
+        if body is not None:
+            reasons.append(f"runs/{run_id}/{C.ENTRY} is there: this run has an extraction to review")
+        entry = empty_entry(request["organization_id"], request["well_id"])
+    else:
+        entry, why = read_json(objects, C.run_key(run_id, C.ENTRY))
+        if entry is None:
+            reasons.append(f"runs/{run_id}/{C.ENTRY} is not there{why or ': the run stored no entry'}")
     pdf, why = read(objects, C.pdf_key(run_id))
     if pdf is None:
         reasons.append(f"intake/{run_id}.pdf is not there{why}")
@@ -167,7 +177,7 @@ def check(objects, request, cid: str, catalogue) -> tuple[list[str], dict]:
     if entry is None:
         return reasons, {}
 
-    # Against the stored entry: pump_sections is reviewed as the string.
+    # Against the stored entry (manual: the empty proposal): pump_sections is reviewed as the string.
     stored = {v["key"]: v for v in entry["review"]["values"]}
     given = {v["key"]: v for v in request["values"]} | {C.PUMP_SECTIONS: request["pump_string"]}
     missing, extra = [k for k in stored if k not in given], [k for k in given if k not in stored]
@@ -189,6 +199,9 @@ def check(objects, request, cid: str, catalogue) -> tuple[list[str], dict]:
     unmarked = [k for k in keys if given[k]["status"] != C.CORRECTED and changed(k)]
     if unmarked:
         reasons.append(f"changed from the proposal but not marked manually corrected: {', '.join(unmarked)}")
+    if manual and not entered(request):
+        reasons.append("nothing was entered: no value is manually corrected to a value, and the pump string has no "
+                       "section")
 
     string, names = request["pump_string"], CatalogueNames(catalogue())
     checks = final_string_checks(string["sections"], names)
@@ -219,7 +232,8 @@ def check(objects, request, cid: str, catalogue) -> tuple[list[str], dict]:
         return reasons, {}
 
     keys_ = {"row_key": C.row_key(environment, cid), "version_key": C.version_key(sha, cid)}
-    row = C.build_row(request, design_date=printed_design_date(objects, run_id, reasons), version=keys_["version_key"])
+    row = C.build_row(request, design_date=None if manual else printed_design_date(objects, run_id, reasons),
+                      version=keys_["version_key"])                  # entered by hand: no report is read
     for field in schema.PARAMETERS:
         reasons += [f"#1218: {p}" for p in parameter_problems(row[field], field)]
     reasons += [f"row: {p}" for p in schema.problems(row)]
@@ -227,6 +241,18 @@ def check(objects, request, cid: str, catalogue) -> tuple[list[str], dict]:
         return list(dict.fromkeys(reasons)), {}
     return [], {**keys_, "pdf": pdf, "row": row,
                 "version": version_record(request, run, entry, row, checks, keys_, upload)}
+
+
+def ended(run) -> bool:
+    """Whether the run has ended: run.json failed or succeeded, or running past its deadline_at, the stale rule of
+    extraction.run.read_record (`C.as_read` applies it)."""
+    return C.as_read(run, now())["status"] in ("failed", "succeeded", C.STALE)
+
+
+def entered(request) -> bool:
+    """Whether anything was typed: a value manually corrected to a value, or a section in the pump string."""
+    return bool(request["pump_string"]["sections"]) or any(
+        v["status"] == C.CORRECTED and v["final"] is not None for v in request["values"])
 
 
 def printed_design_date(objects, run_id: str, reasons: list) -> str | None:

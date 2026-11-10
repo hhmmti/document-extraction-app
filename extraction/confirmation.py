@@ -2,7 +2,8 @@
 
 An engineer confirms a run's `well_entry.json` (extraction/well_entry.py) with the confirm CLI
 (extraction/confirm.py), which writes a request.  The writer (extraction/confirm_writer.py; on Lambda,
-`lambda_function.confirm_handler`) checks it against the run's stored entry, writes the document's design record
+`lambda_function.confirm_handler`) checks it against the run's stored entry (for entry_method manual, a run that
+stored none, against the empty proposal, extraction/well_entry.empty_entry), writes the document's design record
 and appends one row to the well-entries table (extraction/well_entries_schema.py).  The app reads them back
 (app/store.py).  This module is what the three share: the keys, the shapes and the two storage backends.  It
 needs only the standard library.
@@ -23,9 +24,10 @@ The request, schema_version 1:
     confirmation_id      the run id's format, at the UTC moment of confirming
     run_id, document_sha256, organization_id, well_id
     environment          dev or prd
-    entry_method         extracted, transcription or manual
+    entry_method         extracted, transcription or manual (a run that stored no entry, typed by hand)
     confirmed_by, confirmed_at   confirmed_at: UTC ISO 8601 with microseconds and no offset, as the run log writes
-    values               every reviewed key of the stored entry but pump_sections, once each:
+    values               every reviewed key of the stored entry (manual: of the empty proposal) but pump_sections,
+                         once each:
                          {key, final, status, [accept_anyway], history}
     pump_string          pump_sections, reviewed as the string: {final, sections, status, [accept_anyway], history},
                          `sections` holding each section's final SECTION_FIELDS
@@ -55,8 +57,8 @@ BUCKET = "roam-ds-assets"
 ROOT = "esp-design-extraction/"
 SCHEMA_VERSION = 1
 ENVIRONMENTS = ("dev", "prd")
-ENTRY_METHODS = ("extracted", "transcription")          # what the writer takes
-MANUAL = "manual"                                        # in the contract; refused until manual entry exists
+MANUAL = "manual"                                        # no extraction to review: the run's values typed by hand
+ENTRY_METHODS = ("extracted", "transcription", MANUAL)   # what the writer takes
 # The entry's statuses, as extraction/well_entry.py writes them (restated: that module loads the stage), and
 # the one a confirmation adds.  A final status is settled or manually corrected.
 SETTLED, TO_CHECK, BLOCKS, CORRECTED = "settled", "to check", "blocks publish", "manually corrected"

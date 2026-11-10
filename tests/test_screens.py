@@ -6,7 +6,9 @@ scanned.
     pytest -m store tests/test_screens.py    every run with an entry in ESP_RUN_STORE_DIR: its review mode, each
                                              pop-up and the Write pop-up, then the string's editor (a section without
                                              a model marked not in the catalogue, and the string saved so); or, once
-                                             written, its confirmed view
+                                             written, its confirmed view.  A run with no entry that offers Enter by
+                                             hand is entered by hand and walked the same, or, once written, its
+                                             confirmed view
 
 The rest needs no input: every message the app makes, scanned the same way, among them the line on a run an upload in
 the product started and the writer's refusal of an environment other than the upload's.  The screens in those states
@@ -34,6 +36,7 @@ import extraction.confirmation as C
 from extraction.catalogue import CatalogueNames
 from extraction.validate.validate import catalogue as read_catalogue
 from extraction.well_entries_schema import VALUE_TYPE
+from extraction.well_entry import empty_entry
 
 APP = str(Path(__file__).resolve().parents[1] / "app" / "main.py")
 PATTERNS = {
@@ -157,7 +160,7 @@ SAMPLE_REASONS = [
     "head sum: 1 vs TDH 2", "rule: V-06", "rule: V-X3", "rule: V-12", "rule: D16", "rule: V-08", "rule: D17",
     "rule: V-99", "grounding: not_found on any kept page", "grounding: other_page (cited p1; found on p2, p6)",
     "quarantined: empty_string", "quarantined: composite_value", "quarantined: unrecognized_unit_token",
-    "quarantined: something_new", "typed_from_scan", "a_code_never_seen"]
+    "quarantined: something_new", "typed_from_scan", "entered_by_hand", "a_code_never_seen"]
 SAMPLE_NOTES = [
     "not from the document: points to the design record", "not from the document: entered by hand",
     "intake; depth_reference_basis intake", "intake; pump setting 11099 ft; depth_reference_basis pump_setting",
@@ -175,7 +178,10 @@ SHA = "4e7fbd14e8e0e2545ad0da804f4c1ca7441ad4dce07bc6bf45e0b34460c807e0"
 # The writer's refusals (extraction/confirm_writer.py), the contract's (extraction/confirmation.py) and the app's.
 SAMPLE_REFUSALS = [
     f"contract: missing field pump_string", f"contract: run_id {RUN!r} is not in its format",
-    "manual entry is not supported yet", "entry_method 'typed' is not extracted or transcription",
+    f"runs/{RUN}/run.json says 'running': the run has not ended (its deadline_at is 2026-10-28T00:15:00Z)",
+    f"runs/{RUN}/well_entry.json is there: this run has an extraction to review",
+    "nothing was entered: no value is manually corrected to a value, and the pump string has no section",
+    "entry_method 'typed' is not extracted or transcription or manual",
     "environment 'qa' is not dev or prd", f"runs/{RUN}/run.json is not there",
     f"runs/{RUN}/run.json is not there (S3 answered 403 for x/runs/{RUN}/run.json: the writer cannot list)",
     "organization_id is 'org-1'; the run's is 'org-2'", "well_id is 'A 1H'; the run's is 'A 2H'",
@@ -402,19 +408,42 @@ def test_no_id_or_code_on_any_engineer_screen(monkeypatch):
     except Exception:  # noqa: BLE001 - no snapshot: the editor shows none
         names = []
     root, hits, screens = Path(STORE), [], 0
-    runs = sorted(p.name for p in (root / "runs").iterdir() if (p / C.ENTRY).is_file())
+    runs = sorted(p.name for p in (root / "runs").iterdir() if (p / C.ENTRY).is_file() or (p / "run.json").is_file())
     for rid in runs:
         record = json.loads((root / "runs" / rid / "run.json").read_text(encoding="utf-8"))
-        entry = json.loads((root / "runs" / rid / C.ENTRY).read_text(encoding="utf-8"))
         if record.get("well_id") is None:
             continue
+        stored = (root / "runs" / rid / C.ENTRY).is_file()
+        entry = (json.loads((root / "runs" / rid / C.ENTRY).read_text(encoding="utf-8")) if stored
+                 else empty_entry(record.get("organization_id"), record["well_id"]))
+        at = open_run(rid)
+        if not stored and not at.get("button_group"):  # no entry and not confirmed by hand: entered by hand, if offered
+            if not [b for b in at.button if b.key == f"enter-{rid}"]:
+                continue                                # nothing to review and nothing offered: a technical page
+            at.button(key=f"enter-{rid}").click().run()
         versions = [json.loads(p.read_text(encoding="utf-8")) for p in root.glob("design-records/*/versions/*.json")]
         mine = [v for v in versions if (v.get("run") or {}).get("run_id") == rid]
         pdf = root / "intake" / f"{((record.get('source') or {}).get('pdf') or {}).get('sha256')}.pdf"
         scan = T.recognise(pdf.read_bytes()) if pdf.is_file() else None     # a transcription goes by its scan's name
         leave_out = exempt(record, entry, mine[0] if mine else None, "reviewer", REASON,
-                           *(v["confirmed_by"] for v in versions), *names, *([scan.name] if scan and scan.name else []))
-        for name, at in walk(open_run(rid), rid):
+                           *(v["confirmed_by"] for v in versions), *names, *([scan.name] if scan and scan.name else []),
+                           *typed_by_hand(versions))
+        for name, at in walk(at, rid):
             screens += 1
             hits += [f"{rid} · {name} · {hit}" for hit in unplain(at, *leave_out)]
     assert runs and screens and not hits, "\n".join(hits[:60]) + f"\n… {len(hits)} in all"
+
+
+def typed_by_hand(versions) -> list[str]:
+    """What an engineer typed into the store's entries by hand, as their versions hold it: notes, names as printed and
+    pump models; the screens of a re-run show it again."""
+    out = []
+    for v in versions:
+        if v.get("entry_method") != C.MANUAL:
+            continue
+        for item in v.get("values") or []:
+            final = item.get("final") or {}
+            out += [str(final.get(k)) for k in ("note", "value") if isinstance(final.get(k), str)]
+            out += re.findall(r'"((?:[^"\\]|\\.)*)"', " ".join(s.get("reason") or "" for s in item.get("history") or []))
+        out += [s.get("pump_model") or "" for s in (v.get("pump_string") or {}).get("final_sections") or []]
+    return [x for x in out if x]

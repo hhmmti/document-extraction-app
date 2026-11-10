@@ -13,6 +13,8 @@ Values come from the report's staged rows, the rows review.jsonl describes, thro
 columns the final field list names for each key.  Built after Validate and stage from the StageResult
 and the report; nothing here changes a grain, a finding or the review list.  The file holds no
 filesystem path: the S3 upload relocates paths only in run.json and source.json.
+
+A run that stored no entry can be entered by hand: `empty_entry` is its empty proposal, in the same shape.
 """
 
 from __future__ import annotations
@@ -68,6 +70,8 @@ NOT_FROM_THE_DOCUMENT = {
     "design_document_ref": "not from the document: points to the design record",
     "vapor_pressure_psia": "not from the document: entered by hand",
 }
+# The empty proposal's route (`empty_entry`), and the reason each of its values is to check.
+MANUAL, ENTERED_BY_HAND = "manual", "entered_by_hand"
 # Keys read straight from one staging column: (column, the note's columns, a note builder).
 SINGLE = {
     "motor_type": ("motor_type", (), None),
@@ -659,6 +663,30 @@ def build_entry(result, report_text, family, organization_id, well_id, *, prep=N
                        "summary": {**counts, "nothing_to_check": counts[SETTLED] == len(KEYS)},
                        **({"document_reasons": document} if document else {}),
                        "values": reviewed, "pump_string": string}}
+
+
+def empty_entry(organization_id, well_id) -> dict:
+    """The empty proposal: the entry an extraction would store had it read nothing, for a run whose values an engineer
+    types from the document by hand (a confirmation's entry_method `manual`).  Every key of KEYS in its order, to
+    check for ENTERED_BY_HAND, but the two never from the document, settled and empty with their notes as build_entry
+    leaves them (design_document_ref is the writer's); the pump string empty and to check, no check run on it.  Its
+    route, MANUAL, marks it as entered by hand: readers that tell the routes apart act on template and generic only.
+    Nothing stores it: the app and the confirmation writer each build it for the run."""
+    values = []
+    for key, (map_, unit) in KEYS.items():
+        item = {"key": key, "map": map_, "status": TO_CHECK, "reasons": [ENTERED_BY_HAND], "value": None, "unit": unit,
+                "written": False}
+        if key in NOT_FROM_THE_DOCUMENT:
+            item.update(status=SETTLED, reasons=[], note=NOT_FROM_THE_DOCUMENT[key])
+        elif key != "pump_sections":
+            item.update(printed=None, column=None, scenario=None, page=None, page_basis=None, note=None)
+        values.append(item)
+    counts = {s: sum(1 for v in values if v["status"] == s) for s in (SETTLED, TO_CHECK, BLOCKS)}
+    return {"organization_id": organization_id, "well_id": well_id, PUMP: {}, WELLBORE: {},
+            "review": {"family": None, "route": MANUAL,
+                       "summary": {**counts, "nothing_to_check": counts[SETTLED] == len(KEYS)}, "values": values,
+                       "pump_string": {"status": TO_CHECK, "reasons": [ENTERED_BY_HAND], "scenario": None,
+                                       "checks": [], "sections": [], "head_sum": []}}}
 
 
 def entry_bytes(entry: dict) -> bytes:
