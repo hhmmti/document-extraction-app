@@ -267,7 +267,7 @@ def test_d_edit_sections_in_the_string_pop_up_pulls_it_out_then_a_save(offline, 
     at.button(key=f"dlg-go-{RUN_ID}-found").click().run()
     at.button(key=f"dlg-go-{RUN_ID}-not found").click().run()
     at.button(key=f"write-go-{RUN_ID}").click().run()
-    assert texts(at.success)[0].startswith("**Written to production**")
+    assert texts(at.success)[0].startswith("**Written to Live wells**")
     [key] = [k for k in offline.keys(f"{C.ROOT}confirmations/") if k.endswith("request.json")]
     q = C.load(offline.get(key))
     assert [s["reason"] for s in q["pump_string"]["history"][1:]] == ["batch 1 · string · pulled out",
@@ -391,7 +391,7 @@ def test_g_a_rerun_carries_a_corrected_string_and_it_is_edited_again(store):
     settle_rest(first, e)
     out = write(store, first, e)
     assert out["status"] == C.WRITTEN
-    version = S.LocalRunStore(store.root).latest_version(SHA, ORG, WELL)
+    version = S.LocalRunStore(store.root).latest_version(SHA, ORG, WELL, "prd")
     e2 = to_check()
     run = rerun(store, e2)
     review = R.start(e2, run, version, at=AT, names=NAMES)
@@ -470,7 +470,7 @@ def test_h_a_catalogue_model_with_no_stage_count_is_recorded_for_a_reason(store)
     assert R.step_words({**recorded(version)["history"][-1], "by": "tester"}).startswith(
         "sections edited (stages changed; not written), by tester")
     e2 = to_check(entry(**TWO))                                         # a re-run carries the reason back
-    review2 = R.start(e2, rerun(store, e2), S.LocalRunStore(store.root).latest_version(SHA, ORG, WELL), at=AT,
+    review2 = R.start(e2, rerun(store, e2), S.LocalRunStore(store.root).latest_version(SHA, ORG, WELL, "prd"), at=AT,
                       names=NAMES)
     assert string(review2)["unwritten"] == NO_COUNT and "The reason given" in R.unwritten_words(review2)
 
@@ -564,5 +564,5 @@ def test_the_editor_on_screen(offline, fresh_catalogue):
     assert not at.button(key=f"write-{RUN_ID}").disabled
     at.button(key=f"write-{RUN_ID}").click().run()
     at.button(key=f"write-go-{RUN_ID}").click().run()
-    assert texts(at.success)[0].startswith("**Written to production**")
+    assert texts(at.success)[0].startswith("**Written to Live wells**")
     plain_words(at, e)

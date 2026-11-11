@@ -15,15 +15,15 @@ import app.store as S
 import extraction.run as R
 import lambda_function as L
 import test_lambda as TL
-from app.wells import WELL_LIST_ENV
 from extraction import ExtractionError
 from extraction.assets_dir import ASSETS_ENV
-from extraction.intake import LABELS, RUN_ID, decode_labels, encode_labels, intake_key, intake_run_id
+from extraction.intake import (LABELS, RUN_ID, decode_labels, encode_labels, intake_key, intake_run_id,
+                               optional_labels)
 from test_bedrock import FakeClient, events
-from test_intake import WELLS, app
+from test_intake import NO_RUN, TRY_AGAIN, app, lists, no_id_or_code, technical
 from test_run import GOOD
 from test_screens import screen
-from test_viewer import FULL, PDF, PDF_SHA, record, texts
+from test_viewer import FULL, PDF, PDF_SHA, record, runs, texts
 
 BUCKET, INTAKE, RUNS = TL.BUCKET, TL.INTAKE, TL.RUNS
 # The run list's column (app/main.py) and its words (app/review.py) for a run an upload in the product started.
@@ -71,10 +71,11 @@ def no_process(*args, **kwargs):
 
 @pytest.fixture
 def fake(tmp_path, monkeypatch):
-    """The app in S3 mode on a fake bucket, with test_intake's well list; the store is built afresh."""
-    (tmp_path / "wells.csv").write_text(WELLS)
+    """The app in S3 mode on a fake bucket, with test_intake's well lists from a fake Athena; the store is built
+    afresh."""
+    lists(monkeypatch)
     for name, value in {S.MODE_ENV: "s3", "ESP_BUCKET": BUCKET, "ESP_INTAKE_PREFIX": INTAKE,
-                        "ESP_RUNS_PREFIX": RUNS, WELL_LIST_ENV: str(tmp_path / "wells.csv")}.items():
+                        "ESP_RUNS_PREFIX": RUNS}.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv(S.STORE_ENV, raising=False)
     bucket = FakeS3()
@@ -124,10 +125,11 @@ def as_running(fake, handle, run_id, *, stale=False):
     return first
 
 
-def form(name="doc.pdf"):
+def form(name="doc.pdf", wells="Live wells", org=ORG, well=WELL):
     at = app(upload="1")
-    at.selectbox(key="new-org").select_index(1).run()
-    at.selectbox(key="new-well").select_index(0).run()
+    at.get("button_group")[0].set_value(wells).run()
+    at.selectbox(key="new-org").set_value(org).run()
+    at.selectbox(key="new-well").set_value(well).run()
     at.file_uploader(key="new-pdf").upload(name, PDF, "application/pdf").run()
     return at
 
@@ -175,19 +177,41 @@ def test_the_forms_checks_stay_and_nothing_is_sent_unconfirmed(fake):
     assert not fake.puts
 
 
-def test_an_upload_has_the_key_type_and_labels_and_the_handler_accepts_them(fake, handler):
-    at = form("Désign report 1.pdf")
+@pytest.mark.parametrize("wells,org,well,environment", [("Live wells", ORG, WELL, "prd"),
+                                                         ("Test wells", "Test Org", "T 1", "dev")])
+def test_an_upload_has_the_key_type_and_labels_and_the_handler_accepts_them(fake, handler, wells, org, well,
+                                                                            environment):
+    at = form("Désign report 1.pdf", wells, org, well)
     at.checkbox(key="new-confirm").check().run()
     start_button(at).click().run()
     [key] = [k for k, _ in fake.puts]
     run_id = intake_run_id(INTAKE, key)
     assert run_id and fake.objects[key] == PDF
     assert fake.headers[key] == {"ContentType": "application/pdf", "IfNoneMatch": "*"}
-    assert fake.metadata[key] == encode_labels(ORG, WELL, "Désign report 1.pdf", PDF_SHA)
+    assert fake.metadata[key] == {**encode_labels(org, well, "Désign report 1.pdf", PDF_SHA), "environment": environment}
+    assert S.s3_store_from_env().intake_labels(run_id)["environment"] == environment     # as the writer reads it
+    assert optional_labels(fake.metadata[key]) == {"environment": environment}
     assert any(i.startswith("Queued for") for i in texts(at.info))              # now on the watch view
     operation, first = handler(run_id).writes[0]     # the handler's own validation: its RUNNING row follows it
-    assert (operation, first["status"], first["organization_id"], first["well_ids"]) == ("PutItem", "RUNNING", ORG, [WELL])
+    assert (operation, first["status"], first["organization_id"], first["well_ids"]) == ("PutItem", "RUNNING", org, [well])
     assert json.loads(first["data_json"])["source_name"] == "Désign report 1.pdf"
+
+
+def test_a_name_the_labels_refuse_puts_nothing_and_a_put_that_fails_still_says_try_again(fake, monkeypatch):
+    """S3 mode, where the upload starts the run: a name the labels refuse is said before any upload, Start stays off and
+    nothing is put.  A failure a retry can fix, a put the bucket turns away for now, still says Try again, with the
+    error in the technical section."""
+    lists(monkeypatch, prd=[("Org\u00a0Alpha", "Well 1"), (ORG, WELL)])
+    at = form(org="Org\u00a0Alpha", well="Well 1")
+    assert texts(at.error) == [NO_RUN["organisation"]] and start_button(at).disabled and not fake.puts
+
+    def slow_down(**kwargs):
+        raise TL.client_error(503, "SlowDown", "PutObject")
+    monkeypatch.setattr(fake, "put_object", slow_down)
+    at = form()
+    at.checkbox(key="new-confirm").check().run()
+    start_button(at).click().run()
+    assert texts(at.error) == [TRY_AGAIN] and "SlowDown" in technical(at) and not fake.puts
 
 
 # ---- the viewer: a pipeline record and the handler's failure record ----
@@ -251,10 +275,11 @@ def test_the_list_shows_each_state(fake, handler):
     upload(fake, expired, age=timedelta(hours=7))
     fake.add(f"{INTAKE}report.pdf", PDF)                                        # not <run_id>.pdf: ignored
     fake.add(f"{INTAKE}sub/{rid(9)}.pdf", PDF)
-    df = app().dataframe[0].value.set_index("Run id")
+    at = app()
+    df, raw = runs(at), at.dataframe[1].value.set_index("Run id")
     assert list(df.index) == [expired, late, queued, stale, failed, done]
-    assert df.loc[[done, failed, stale], "Pipeline"].tolist() == ["completed", "failed at labels", "failed (stale)"]
-    assert df.loc[failed, "Error"] == "INTAKE_INVALID at labels"
+    assert df.loc[[done, failed, stale], "Pipeline"].tolist() == ["completed", "failed", "failed (stale)"]
+    assert (raw.loc[failed, "Pipeline, raw"], raw.loc[failed, "Error"]) == ("failed at labels", "INTAKE_INVALID at labels")
     assert df.loc[[queued, late, expired], "Pipeline"].tolist() == ["queued", "not picked up", "expired"]
     assert df.loc[[queued, late, expired], "Waited"].tolist() == ["2 min", "10 min", "7 h 0 min"]
     assert df.loc[[queued, stale], "Organisation"].tolist() == [ORG, ORG]      # from the uploads' labels
@@ -265,10 +290,10 @@ def test_with_a_run_running_a_long_wait_is_still_queued(fake, handler):
     upload(fake, running, age=timedelta(minutes=12))
     as_running(fake, handler, running)
     upload(fake, late, age=timedelta(minutes=10))
-    df = app().dataframe[0].value.set_index("Run id")
-    assert df.loc[running, ["Pipeline", "Well"]].tolist() == ["running", WELL]
+    df = runs(app())
+    assert df.loc[running, ["Pipeline", "Well"]].tolist() == ["running", "Well\u2423\u2423#1"]     # spacing marked
     assert df.loc[late, "Pipeline"] == "queued"
-    metrics = {m.label: m.value for m in app(run=running).metric}            # its page names them the same way
+    metrics = {m.label: m.value for m in app(run=running).metric}            # its technical page: exactly
     assert (metrics["Organisation"], metrics["Well"]) == (ORG, WELL)
 
 
@@ -284,10 +309,12 @@ def test_the_watch_view_shows_an_uploads_wait(fake, handler, age, running, eleme
     if running:
         upload(fake, rid(1), age=timedelta(minutes=12))
         as_running(fake, handler, rid(1))
-    messages = [t for t in texts(getattr(app(watch=run_id), element)) if t.startswith(shown)]
+    at = app(watch=run_id)
+    messages = [t for t in texts(getattr(at, element)) if t.startswith(shown)]
     assert len(messages) == 1
-    if element == "warning":
-        assert "run log" in messages[0] and "CloudWatch" in messages[0]
+    if element == "warning":                            # where to look: technical
+        assert "run log" in technical(at) and "CloudWatch" in technical(at) and run_id in technical(at)
+    no_id_or_code(at, ORG, WELL, "doc.pdf")
 
 
 def test_the_watch_view_follows_an_upload_to_its_final_record(fake):
@@ -315,14 +342,20 @@ def test_the_watch_view_follows_an_upload_to_its_final_record(fake):
     ("expired", None),
     ("stale", None),
     ("another well", None),
+    ("queued for Test wells", None),                    # the same PDF, organisation and well, written to dev
+    ("running for Test wells", None),
 ])
 def test_the_duplicate_warning_reads_running_records_and_waiting_uploads(fake, handler, case, warned):
     run_id = rid(1)
     age = {"not picked up": timedelta(minutes=10), "expired": timedelta(hours=7)}.get(case, timedelta(minutes=1))
-    upload(fake, run_id, age=age, well="well #2" if case == "another well" else WELL)
-    if case in ("running", "stale"):
+    dev = {**encode_labels(ORG, WELL, "doc.pdf", R.sha256(PDF)), "environment": "dev"}
+    upload(fake, run_id, age=age, well="well #2" if case == "another well" else WELL,
+           metadata=dev if case.endswith("Test wells") else None)
+    if case.startswith(("running", "stale")):
         assert as_running(fake, handler, run_id, stale=case == "stale")["organization_id"] is None
-    mine = [w for w in texts(form().warning) if run_id in w]
+    at = form()
+    mine = [w for w in texts(at.warning) if "of this PDF for this organisation and well" in w]
+    no_id_or_code(at, ORG, "org alpha", "Beta Org", WELL, "well #2", "doc.pdf")
     if warned is None:
         assert mine == []
     else:
@@ -379,7 +412,26 @@ def test_an_unknown_mode_is_refused_and_s3_needs_its_variables(fake, monkeypatch
 
 def test_an_s3_failure_is_said_plainly(fake):
     fake.fail["ListObjectsV2", INTAKE] = TL.client_error(400, "ExpiredToken", "ListObjectsV2")
-    assert any(e.startswith("S3 could not be read (ClientError") and "aws sso login" in e for e in texts(app().error))
+    at = app()
+    assert texts(at.error) == ["The runs could not be read. Your AWS sign-in may have expired: sign in again, then "
+                               "reload the page."]
+    assert "S3 could not be read (ClientError" in technical(at) and "aws sso login" in technical(at)
+    no_id_or_code(at)
+
+
+def test_the_list_upload_and_watch_pages_sidebar_says_only_when_the_runs_were_read(fake, handler):
+    done, queued = rid(1), rid(2)
+    upload(fake, done, age=timedelta(hours=1))
+    stored_run(fake, done, record(done))
+    upload(fake, queued)
+    names = (ORG, "org alpha", "Beta Org", WELL, "well #2", "doc.pdf", "org-test", "well-a")
+    for at in (app(), app(upload="1"), app(watch=queued), app(watch=done)):
+        said = texts(at.sidebar.caption)
+        assert len(said) == 1 and said[0].startswith("Runs read at ") and [b.label for b in at.sidebar.button] == [
+            "Refresh"]
+        no_id_or_code(at, *names)
+    at = app(run=done)                                  # Run details, technical: where S3 mode reads
+    assert any(BUCKET in c for c in texts(at.sidebar.caption))
 
 
 # ---- a run an upload in the product started ----
@@ -413,10 +465,10 @@ def test_a_run_the_product_started_says_so_in_the_list_and_on_its_queue_and_watc
     stored_run(fake, pushed, record(pushed))                           # one has its run, one is queued
     S.s3_store_from_env().refresh()
     at = app()
-    df = at.dataframe[0].value.set_index("Run id")
+    df = runs(at)
     assert df.loc[[queued, pushed], ORIGIN].tolist() == [AUTOMATIC, AUTOMATIC]
     assert df.loc[[queued, pushed], "Pipeline"].tolist() == ["queued", "completed"] and df.loc[form, ORIGIN] == ""
-    assert list(df.reset_index().columns[3:5]) == ["Well", ORIGIN]              # beside the organisation and well
+    assert list(df.columns[2:4]) == ["Well", ORIGIN]                            # beside the organisation and well
     pages = [at]
     for run_id, says in ((queued, True), (form, False)):
         watch = app(watch=run_id)

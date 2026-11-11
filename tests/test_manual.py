@@ -26,6 +26,7 @@ from extraction.well_entry import (ENTERED_BY_HAND, KEYS, MANUAL, NOT_FROM_THE_D
                                    entry_bytes, section_value)
 from test_confirm import AT, CATALOGUE, CID, DEADLINE, FUNCTION, ORG, PDF, RUN_ID, SHA, WELL, entry, run_record
 from test_editor import fresh_catalogue  # noqa: F401 - a fixture
+from test_intake import no_id_or_code, technical
 from test_review import VALIDATE, app, s3_mode  # noqa: F401 - s3_mode: a fixture
 from test_screens import exempt, unplain
 from test_transcription import made  # noqa: F401 - a fixture: a scan and its transcription
@@ -359,6 +360,52 @@ def test_a_scan_offers_entry_by_hand_beside_its_message(offline):
     assert not [b for b in app(run=RUN_ID).button if b.key == f"enter-{RUN_ID}"]       # not while it runs
 
 
+def test_a_failed_upload_ends_on_a_plain_screen_whose_offer_opens_the_same_flow(offline):
+    at = app(watch=RUN_ID)
+    assert SCAN_WORDS in texts(at.info) and R.OFFER in texts(at.caption) and "#### Pipeline: failed" in texts(at.markdown)
+    assert "IMAGE_ONLY" in technical(at)                                 # the code: technical only
+    no_id_or_code(at, ORG, WELL, "design.pdf")
+    at.button(key=f"enter-{RUN_ID}").click().run()                       # the run's page, entered by hand
+    assert at.query_params["run"] == RUN_ID and "watch" not in at.query_params
+    [view] = at.get("button_group")
+    assert view.options == ["Enter by hand", "Run details (technical)"] and R.BY_HAND in texts(at.info)
+    for error, retry in (({"code": "MODEL_TIMEOUT", "stage": "extract", "message": "x"}, True),
+                         ({"code": "PREP_FAILED", "stage": "prep", "message": "x"}, False)):
+        put_failed(offline, failed(error=error))
+        at = app(watch=RUN_ID)
+        assert R.failure_words(failed(error=error)) in texts(at.info) and at.button(key=f"enter-{RUN_ID}")
+        assert ("Uploading the document again" in R.failure_words(failed(error=error))) == retry
+        no_id_or_code(at, ORG, WELL, "design.pdf")
+
+
+@pytest.mark.parametrize("error,said", [
+    (IMAGE_ONLY, None),
+    ({"code": "MODEL_TIMEOUT", "stage": "extract", "message": "x"},
+     "Nothing was read from this document. Uploading the document again retries the extraction."),
+    ({"code": "ASSET_INVALID", "stage": "assets", "message": "x"},
+     "Nothing was read from this document. Whoever runs the app can see why in the technical details."),
+])
+def test_a_failed_upload_whose_pdf_is_not_in_the_store_says_what_happened_without_the_offer(offline, error, said):
+    offline.path(C.pdf_key(RUN_ID)).unlink()                            # nothing to enter it beside
+    put_failed(offline, failed(error=error), pdf=None)
+    at = app(watch=RUN_ID)
+    assert not [b for b in at.button if b.key == f"enter-{RUN_ID}"] and R.OFFER not in texts(at.caption)
+    assert (SCAN_WORDS in texts(at.info)) == (said is None) and (said is None or said in texts(at.info))
+    assert "Open the run" in [b.label for b in at.button]
+    no_id_or_code(at, ORG, WELL, "design.pdf")
+
+
+def test_the_watch_page_says_what_happened_to_a_run_that_read_the_document_or_ran_out_of_time(offline):
+    put_failed(offline, failed(error={"code": "LOAD_HALTED", "stage": "stage", "message": "x"}),
+               stored_entry=empty_entry(ORG, WELL))
+    at = app(watch=RUN_ID)
+    assert ("The run stopped part-way, after reading the document. Open the run to review the values it read."
+            in texts(at.info)) and not [b for b in at.button if b.key == f"enter-{RUN_ID}"]
+    stale = failed(status="running", error=None, deadline_at="2000-01-01T00:00:00Z")
+    assert R.failed_words(stale, entry_stored=False).startswith("The run stopped without finishing")
+    no_id_or_code(at, ORG, WELL, "design.pdf")
+
+
 def test_entered_by_hand_then_written_then_confirmed(offline):
     at = enter(app(run=RUN_ID))
     [view] = at.get("button_group")
@@ -384,7 +431,7 @@ def test_entered_by_hand_then_written_then_confirmed(offline):
     assert not go.disabled
     plain_words(at, PRESSURE["note"])
     go.click().run()
-    assert texts(at.success)[0].startswith("**Written to production**")
+    assert texts(at.success)[0].startswith("**Written to Live wells**")
     assert at.get("button_group")[0].options == ["Confirmed entry", "Run details (technical)"]
     assert any("Entered by hand: nothing was read from it" in c for c in texts(at.caption))
     plain_words(at, PRESSURE["note"])
@@ -443,7 +490,7 @@ def test_a_transcription_entered_by_hand_keeps_its_warning_and_scan_and_goes_as_
     at.button(key=f"dlg-go-{RUN_ID}-string").click().run()
     at.button(key=f"dlg-go-{RUN_ID}-not found").click().run()
     at.button(key=f"write-go-{RUN_ID}").click().run()
-    assert texts(at.success)[0].startswith("**Written to production**")
+    assert texts(at.success)[0].startswith("**Written to Live wells**")
     [key] = [k for k in offline.keys(f"{C.ROOT}confirmations/") if k.endswith("request.json")]
     assert C.load(offline.get(key))["entry_method"] == C.MANUAL
 
@@ -480,7 +527,7 @@ def test_s3_mode_enters_by_hand_and_the_writer_lambda_writes_it(s3_mode, fresh_c
     at.button(key=f"dlg-go-{RUN_ID}-string").click().run()
     at.button(key=f"dlg-go-{RUN_ID}-not found").click().run()
     at.button(key=f"write-go-{RUN_ID}").click().run()
-    assert texts(at.success)[0].startswith("**Written to production**")
+    assert texts(at.success)[0].startswith("**Written to Live wells**")
     [row] = [json.loads(body) for key, body in fake.objects.items() if key.startswith(C.row_prefix("prd"))]
     assert (row["entry_method"], row["design_date"], row["confirmed_by"]) == (C.MANUAL, None, "analyst-1")
     plain_words(at, "analyst-1")

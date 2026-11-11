@@ -267,7 +267,6 @@ def test_the_viewer_marks_a_generic_run(tmp_path, monkeypatch):
     assert "Document review: no issues" in " ".join(texts(template.markdown))
     assert not any("Generic extraction" in m.value for m in template.markdown)
     at = app()
-    assert dict(zip(at.dataframe[0].value["Run id"], at.dataframe[0].value["Route"])) == {
-        GENERIC_RUN: GENERIC, TEMPLATE_RUN: "template"}
-    at.multiselect(key="route").set_value([GENERIC]).run()
-    assert list(at.dataframe[0].value["Run id"]) == [GENERIC_RUN]
+    assert dict(zip(at.dataframe[1].value["Run id"], at.dataframe[1].value["Route"])) == {     # the list's technical
+        GENERIC_RUN: GENERIC, TEMPLATE_RUN: "template"}                                      # section
+    assert "Route" not in at.dataframe[0].value and [m.key for m in at.multiselect] == ["org", "well", "status"]

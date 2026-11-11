@@ -12,9 +12,10 @@ scanned.
 
 The rest needs no input: every message the app makes, scanned the same way, among them the line on a run an upload in
 the product started and the writer's refusal of an environment other than the upload's.  The screens in those states
-are scanned where tests/test_review.py reaches them (S3 mode, and local mode, which reads no upload labels), and so
-are those of a lab-check run pushed from production, its Write off from the start.  What a scan leaves out
-(`exempt`): the organisation and the well, as the well list names them; pump models, the catalogue's names among them;
+are scanned where tests/test_review.py reaches them (S3 mode, and local mode, which reads the upload labels the form
+keeps), and so are those of a lab-check run pushed from production, its Write off from the start.  The run list, the
+upload page and the watch page are scanned the same way in tests/test_intake.py.  What a scan leaves out
+(`exempt`): the organisation and the well, as the well list names them and as the screens mark their spacing; pump models, the catalogue's names among them;
 values and text as printed; the document's file name (a transcription's, its scan's); who confirms; and what the
 engineer typed.
 """
@@ -22,6 +23,7 @@ engineer typed.
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
@@ -32,6 +34,7 @@ from streamlit.testing.v1.element_tree import Dataframe
 
 import app.review as R
 import app.transcription as T
+from app.wells import marked
 import extraction.confirmation as C
 from extraction.catalogue import CatalogueNames
 from extraction.validate.validate import catalogue as read_catalogue
@@ -78,14 +81,26 @@ def strings(value, field=None):
         yield value
 
 
+def cells(node) -> list[str]:
+    """A table's columns and cells as Streamlit 1.65's grid shows them: an empty cell reads None, but in a button column
+    it shows nothing, no button."""
+    df = node.value
+    buttons = {name for name, column in json.loads(node.proto.columns or "{}").items()
+               if (column.get("type_config") or {}).get("type") == "button"}
+    out = [str(c) for c in df.columns]
+    for name, values in df.items():
+        out += [str(v) for v in values if not pd.isna(v)] if name in buttons else \
+            ["None" if pd.isna(v) else str(v) for v in values]
+    return out
+
+
 def screen(at) -> list[str]:
-    """Every string the page shows: text, labels, help, options, a table's columns and cells, pop-up and expander
-    titles.  Icons and Markdown syntax are not text."""
+    """Every string the page shows: text, labels, help, options, a table's columns and cells (`cells`), pop-up and
+    expander titles.  Icons and Markdown syntax are not text."""
     out = []
     for node in at._tree:
         if isinstance(node, Dataframe):
-            df = node.value
-            out += [str(c) for c in df.columns] + [str(v) for v in df.to_numpy().ravel() if not pd.isna(v)]
+            out += cells(node)
         elif getattr(node, "proto", None) is not None:
             out += strings(MessageToDict(node.proto, preserving_proto_field_name=True))
     return [normalise(s) for s in out]
@@ -97,10 +112,24 @@ def normalise(text: str) -> str:
     return re.sub(r"\\(.)", r"\1", text).replace(" ", " ")
 
 
+# Two names of one list that differ only by a character that doesn't show, or by case (invented): a plain or a no-break
+# space, a tab, a zero-width character, case, and two other kinds of space, which share ▫ and which the list tells apart
+# in words.
+PAIRS = {"space-or-no-break-space": ("Org Alpha ", "Org Alpha\u00a0"), "tab": ("Org Alpha ", "Org Alpha\t"),
+         "zero-width": ("Org Alpha", "Org Alpha\u200b"), "case": ("Org Alpha", "org alpha"),
+         "two-other-spaces": ("Org\u2002Alpha", "Org\u2003Alpha")}
+
+
+def seen(label: str) -> str:
+    """A label as a person sees it: no format or control character, each run of spacing one space, none at an edge."""
+    return " ".join("".join(c for c in label if c.isspace() or unicodedata.category(c) not in ("Cf", "Cc")).split())
+
+
 def exempt(record=None, entry=None, version=None, *more) -> list[str]:
     """What a scan leaves out for one run, longest first."""
     record, out = record or {}, set(more)
-    out |= {str(record.get("organization_id") or ""), str(record.get("well_id") or ""), R.document_name(record) or ""}
+    names = [str(record.get(k)) for k in ("organization_id", "well_id") if record.get(k)]
+    out |= {*names, *map(marked, names), R.document_name(record) or ""}     # names as they are, and marked
     review = (entry or {}).get("review") or {}
     for s in [*((review.get("pump_string") or {}).get("sections") or []),
               *(((version or {}).get("pump_string") or {}).get("final_sections") or [])]:
@@ -140,6 +169,17 @@ def ids(texts, leave_out=()) -> list[str]:
 def unplain(at, *leave_out) -> list[str]:
     assert not at.exception, [e.value for e in at.exception]
     return ids(screen(at), leave_out)
+
+
+def test_the_scan_reads_an_empty_cell_as_the_table_shows_it():
+    """A table shows an empty cell as None, so a table that stopped blanking its empty cells must fail the scan; a
+    button column shows nothing for one (no button), as the page column of a section with no page does."""
+    at = AppTest.from_string(
+        "import streamlit as st\n"
+        "st.dataframe({'Page': ['p2', None, None], 'Value': ['shown', None, float('nan')]}, key='t', hide_index=True,\n"
+        "             column_config={'Page': st.column_config.ButtonColumn(key='t-click')})").run()
+    assert screen(at) == ["Page", "Value", "p2", "shown", "None", "None"]
+    assert ids(screen(at)) == ["null: 'None' in 'None'"] * 2
 
 
 # ---- every message the app makes ----

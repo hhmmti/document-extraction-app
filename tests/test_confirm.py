@@ -665,7 +665,7 @@ def test_the_readers_take_only_a_404_for_not_there():
     store.objects.put(missing, C.dump(C.result(CID, C.WRITTEN, at=DEADLINE)))
     for key in (C.row_key("prd", CID), C.version_key(SHA, CID), missing):      # listed, but S3 answers 403
         fake.fail["GetObject", key] = TL.client_error(403, "AccessDenied", "GetObject")
-    for read in (lambda: store.current_entries("prd"), lambda: store.latest_version(SHA, ORG, WELL),
+    for read in (lambda: store.current_entries("prd"), lambda: store.latest_version(SHA, ORG, WELL, "prd"),
                  lambda: store.result(CID)):
         with pytest.raises(ClientError):
             read()
@@ -853,9 +853,28 @@ def test_the_latest_version_is_the_latest_with_a_row(reader):
     stored_row(objects, "20261028T080000Z-00000001", "2026-10-28T08:00:00.000000")
     stored_row(objects, "20261028T090000Z-00000002", "2026-10-28T09:00:00.000000", row=False)    # never committed
     stored_row(objects, "20261028T100000Z-00000003", "2026-10-28T10:00:00.000000", well="Well #1")
-    assert store.latest_version(SHA, ORG, WELL)["confirmation_id"] == "20261028T080000Z-00000001"
-    assert store.latest_version(SHA, ORG, "Well #1")["confirmation_id"] == "20261028T100000Z-00000003"
-    assert store.latest_version("0" * 64, ORG, WELL) is None and store.latest_version("../x", ORG, WELL) is None
+    assert store.latest_version(SHA, ORG, WELL, "prd")["confirmation_id"] == "20261028T080000Z-00000001"
+    assert store.latest_version(SHA, ORG, "Well #1", "prd")["confirmation_id"] == "20261028T100000Z-00000003"
+    assert store.latest_version("0" * 64, ORG, WELL, "prd") is None and store.latest_version("../x", ORG, WELL,
+                                                                                              "prd") is None
+
+
+def test_the_latest_version_is_the_latest_written_to_the_environment_asked_for(reader):
+    store, objects, _ = reader
+    prd = stored_row(objects, "20261028T080000Z-00000001", "2026-10-28T08:00:00.000000")
+    dev = stored_row(objects, "20261028T100000Z-00000002", "2026-10-28T10:00:00.000000", environment="dev")
+    stored_row(objects, "20261028T110000Z-00000003", "2026-10-28T11:00:00.000000", environment="dev", row=False)
+    assert store.latest_version(SHA, ORG, WELL, "prd")["confirmation_id"] == prd["confirmation_id"]   # dev's is later
+    assert store.latest_version(SHA, ORG, WELL, "dev")["confirmation_id"] == dev["confirmation_id"]
+    assert store.latest_version(SHA, ORG, "Well #1", "dev") is None
+    with pytest.raises(ValueError, match="not an environment"):
+        store.latest_version(SHA, ORG, WELL, "qa")
+
+
+def test_a_dev_version_is_never_returned_for_prd(reader):
+    store, objects, _ = reader
+    stored_row(objects, "20261028T100000Z-00000002", "2026-10-28T10:00:00.000000", environment="dev")
+    assert store.latest_version(SHA, ORG, WELL, "prd") is None
 
 
 def test_a_running_result_past_its_deadline_reads_as_stale(reader):

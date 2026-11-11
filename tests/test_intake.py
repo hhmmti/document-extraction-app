@@ -1,6 +1,6 @@
 """Intake (app/wells.py, app/intake.py, the upload form, the watch view), the CLI's --run-id and
 --source-name, chart grouping and the client-name check.  Invented ids only; no AWS, no real launch:
-Popen is replaced wherever the app would start a process."""
+Popen is replaced wherever the app would start a process, and Athena by a fake (`lists`)."""
 
 import json
 import os
@@ -12,15 +12,22 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from google.protobuf.json_format import MessageToDict
 from streamlit.testing.v1 import AppTest
+from streamlit.testing.v1.errors import AppTestError
+from streamlit.testing.v1.element_tree import Dataframe, Expander
 
 import app.intake as intake
-from app.store import PDF_DIRS_ENV, STORE_ENV
+import app.wells as W
+import test_screens as TS
+from app.store import PDF_DIRS_ENV, STORE_ENV, LocalRunStore
 from app.wells import WELL_LIST_ENV, SnapshotError, load
 from extraction.__main__ import main
 from extraction.assets_dir import ASSETS_ENV
+import extraction.confirmation as C
+from extraction.intake import decode_labels, optional_labels
 from test_unit import F4_P1, F4_P2, make_pdf
-from test_viewer import APP, FULL, PDF, PDF_SHA, curve, parquet, record, texts, write_run
+from test_viewer import APP, FULL, PDF, PDF_SHA, curve, parquet, record, runs, texts, write_run
 
 LAB = Path(__file__).resolve().parents[1]
 RUN = "20990101T000000Z-0000abcd"
@@ -32,6 +39,110 @@ WELLS = ('"organization_id","well_id"\n'
          '"org alpha","Lower Well"\n'
          '"Beta Org","B 1"\n')
 needs_assets = pytest.mark.skipif(not os.environ.get(ASSETS_ENV), reason=f"needs {ASSETS_ENV}")
+# The product's live well lists as the fake Athena returns them: WELLS's rows for prd, another organisation for dev.
+LIVE = [("Org Alpha", "Well  #1"), ("Org Alpha", "well #2"), ("Org Alpha", "Well  #1"), ("org alpha", "Lower Well"),
+        ("Beta Org", "B 1")]
+TEST = [("Test Org", "T 1"), ("Test Org", "T 2")]
+NEAR = ("The list holds names that differ only by case or by characters that don't show; the exact name you choose is "
+        "sent.")
+SPACES = "␣ marks a space that would not show."
+# The form's words for a name the upload's labels refuse (extraction/intake.py takes printable values only), and the
+# names of test_screens.PAIRS they refuse: with a no-break space, a tab, a zero-width space, an en and an em space.
+NO_RUN = {"organisation": "No run can start for this organisation yet, because its name holds a character the pipeline "
+                          "can't carry.",
+          "well": "No run can start for this well yet, because its name holds a character the pipeline can't carry.",
+          "both": "No run can start for this organisation and this well yet, because each name holds a character the "
+                  "pipeline can't carry."}
+REFUSED = sorted({name for pair in TS.PAIRS.values() for name in pair if not name.isprintable()})
+TRY_AGAIN = "The run could not be started. Try again; if it fails again, ask whoever runs the app."
+
+
+class FakeAthena:
+    """Athena's client as app/wells.py calls it.  A query reads RUNNING at its first poll, then `state`; its rows come
+    two a page under the header row, None as a NULL.  With `fail` set, starting a query raises it."""
+
+    def __init__(self, lists):
+        self.lists, self.calls, self.fail, self.state, self.polls = lists, [], None, "SUCCEEDED", {}
+
+    def start_query_execution(self, **kwargs):
+        self.calls.append(("start", kwargs))
+        if self.fail:
+            raise self.fail
+        environment = next(e for e, source in W.SOURCES.items() if f'"{source}"' in kwargs["QueryString"])
+        qid = f"query-{len(self.calls)}-{environment}"
+        self.polls[qid] = 0
+        return {"QueryExecutionId": qid}
+
+    def get_query_execution(self, *, QueryExecutionId):
+        self.calls.append(("poll", QueryExecutionId))
+        self.polls[QueryExecutionId] += 1
+        state = "RUNNING" if self.polls[QueryExecutionId] == 1 else self.state
+        return {"QueryExecution": {"Status": {"State": state, "StateChangeReason": "an invented reason"}}}
+
+    def get_query_results(self, *, QueryExecutionId, NextToken="0"):
+        self.calls.append(("page", QueryExecutionId, NextToken))
+        rows, start = [W.COLUMNS, *self.lists[QueryExecutionId.rsplit("-", 1)[1]]], int(NextToken)
+        page = {"ResultSet": {"Rows": [{"Data": [{} if v is None else {"VarCharValue": v} for v in row]}
+                                       for row in rows[start:start + 2]]}}
+        return {**page, "NextToken": str(start + 2)} if start + 2 < len(rows) else page
+
+    def started(self) -> list[str]:
+        """The environment of each query started, in order."""
+        return [e for c in self.calls if c[0] == "start" for e, source in W.SOURCES.items()
+                if f'"{source}"' in c[1]["QueryString"]]
+
+
+def lists(monkeypatch, prd=LIVE, dev=TEST) -> FakeAthena:
+    """The product's well lists, from a fake Athena, nothing kept from an earlier test and no wait between polls."""
+    fake = FakeAthena({"prd": list(prd), "dev": list(dev)})
+    monkeypatch.setattr(W, "athena_client", lambda: fake)
+    monkeypatch.setattr(W, "_LISTS", {})
+    monkeypatch.setattr(W, "POLL_S", 0)
+    return fake
+
+
+def plain_part(at) -> list[str]:
+    """Every string the page shows outside its technical sections (an expander labelled `… (technical)`), read as
+    tests/test_screens.py's `screen` reads a page."""
+    out = []
+
+    def walk(node):
+        if isinstance(node, Expander) and node.label.endswith("(technical)"):
+            return
+        if isinstance(node, Dataframe):
+            out.extend(TS.cells(node))
+        elif getattr(node, "proto", None) is not None:
+            out.extend(TS.strings(MessageToDict(node.proto, preserving_proto_field_name=True)))
+        for child in getattr(node, "children", {}).values():
+            walk(child)
+    walk(at._tree)
+    return [TS.normalise(t) for t in out]
+
+
+def no_id_or_code(at, *names):
+    """R5's check on the run list, the upload page and the watch page: outside the technical sections, no run id, hash,
+    code, key or the words dev and prd, by tests/test_screens.py's patterns; `names` are the organisations, wells and
+    document names the page may show, as they are and marked."""
+    assert not at.exception, [e.value for e in at.exception]
+    assert TS.ids(plain_part(at), sorted({*names, *map(W.marked, names)}, key=len, reverse=True)) == []
+
+
+def every_string(value):
+    if isinstance(value, dict):
+        for inner in value.values():
+            yield from every_string(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            yield from every_string(inner)
+    elif isinstance(value, str):
+        yield value
+
+
+def technical(at) -> str:
+    """Everything the page's technical sections hold, code blocks and JSON included, as one text, Markdown undone."""
+    return " ".join(TS.normalise(t) for e in at.get("expander") if e.label.endswith("(technical)") for node in e
+                    if getattr(node, "proto", None) is not None
+                    for t in every_string(MessageToDict(node.proto, preserving_proto_field_name=True)))
 
 
 class FakeProcess:
@@ -44,13 +155,13 @@ class FakeProcess:
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    root, wells = tmp_path / "store", tmp_path / "wells.csv"
+    root = tmp_path / "store"
     (root / "runs").mkdir(parents=True)
-    wells.write_text(WELLS)
     monkeypatch.setenv(STORE_ENV, str(root))
-    monkeypatch.setenv(WELL_LIST_ENV, str(wells))
+    monkeypatch.delenv(WELL_LIST_ENV, raising=False)
     monkeypatch.delenv(PDF_DIRS_ENV, raising=False)
     monkeypatch.setattr(intake, "PROCESSES", {})
+    lists(monkeypatch)
     return root
 
 
@@ -181,20 +292,369 @@ def test_launch_status_follows_the_process():
     assert intake.watch_state(None, late, now, False) == "no record yet"        # alive: keep watching
     assert intake.watch_state(None, late, now, None) == "launch failed"         # handle unknown: the 120 s rule
 
+# ---- the live well lists ----
+
+def test_a_list_is_one_query_polled_and_paged_with_its_values_exactly_as_returned(monkeypatch):
+    rows = [("Org Alpha", "Well  #1"), ("Org Alpha", "Well  #1"), ("Org Alpha", "well  #1"), (" Org Alpha", "W 1 "),
+            (None, "No Org"), ("Org Alpha", ""), ("", "x"), ("Beta Org", "B\t1")]
+    fake = lists(monkeypatch, prd=rows)
+    got = W.read("prd", client=fake, environ={})
+    assert got.pairs == (("Org Alpha", "Well  #1"), ("Org Alpha", "well  #1"), (" Org Alpha", "W 1 "), ("Beta Org", "B\t1"))
+    assert (got.environment, got.skipped) == ("prd", 3)                  # a NULL, then two empty values
+    assert got.organisations() == [" Org Alpha", "Beta Org", "Org Alpha"]
+    assert got.wells("Org Alpha") == ["Well  #1", "well  #1"]
+    [start] = [c[1] for c in fake.calls if c[0] == "start"]
+    assert start == {"QueryString": 'SELECT organization_id, well_id FROM "roam_prd_ddb"."default"'
+                                    '."esp_well_configuration_v2"', "WorkGroup": "primary",
+                     "ResultConfiguration": {"OutputLocation": "s3://aws-athena-query-results-640168431387-us-east-1/"}}
+    assert [c[0] for c in fake.calls] == ["start", "poll", "poll", "page", "page", "page", "page", "page"]
+    assert [c[2] for c in fake.calls if c[0] == "page"] == ["0", "2", "4", "6", "8"]       # 9 rows, the header first
+    W.read("dev", client=fake, environ={W.OUTPUT_ENV: "s3://other-results/", W.WORKGROUP_ENV: "lab"})
+    assert next(c[1] for c in reversed(fake.calls) if c[0] == "start") == {
+        "QueryString": 'SELECT organization_id, well_id FROM "roam_dev_ddb"."default"."esp_well_configuration_v2"',
+        "WorkGroup": "lab", "ResultConfiguration": {"OutputLocation": "s3://other-results/"}}
+    fake.state = "FAILED"
+    with pytest.raises(RuntimeError, match="FAILED: an invented reason"):
+        W.read("prd", client=fake, environ={})
+
+
+def test_names_that_differ_only_by_case_or_spacing_are_found_and_their_spacing_marked():
+    names = ["Org Alpha", "org alpha", "Org Alpha ", " Org  Alpha", "Beta Org", "Beta\u00a0Org2", "Gamma", "Gamma\u200b"]
+    assert W.near(names) == {"Org Alpha", "org alpha", "Org Alpha ", " Org  Alpha", "Gamma", "Gamma\u200b"}
+    assert [W.marked(n) for n in names] == ["Org Alpha", "org alpha", "Org Alpha\u2423", "\u2423Org\u2423\u2423Alpha",
+                                           "Beta Org", "Beta°Org2", "Gamma", "Gamma¦"]
+
+
+def test_each_kind_of_character_that_does_not_show_has_its_own_sign_and_one_line_says_what_the_signs_shown_mean():
+    """␣ a plain space only where it would not show (an edge, a run of two or more); ° a no-break space, → a tab,
+    ▫ any other space character, ¦ a character with no width, wherever they are.  One sign per character."""
+    assert W.marked(" Org  Alpha ") == "␣Org␣␣Alpha␣" and W.marked("Org Alpha") == "Org Alpha"
+    others = {"\u00a0": "°", "\t": "→", "\u2002": "▫", "\u202f": "▫", "\u3000": "▫", "\n": "▫", "\x85": "▫",
+              "\u200b": "¦", "\u200d": "¦", "\u2060": "¦", "\ufeff": "¦", "\u00ad": "¦", "\u200e": "¦", "\x01": "¦"}
+    for char, sign in others.items():
+        assert W.marked(f"{char}Org{char}Alpha{char}") == f"{sign}Org{sign}Alpha{sign}", repr(char)
+    assert W.marked("Org \u00a0Alpha") == "Org °Alpha" and W.marked("\u200b Org") == "¦ Org"    # a space between
+    assert W.marked("Org \u00a0 Alpha") == "Org ° Alpha"                                     # signs shows
+    assert W.key(["Org Alpha", "Pad 90° → ¦"]) == ""                     # no sign shown; a sign written is no sign
+    assert W.key(["Org\u00a0Alpha"]) == "° marks a no-break space."
+    assert W.key([" Org", "Org\u00a0Alpha"]) == "␣ marks a space that would not show and ° a no-break space."
+    assert W.key(["Org Alpha\u200b", "Org\u2002Alpha", "Org\tAlpha", "Org\u00a0Alpha", "Org  Alpha"]) == (
+        "␣ marks a space that would not show, ° a no-break space, → a tab, ▫ another kind of space and ¦ a character "
+        "with no width.")
+
+
+def test_no_two_names_of_one_list_show_alike_even_where_two_mark_alike():
+    """Two kinds of space behind ▫, or a sign written in a name, mark alike: each such name is followed by the
+    characters behind its signs, in words; a name written as another's label is numbered."""
+    assert W.labels(["Org\u2002Alpha", "Org\u2003Alpha", "Org Alpha ", "Org Alpha␣", "Org Alpha", "Org Alpha"]) == {
+        "Org\u2002Alpha": "Org▫Alpha (en space)", "Org\u2003Alpha": "Org▫Alpha (em space)",
+        "Org Alpha ": "Org Alpha␣ (space)", "Org Alpha␣": "Org Alpha␣ (open box)", "Org Alpha": "Org Alpha"}
+    assert W.labels(["A\t\x01", "A→\x02"]) == {"A\t\x01": "A→¦ (tab, U+0001)", "A→\x02": "A→¦ (rightwards arrow, U+0002)"}
+    assert W.labels(["A\u2002B", "A\u2003B", "A▫B (en space)"]) == {
+        "A\u2002B": "A▫B (en space)", "A\u2003B": "A▫B (em space)", "A▫B (en space)": "A▫B (en space) (2)"}
+    for pair in TS.PAIRS.values():
+        assert len({TS.seen(label) for label in W.labels(pair).values()}) == 2, pair
+
+
+def test_each_list_is_read_once_until_refresh(env):
+    fake = W.athena_client()
+    at = app(upload="1")
+    assert fake.started() == ["prd"] and at.get("button_group")[0].value == "Live wells"
+    [said] = [c for c in texts(at.caption) if c.startswith("Live wells: ")]
+    assert re.fullmatch(r"Live wells: 4 wells, read from the product at \d\d:\d\d UTC on \d{1,2} [A-Z][a-z]+ \d{4}\.", said)
+    at.run()
+    app(upload="1")                                                      # another page: the list is kept
+    assert fake.started() == ["prd"]
+    at.get("button_group")[0].set_value("Test wells").run()
+    at.get("button_group")[0].set_value("Live wells").run()
+    at.get("button_group")[0].set_value("Test wells").run()
+    assert fake.started() == ["prd", "dev"]
+    at.button(key="new-refresh").click().run()                           # the list shown, read again
+    assert fake.started() == ["prd", "dev", "dev"]
+
+
+def test_a_failed_read_keeps_the_form_off_until_retry_and_never_falls_back_to_the_csv(env, monkeypatch, tmp_path):
+    fake = W.athena_client()
+    fake.fail = RuntimeError("AccessDeniedException: an invented refusal")
+    (tmp_path / "wells.csv").write_text('"organization_id","well_id"\n"Csv Org","Csv Well"\n')
+    monkeypatch.setenv(WELL_LIST_ENV, str(tmp_path / "wells.csv"))      # set, and never read
+    at = app(upload="1")
+    assert texts(at.error) == ["The live wells could not be read from the product, so the form is off. Retry; if it "
+                               "fails again, ask whoever runs the app."]
+    assert at.selectbox(key="new-org").disabled and at.selectbox(key="new-org").options == []
+    assert at.file_uploader(key="new-pdf").disabled and next(b for b in at.button if b.label == "Start the run").disabled
+    assert "RuntimeError: AccessDeniedException: an invented refusal" in technical(at)
+    no_id_or_code(at)                                                    # the class and message: technical only
+    at.run()
+    assert fake.started() == ["prd"]                                     # the failure is kept until Retry
+    fake.fail = None
+    at.button(key="new-retry").click().run()
+    assert not at.error and at.selectbox(key="new-org").options == ["Beta Org", "Org Alpha", "org alpha"]
+    assert "Csv Org" not in " ".join(TS.screen(at)) and fake.started() == ["prd", "prd"]
+
+
 # ---- the form ----
 
-def test_form_lists_ids_exactly_with_the_case_hint(env):
+def test_form_lists_ids_exactly_and_marks_the_spacing_of_near_duplicates(env):
     at = app(upload="1")
-    assert any("5 rows" in c and "SHA-256" in c for c in texts(at.caption))
     org = at.selectbox(key="new-org")
-    assert org.options == ["Beta Org", "Org Alpha", "org alpha"]
+    assert org.options == ["Beta Org", "Org Alpha", "org alpha"]        # no lab-check among live wells
+    assert NEAR in texts(at.caption)                                     # Org Alpha, org alpha: case only
     org.select_index(1).run()
     assert at.selectbox(key="new-org").value == "Org Alpha"
-    assert any("differing only by case: org alpha" in c for c in texts(at.caption))
     well = at.selectbox(key="new-well")
-    assert well.options == ["Well  #1", "well #2"]          # the double space stays visible
+    assert well.options == ["Well\u2423\u2423#1", "well #2"]          # the double space marked, as every screen marks it
+    assert f"{NEAR} {SPACES}" in texts(at.caption)                       # one line: the organisations, and the sign
     well.select_index(0).run()
     assert at.selectbox(key="new-well").value == "Well  #1"
+
+
+def test_near_duplicates_show_their_spacing_and_the_exact_one_is_sent(env, monkeypatch, popen):
+    lists(monkeypatch, prd=[("Org Alpha", "Well 1"), ("Org Alpha ", "Well  1"), ("Org Alpha ", "well 1"),
+                            ("Org Alpha ", "Well 2"), ("Beta  Org", "B 1")])
+    at = app(upload="1")
+    assert at.selectbox(key="new-org").options == ["Beta\u2423\u2423Org", "Org Alpha", "Org Alpha\u2423"]
+    at.selectbox(key="new-org").set_value("Org Alpha ").run()
+    assert at.selectbox(key="new-well").options == ["Well\u2423\u24231", "well 1", "Well 2"]
+    assert [c for c in texts(at.caption) if SPACES in c] == [f"{NEAR} {SPACES}"]
+    at.selectbox(key="new-well").set_value("Well  1").run()
+    at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
+    no_id_or_code(at, "Org Alpha ", "Org Alpha", "Beta  Org", "Well  1", "well 1", "Well 1", "Well 2", "Upload name.pdf")
+    at.checkbox(key="new-confirm").check().run()
+    next(b for b in at.button if b.label == "Start the run").click().run()
+    (args, _), = popen
+    assert "--org=Org Alpha " in args and "--well=Well  1" in args
+
+
+@pytest.mark.parametrize("box", ["new-org", "new-well"])
+@pytest.mark.parametrize("pair", TS.PAIRS.values(), ids=list(TS.PAIRS))
+def test_two_names_that_differ_only_by_what_does_not_show_never_show_alike_and_each_is_taken_exactly(
+        env, monkeypatch, popen, pair, box):
+    """Two organisations, or two wells of one organisation, that differ only by a character that doesn't show or by
+    case show unalike, and the one chosen, by its place in the list, is exactly the one the form takes: the one it asks
+    the upload's labels' rule about (`intake.refused`) and, when the labels take it, the one it sends them
+    (`intake.labels`).  They take printable values only (extraction/intake.py), so a name with a tab, a space other
+    than the plain one or a zero-width space starts no run, which the form says before any upload, Start off; any
+    other starts its run, launched and labelled exactly."""
+    lists(monkeypatch, prd=[(n, "Well 1") for n in pair] if box == "new-org" else [("Org Alpha", n) for n in pair])
+    real_labels, real_refused, sent, asked, shown = intake.labels, intake.refused, [], [], set()
+    monkeypatch.setattr(intake, "labels", lambda org, well, *rest: sent.append((org, well)) or real_labels(org, well,
+                                                                                                           *rest))
+    monkeypatch.setattr(intake, "refused", lambda *names, **file: (asked.append(names) if names else None)
+                        or real_refused(*names, **file))                 # the names asked, not the file's
+    flag, label = ("--org=", "organization-id") if box == "new-org" else ("--well=", "well-id")
+    for i, name in enumerate(sorted(pair, key=W.display_order)):
+        popen.clear()
+        sent.clear()
+        at = app(upload="1")
+        if box == "new-well":
+            at.selectbox(key="new-org").set_value("Org Alpha").run()
+        shown |= {TS.seen(o) for o in at.selectbox(key=box).options}
+        at.selectbox(key=box).select_index(i).run()
+        if box == "new-org":
+            at.selectbox(key="new-well").set_value("Well 1").run()
+        at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
+        assert asked[-1][box == "new-well"] == name                       # the one chosen, exactly
+        if name.isprintable():
+            at.checkbox(key="new-confirm").check().run()
+            next(b for b in at.button if b.label == "Start the run").click().run()
+            assert sent[-1][box == "new-well"] == name                    # and sent exactly
+            (args, _), = popen
+            run_id = next(a.split("=", 1)[1] for a in args if a.startswith("--run-id="))
+            assert flag + name in args and LocalRunStore(env).intake_labels(run_id)[label] == name
+        else:                                     # refused by the labels' own rule: said up front, and nothing sent
+            assert texts(at.error) == [NO_RUN["organisation" if box == "new-org" else "well"]]
+            assert next(b for b in at.button if b.label == "Start the run").disabled and not sent and not popen
+    assert len(shown) == 2, shown                                        # never two alike as a person sees them
+
+
+def unshown(name: str) -> str:
+    """A test id for a refused name: its characters that are not printable, by code point."""
+    return "+".join(f"U{ord(c):04X}" for c in name if not c.isprintable())
+
+
+@pytest.mark.parametrize("box", ["new-org", "new-well"])
+@pytest.mark.parametrize("name", REFUSED, ids=unshown)
+def test_a_name_the_labels_refuse_is_said_in_plain_words_as_soon_as_it_is_chosen_and_start_stays_off(
+        env, monkeypatch, popen, name, box):
+    """Each name of test_screens.PAIRS the labels refuse, as an organisation or as a well: as soon as it is chosen,
+    before any upload, the form says that no run can start for it, in plain words that show no id or code (not the
+    name, no label, no error code), and Start stays off once the PDF is added; nothing is labelled, copied or launched,
+    and no Try again."""
+    pairs = [(name, "Well 1"), ("Org Alpha", "Well 1")] if box == "new-org" else [("Org Alpha", name),
+                                                                                    ("Org Alpha", "Well 1")]
+    lists(monkeypatch, prd=pairs)
+    sent = []
+    monkeypatch.setattr(intake, "labels", lambda *args: sent.append(args))
+    message = NO_RUN["organisation" if box == "new-org" else "well"]
+    at = app(upload="1")
+    if box == "new-org":
+        at.selectbox(key="new-org").select_index(sorted([name, "Org Alpha"], key=W.display_order).index(name)).run()
+        assert texts(at.error) == [message]                               # before the well is chosen
+        at.selectbox(key="new-well").set_value("Well 1").run()
+    else:
+        at.selectbox(key="new-org").set_value("Org Alpha").run()
+        assert not at.error                                               # the organisation is taken
+        at.selectbox(key="new-well").select_index(sorted([name, "Well 1"], key=W.display_order).index(name)).run()
+    assert texts(at.error) == [message]                                   # before any upload
+    assert TS.ids([message]) == [] and not any(word in message for word in (
+        name, W.marked(name), "organization-id", "well-id", "label", "INTAKE_INVALID", "Try again"))
+    no_id_or_code(at, name, "Org Alpha", "Well 1")
+    at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
+    start = next(b for b in at.button if b.label == "Start the run")
+    assert texts(at.error) == [message] and at.checkbox(key="new-confirm").disabled and start.disabled
+    with pytest.raises(AppTestError):                                    # no one can press it
+        start.click()
+    no_id_or_code(at, name, "Org Alpha", "Well 1", "Upload name.pdf")
+    assert not sent and not popen and not (env / "intake").exists()
+
+
+PRINTABLE = {"plain": "Org Alpha", "edge-space": "Org Alpha ", "two-spaces": "Org  Alpha",
+             "variation-selector": "Org Alpha\ufe0f"}
+
+
+@pytest.mark.parametrize("box", ["new-org", "new-well"])
+@pytest.mark.parametrize("name", PRINTABLE.values(), ids=list(PRINTABLE))
+def test_a_printable_name_is_unaffected_even_one_shown_with_a_sign(env, monkeypatch, popen, name, box):
+    """A name the labels take is unaffected: no message, Start on once the PDF is added and the cost accepted, and the
+    run launched and labelled with exactly that name.  So is a name with a printable character that does not show, a
+    variation selector, shown ¦: the labels' own rule decides, not the sign."""
+    org, well = (name, "Well 1") if box == "new-org" else ("Org Alpha", name)
+    lists(monkeypatch, prd=[(org, well)])
+    at = app(upload="1")
+    at.selectbox(key="new-org").select_index(0).run()
+    at.selectbox(key="new-well").select_index(0).run()
+    assert at.selectbox(key=box).options == [W.marked(name)] and not at.error
+    at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
+    assert not at.error and not at.checkbox(key="new-confirm").disabled
+    at.checkbox(key="new-confirm").check().run()
+    next(b for b in at.button if b.label == "Start the run").click().run()
+    (args, _), = popen
+    run_id = next(a.split("=", 1)[1] for a in args if a.startswith("--run-id="))
+    assert f"--org={org}" in args and f"--well={well}" in args
+    assert LocalRunStore(env).intake_labels(run_id) == {"organization-id": org, "well-id": well,
+                                                        "source-name": "Upload name.pdf", "sha256": PDF_SHA,
+                                                        "environment": "prd"}
+
+
+def test_a_pdf_whose_file_name_the_labels_refuse_is_said_once_added_and_start_stays_off(env, popen):
+    """The PDF's file name goes as the upload's `source-name` label, under the same rule: a name with a narrow no-break
+    space, as some systems put before AM or PM, is refused as soon as the file is added, in plain words that show no id
+    or code, and Start stays off; nothing is labelled, copied or launched.  The same PDF under a plain name starts its
+    run, labelled with exactly that name."""
+    message = "This file's name holds a character the pipeline can't carry: rename the file and add it again."
+    misnamed = "Design report 10.41\u202fAM.pdf"
+    at = app(upload="1")
+    at.selectbox(key="new-org").select_index(1).run()
+    at.selectbox(key="new-well").select_index(0).run()
+    assert not at.error
+    at.file_uploader(key="new-pdf").upload(misnamed, PDF, "application/pdf").run()
+    start = next(b for b in at.button if b.label == "Start the run")
+    assert texts(at.error) == [message] and at.checkbox(key="new-confirm").disabled and start.disabled
+    with pytest.raises(AppTestError):                                    # no one can press it
+        start.click()
+    assert TS.ids([message]) == [] and not any(word in message for word in (
+        misnamed, W.marked(misnamed), "source-name", "label", "INTAKE_INVALID", "Try again"))
+    no_id_or_code(at, *{name for pair in LIVE for name in pair}, misnamed)              # every name the page lists
+    assert not popen and not (env / "intake").exists()
+    at.file_uploader(key="new-pdf").upload("Design report 10.41 AM.pdf", PDF, "application/pdf").run()
+    assert not at.error
+    at.checkbox(key="new-confirm").check().run()
+    next(b for b in at.button if b.label == "Start the run").click().run()
+    (args, _), = popen
+    run_id = next(a.split("=", 1)[1] for a in args if a.startswith("--run-id="))
+    assert "--source-name=Design report 10.41 AM.pdf" in args
+    assert LocalRunStore(env).intake_labels(run_id)["source-name"] == "Design report 10.41 AM.pdf"
+
+
+def test_the_message_says_which_name_it_is_the_organisation_the_well_or_both_and_a_typed_well_too(env, monkeypatch):
+    """The message names what holds the character: the organisation, the well, or both; a well typed for lab-check is
+    checked as a listed one is, and a printable one typed after it starts its run."""
+    lists(monkeypatch, prd=[("Org\u00a0Alpha", "Well\t1"), ("Org\u00a0Alpha", "Well 2"), ("Org Alpha", "Well 3")])
+    at = app(upload="1")
+    at.selectbox(key="new-org").set_value("Org\u00a0Alpha").run()
+    assert texts(at.error) == [NO_RUN["organisation"]]
+    at.selectbox(key="new-well").set_value("Well\t1").run()
+    assert texts(at.error) == [NO_RUN["both"]]
+    at.selectbox(key="new-well").set_value("Well 2").run()
+    assert texts(at.error) == [NO_RUN["organisation"]]
+    at.get("button_group")[0].set_value("Test wells").run()
+    at.selectbox(key="new-org").set_value("lab-check").run()
+    at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
+    at.text_input(key="new-typed").input("Lab\u200bWell").run()
+    assert texts(at.error) == [NO_RUN["well"]] and at.checkbox(key="new-confirm").disabled
+    at.text_input(key="new-typed").input("Lab Well").run()
+    assert not at.error and not at.checkbox(key="new-confirm").disabled
+
+
+def test_the_form_shows_each_sign_and_one_line_says_what_each_means(env, monkeypatch):
+    """The form: every name marked as the screens after it mark it, and one line for the signs shown."""
+    lists(monkeypatch, prd=[("Org Alpha ", "W 1"), ("Org Alpha\u00a0", "W 1"), ("Org Alpha\t", "W 1"),
+                            ("Org\u2002Alpha", "W 1"), ("Org Alpha\u200b", "W 1"), ("Plain Org", "W 1"),
+                            ("Plain Org", "W\u2002\u2002"), ("Plain Org", "W\u3000\u2002")])
+    at = app(upload="1")
+    assert at.selectbox(key="new-org").options == ["Org Alpha→", "Org Alpha␣", "Org Alpha°", "Org Alpha¦", "Org▫Alpha",
+                                                   "Plain Org"]                    # in code-point order
+    line = (f"{NEAR} ␣ marks a space that would not show, ° a no-break space, → a tab, ▫ another kind of space and ¦ a "
+            "character with no width.")
+    assert line in texts(at.caption)
+    at.selectbox(key="new-org").set_value("Plain Org").run()
+    assert at.selectbox(key="new-well").options == ["W 1", "W▫▫ (en space, en space)", "W▫▫ (ideographic space, en space)"]
+    assert [c for c in texts(at.caption) if "marks" in c] == [line]     # one line for both lists
+    lists(monkeypatch, prd=[("Plain Org", "W 1"), ("Plain Org", "W\u2002")])
+    at = app(upload="1")
+    at.selectbox(key="new-org").set_value("Plain Org").run()
+    assert at.selectbox(key="new-well").options == ["W 1", "W▫"]
+    assert "▫ marks another kind of space." in texts(at.caption)          # no two names alike: the sign alone
+
+
+def test_test_wells_add_lab_check_with_a_typed_well_and_the_upload_carries_dev(env, popen):
+    at = app(upload="1")
+    at.get("button_group")[0].set_value("Test wells").run()
+    assert at.selectbox(key="new-org").options == ["lab-check", "Test Org"]
+    at.selectbox(key="new-org").set_value("lab-check").run()
+    assert not [s for s in at.selectbox if s.key == "new-well"]
+    at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
+    at.text_input(key="new-typed").input("   ").run()
+    assert at.checkbox(key="new-confirm").disabled                      # nothing typed but spaces: no well
+    at.text_input(key="new-typed").input(" Lab  Well 7 ").run()
+    at.checkbox(key="new-confirm").check().run()
+    next(b for b in at.button if b.label == "Start the run").click().run()
+    (args, _), = popen
+    run_id = next(a.split("=", 1)[1] for a in args if a.startswith("--run-id="))
+    assert "--org=lab-check" in args and "--well= Lab  Well 7 " in args             # exactly as typed
+    assert LocalRunStore(env).intake_labels(run_id) == {
+        "organization-id": "lab-check", "well-id": " Lab  Well 7 ", "source-name": "Upload name.pdf", "sha256": PDF_SHA,
+        "environment": "dev"}
+
+
+def test_the_switch_forgets_the_choice_made_on_the_other_list(env):
+    at = app(upload="1")
+    at.selectbox(key="new-org").select_index(1).run()
+    at.selectbox(key="new-well").select_index(0).run()
+    at.get("button_group")[0].set_value("Test wells").run()
+    assert at.selectbox(key="new-org").value is None and at.selectbox(key="new-well").disabled
+
+
+@pytest.mark.parametrize("shown,environment", [("Live wells", "prd"), ("Test wells", "dev")])
+def test_the_upload_records_its_environment_where_the_store_and_the_writer_read_it(env, popen, shown, environment):
+    at = app(upload="1")
+    at.get("button_group")[0].set_value(shown).run()
+    org, well = ("Org Alpha", "Well  #1") if environment == "prd" else ("Test Org", "T 1")
+    at.selectbox(key="new-org").set_value(org).run()
+    at.selectbox(key="new-well").set_value(well).run()
+    at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
+    at.checkbox(key="new-confirm").check().run()
+    next(b for b in at.button if b.label == "Start the run").click().run()
+    (args, _), = popen
+    run_id = next(a.split("=", 1)[1] for a in args if a.startswith("--run-id="))
+    meta = json.loads((env / "intake" / f".{run_id}.pdf.metadata.json").read_text())
+    assert meta == intake.labels(org, well, "Upload name.pdf", PDF_SHA, environment)
+    assert decode_labels(meta) == {"organization-id": org, "well-id": well, "source-name": "Upload name.pdf",
+                                   "sha256": PDF_SHA}
+    assert (env / "intake" / f"{run_id}.pdf").read_bytes() == PDF                # where the writer reads its labels
+    assert LocalRunStore(env).intake_labels(run_id)["environment"] == environment
+    assert optional_labels(C.LocalObjects(env).head(C.pdf_key(run_id))) == {"environment": environment}
 
 
 def test_submit_needs_a_pdf_and_the_confirmation(env, popen):
@@ -236,25 +696,34 @@ def test_a_running_duplicate_is_warned_about_but_allowed(env, popen):
     at.selectbox(key="new-org").select_index(1).run()
     at.selectbox(key="new-well").select_index(0).run()
     at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
-    assert any(RUN in w and "still running" in w for w in texts(at.warning))
+    assert ("A run of this PDF for this organisation and well is still running, started 2099-01-01 00:00:00 UTC. You "
+            "can start another.") in texts(at.warning)
+    no_id_or_code(at, "Org Alpha", "org alpha", "Beta Org", "Well  #1", "well #2", "Upload name.pdf")
     at.checkbox(key="new-confirm").check().run()
     assert not next(b for b in at.button if b.label == "Start the run").disabled
 
 
-@pytest.mark.parametrize("snapshot,message", [
-    (None, f"Set {WELL_LIST_ENV}"),
-    ('"organization_id","well_id"\n', "a header and no wells"),
-    ('"organization_id","site"\n', "no well_id column"),
+@pytest.mark.parametrize("labelled,shown,warned", [
+    (None, "Live wells", True), (None, "Test wells", False),          # no label: Org Alpha writes to prd, as before
+    ("prd", "Live wells", True), ("prd", "Test wells", False),
+    ("dev", "Live wells", False), ("dev", "Test wells", True),
 ])
-def test_form_is_disabled_without_a_usable_well_list(env, monkeypatch, snapshot, message):
-    if snapshot is None:
-        monkeypatch.delenv(WELL_LIST_ENV)
-    else:
-        Path(os.environ[WELL_LIST_ENV]).write_text(snapshot)
+def test_a_running_duplicate_is_one_in_the_uploads_environment_only(env, popen, monkeypatch, labelled, shown, warned):
+    """A run writes where its upload's environment label says (`R.environment_for`): only a run of the same PDF,
+    organisation and well writing to the same place is a duplicate."""
+    lists(monkeypatch, dev=LIVE)                                     # both lists hold Org Alpha's Well  #1
+    write_run(env, RUN, record(RUN, status="running", deadline_at="2999-01-01T00:00:00Z",
+                               organization_id="Org Alpha", well_id="Well  #1"), {})
+    if labelled:
+        intake.label(env, RUN, PDF, intake.labels("Org Alpha", "Well  #1", "Other name.pdf", PDF_SHA, labelled))
     at = app(upload="1")
-    assert any(message in e for e in texts(at.error))
-    assert at.selectbox(key="new-org").disabled and at.file_uploader(key="new-pdf").disabled
-    app()                                                                   # the viewer keeps working
+    at.get("button_group")[0].set_value(shown).run()
+    at.selectbox(key="new-org").set_value("Org Alpha").run()
+    at.selectbox(key="new-well").set_value("Well  #1").run()
+    at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
+    assert [w for w in texts(at.warning) if "is still running" in w] == (
+        ["A run of this PDF for this organisation and well is still running, started 2099-01-01 00:00:00 UTC. You can "
+         "start another."] if warned else [])
 
 
 # ---- watching a run ----
@@ -290,6 +759,19 @@ def test_launch_failure_shows_the_last_50_lines_of_the_log(env, age, process, re
     assert (len(tail), tail[0], tail[-1]) == (50, "line 11", "line 60")
 
 
+def test_the_watch_page_marks_each_name_as_every_screen_does_and_says_what_the_signs_shown_mean(env):
+    """The watch page: the names marked as the form, the run list and the review mark them, and one line
+    for the signs shown."""
+    launched = run_id()
+    launch_log(env, launched)
+    write_run(env, launched, record(launched, organization_id="Org\u00a0Alpha ", well_id="Well\t1\u200b"), {})
+    at = app(watch=launched)
+    assert any(c.startswith("Organisation Org°Alpha␣ · well Well→1¦ · started ") for c in texts(at.caption))
+    assert "␣ marks a space that would not show, ° a no-break space, → a tab and ¦ a character with no width." \
+           in texts(at.caption)
+    no_id_or_code(at, "Org\u00a0Alpha ", "Well\t1\u200b")
+
+
 def test_a_live_process_without_a_record_is_still_watched(env):
     launched = run_id(intake.STARTUP_S + 30)
     launch_log(env, launched)
@@ -302,9 +784,72 @@ def test_a_live_process_without_a_record_is_still_watched(env):
 def test_run_list_shows_launches_without_a_record(env):
     launched = run_id(intake.STARTUP_S + 5)
     launch_log(env, launched, "boom\n")
-    df = app().dataframe[0].value.set_index("Run id")
+    df = runs(app())
     assert df.loc[launched, "Pipeline"] == "launched, no record"
     assert any("Launch failed" in e for e in texts(app(run=launched).error))   # opening it watches it
+
+
+# ---- no id or code on the run list, the upload page or the watch page ----
+
+def test_the_run_list_names_runs_in_plain_words_and_keeps_the_raw_forms_technical(env):
+    good, failed, running = "20990101T000001Z-0000000a", "20990101T000002Z-0000000b", "20990101T000003Z-0000000c"
+    named = {"source": {"pdf": {"path": f"/nowhere/{PDF_SHA}.pdf", "sha256": PDF_SHA}, "report": None,
+                        "source_name": "Upload name.pdf"}}
+    write_run(env, good, record(good, **named), {})
+    write_run(env, failed, record(failed, status="failed", error={"code": "MODEL_TIMEOUT", "stage": "extract",
+                                                                    "message": "x", "details": {}}, **named), {})
+    write_run(env, running, record(running, status="running", deadline_at="2999-01-01T00:00:00Z", **named), {})
+    launched = run_id(5)
+    launch_log(env, launched)
+    at = app()
+    df = runs(at)
+    assert list(df.columns) == ["Open", "Organisation", "Well", "Document", "Started (UTC)", "Pipeline",
+                                "Document review", "Latest", "Cost"]
+    assert df.loc[[good, failed], "Cost"].tolist() == ["$0.50", "$0.50"] and df.loc[launched, "Cost"] == ""
+    assert df.loc[[good, failed, running, launched], "Pipeline"].tolist() == ["completed", "failed", "running",
+                                                                             "launched, no record"]
+    assert df.loc[good, ["Open", "Organisation", "Well", "Document", "Started (UTC)"]].tolist() == [
+        "Open", "org-test", "well-a", "Upload name.pdf", "2099-01-01 00:00:01"]
+    raw = at.dataframe[1].value.set_index("Run id")
+    assert (raw.loc[failed, "Error"], raw.loc[failed, "Pipeline, raw"]) == ("MODEL_TIMEOUT at extract",
+                                                                            "failed at extract")
+    assert raw.loc[good, "Family"].startswith("F4 (")
+    no_id_or_code(at, "org-test", "well-a", "Upload name.pdf")
+    assert at.session_state["runs-shown"] == list(raw.index)             # Open's row is a run id, in this order
+
+
+def test_the_upload_page_on_either_list_and_the_watch_page_in_each_state_show_no_id_or_code(env, popen):
+    names = ("Org Alpha", "org alpha", "Beta Org", "Well  #1", "well #2", "Test Org", "T 1", "T 2", "lab-check",
+             "Upload name.pdf", "org-test", "well-a")
+    at = app(upload="1")
+    no_id_or_code(at, *names)
+    at.get("button_group")[0].set_value("Test wells").run()
+    no_id_or_code(at, *names)
+    at.get("button_group")[0].set_value("Live wells").run()
+    at.selectbox(key="new-org").select_index(1).run()
+    at.selectbox(key="new-well").select_index(0).run()
+    at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
+    at.checkbox(key="new-confirm").check().run()
+    no_id_or_code(at, *names)
+    next(b for b in at.button if b.label == "Start the run").click().run()
+    launched = next(a.split("=", 1)[1] for a in popen[0][0] if a.startswith("--run-id="))
+    assert any("Starting" in i for i in texts(at.info))                  # watching it, by its names
+    assert "Upload name.pdf" in texts(at.subheader) and launched not in " ".join(TS.screen(at))
+    no_id_or_code(at, *names)
+    source = {"pdf": {"path": f"/nowhere/{PDF_SHA}.pdf", "sha256": PDF_SHA}, "report": None,
+              "source_name": "Upload name.pdf"}
+    (env / "runs" / launched).mkdir()
+    for rec in (record(launched, status="running", deadline_at="2999-01-01T00:00:00Z", ended_at=None, source=source),
+                record(launched, source=source)):
+        (env / "runs" / launched / "run.json").write_text(json.dumps(rec))
+        at = app(watch=launched)
+        no_id_or_code(at, *names)
+    assert "Pipeline: completed" in " ".join(texts(at.markdown)) and launched in technical(at)
+    late = run_id(intake.STARTUP_S + 5)
+    launch_log(env, late, "Traceback: ExtractionError INTAKE_INVALID\n")
+    at = app(watch=late)
+    assert any("Launch failed" in e for e in texts(at.error)) and "INTAKE_INVALID" in technical(at)
+    no_id_or_code(at)
 
 
 # ---- charts: one chart per curve, a series per frequency ----

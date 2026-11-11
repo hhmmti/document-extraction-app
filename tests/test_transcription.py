@@ -168,7 +168,7 @@ def test_a_transcription_is_reviewed_against_its_original_scan_and_written_as_on
     scan, typed = made
     at = app(run=RUN_ID)
     md = " ".join(texts(at.markdown))
-    assert "**typed from a scan**" in md and f"**{ORG}**" in md
+    assert "**typed from a scan**" in md and ORG in texts(at.markdown)       # the name, not in emphasis
     assert ("This document is a transcription typed by Claude from the scan's page images. Check every value against "
             "the original scan beside the review. Readings marked unsure: page 2.") in texts(at.warning)
     assert NAME in texts(at.caption)                                        # the original's name
@@ -195,7 +195,7 @@ def test_a_transcription_is_reviewed_against_its_original_scan_and_written_as_on
     assert "Document: Design scan.pdf, typed from the scan, design dated 2025-06-01." in texts(at.caption)
     plain_words(at)
     at.button(key=f"write-go-{RUN_ID}").click().run()
-    assert texts(at.success)[0].startswith("**Written to production**")
+    assert texts(at.success)[0].startswith("**Written to Live wells**")
     plain_words(at)
     assert any("typed from the scan" in c for c in texts(at.caption))      # the confirmed view
     # the request, the version, the row and the design record

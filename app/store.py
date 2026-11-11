@@ -3,7 +3,8 @@
 `LocalRunStore` reads a directory: a run lives in `<root>/runs/<run_id>/`, in the layout
 `extraction/run.py` writes (see the README).  It opens no path recorded in `run.json` or
 `source.json`: the source PDF is found by its SHA-256 only, first as `<root>/intake/<sha256>.pdf`,
-then by hashing the PDFs under the directories ESP_SOURCE_PDF_DIRS names (path-separated).
+then by hashing the PDFs under the directories ESP_SOURCE_PDF_DIRS names (path-separated).  An upload's
+labels are the metadata kept beside `<root>/intake/<run_id>.pdf` (app.intake.label).
 
 `S3RunStore` reads the bucket the Lambda writes, in the same layout: runs under ESP_RUNS_PREFIX, and
 uploads under ESP_INTAKE_PREFIX, each naming a run that may have no record yet.  Whether a file
@@ -11,8 +12,8 @@ exists comes from the listing, never from a failed read.  The source PDF is read
 `source.json` records, only under the intake prefix, and only when its SHA-256 matches.
 
 Both also read confirmed entries, in extraction/confirmation.py's layout (their store root, or the bucket's
-esp-design-extraction/): `current_entry`, `current_entries`, `latest_version` and `result`.  Rows and versions
-never change, so each is read once and kept; listings and results are read each time.
+esp-design-extraction/): `current_entry`, `current_entries`, `latest_version` and `result`, each within one
+environment.  Rows and versions never change, so each is read once and kept; listings and results are read each time.
 """
 
 from __future__ import annotations
@@ -106,23 +107,26 @@ class RunStore(ABC):
         """The well's current row, its ids exactly as given; None when it has none."""
         return self.current_entries(environment).get((organization_id, well_id))
 
-    def latest_version(self, document_sha256: str, organization_id: str, well_id: str,
+    def latest_version(self, document_sha256: str, organization_id: str, well_id: str, environment: str,
                        run_id: str | None = None) -> dict | None:
-        """The document's latest version for this well whose row exists: a version without one never committed.
-        With `run_id`, the latest of that run's: whether the run is confirmed."""
+        """The document's latest version for this well written to `environment` whose row exists: a version without
+        one never committed.  With `run_id`, the latest of that run's: whether the run is confirmed there."""
+        if environment not in C.ENVIRONMENTS:
+            raise ValueError(f"not an environment: {environment!r}")
         if not SHA256.fullmatch(str(document_sha256 or "")):
             return None
         versions = [self._kept(key) for key in self.objects.keys(f"{C.record_prefix(document_sha256)}versions/")]
-        rows = {}
+        rows = None
         for version in sorted(versions, key=C.latest, reverse=True):
+            if version.get("environment") != environment:
+                continue
             if (version["labels"]["organization_id"], version["labels"]["well_id"]) != (organization_id, well_id):
                 continue
             if run_id is not None and (version.get("run") or {}).get("run_id") != run_id:
                 continue
-            prefix = C.row_prefix(version["environment"])
-            if prefix not in rows:
-                rows[prefix] = set(self.objects.keys(prefix))
-            if version["row_key"] in rows[prefix]:
+            if rows is None:
+                rows = set(self.objects.keys(C.row_prefix(environment)))
+            if version["row_key"] in rows:
                 return version
         return None
 
@@ -173,6 +177,14 @@ class LocalRunStore(RunStore):
 
     def launch_log(self, run_id: str) -> bytes:
         return (self.root / "launch" / f"{_plain(run_id)}.log").read_bytes()
+
+    def intake_labels(self, run_id: str) -> dict | None:
+        """The labels kept beside `intake/<run_id>.pdf` (app.intake.label), read as S3RunStore reads an upload's."""
+        try:
+            meta = self.objects.head(C.pdf_key(_plain(run_id)))
+            return None if meta is None else {**decode_labels(meta), **optional_labels(meta)}
+        except Exception:  # noqa: BLE001 - none, unreadable or refused labels: nothing to show or compare
+            return None
 
     def source_pdf(self, sha256: str, location: str | None = None) -> bytes | None:
         if not SHA256.fullmatch(str(sha256 or "")):            # `location` is never opened

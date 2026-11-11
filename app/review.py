@@ -67,7 +67,7 @@ from extraction.well_entries_schema import VALUE_TYPE
 from extraction.well_entry import (ENTERED_BY_HAND, KEYS, MANUAL, NOT_FROM_THE_DOCUMENT, SOURCE, UNITS, FinalSections,
                                    envelope_problem, final_string_checks, order_check, section_incomplete)
 
-LAB_CHECK = "lab-check"                    # the lab's own organisation: dev, every other one prd (`environment_for`)
+LAB_CHECK = "lab-check"                    # the lab's own organisation: unlabelled, dev (`environment_for`)
 AUTOMATIC = "Started automatically by an upload in the product"     # a run whose upload's origin is product-upload
 OFFLINE_ENV = "ESP_CONFIRM_OFFLINE_AS"     # local mode: write into the local store under this name, writer in process
 WAIT_S = 180                               # the CLI's --wait
@@ -947,16 +947,17 @@ def automatic(labels) -> bool:
 
 
 def environment_for(organization_id, labels=None) -> str:
-    """Where the entry goes.  A run started by an upload in the product: its upload's environment label.  Every other
-    run: dev for lab-check, prd for every other organisation."""
-    if automatic(labels) and labels.get("environment") in C.ENVIRONMENTS:
-        return labels["environment"]
+    """Where the entry goes: the upload's environment label (the store's `intake_labels`) when it carries a valid one,
+    the form's or the product's.  A run without one: dev for lab-check, prd for every other organisation."""
+    environment = (labels or {}).get("environment")
+    if environment in C.ENVIRONMENTS:
+        return environment
     return "dev" if organization_id == LAB_CHECK else "prd"
 
 
 def environment_problem(organization_id, environment) -> str | None:
     if organization_id == LAB_CHECK and environment != "dev":
-        return f"{LAB_CHECK} writes to test only, never to {place(environment)}."
+        return f"{LAB_CHECK} writes to {place('dev')} only, never to {place(environment)}."
     return None
 
 
@@ -975,7 +976,7 @@ def confirmer(mode, environ, store_root=None, caller=None) -> tuple[str | None, 
     if root == CLI.LAB or CLI.LAB in root.parents:
         return None, ("Write is off: this copy of the app keeps its runs inside its own code folder, where client "
                       "documents must not be written.")
-    return name, "Offline: Write saves on this computer only, and nothing reaches production or test."
+    return name, f"Offline: Write saves on this computer only, and nothing reaches {place('prd')} or {place('dev')}."
 
 
 def design_dates(objects, run_id, current, *, by_hand=False) -> dict:
@@ -1108,11 +1109,26 @@ def failure_words(run) -> str:
     return f"Nothing was read from this document, so there is nothing to review.{retry} {OFFER}"
 
 
+def failed_words(run, *, entry_stored) -> str:
+    """What happened to a failed run that offers no entry by hand, for the last screen of watching it: it stopped
+    without finishing, it stopped after reading (its entry is there to review), or nothing was read; for a model
+    timeout or a model error, that uploading again retries."""
+    error = run.get("error") if isinstance(run.get("error"), dict) else {}
+    if run_status(run)[1]:
+        return ("The run stopped without finishing: it was still recorded as running when its time ran out. Uploading "
+                "the document again retries it.")
+    if entry_stored:
+        return "The run stopped part-way, after reading the document. Open the run to review the values it read."
+    retry = ("Uploading the document again retries the extraction." if error.get("code") in RETRY else
+             "Whoever runs the app can see why in the technical details.")
+    return f"Nothing was read from this document. {retry}"
+
+
 # ---- the engineer's words: places, kinds of report, notes, refusals, confirmations ----
 # No rule id, key, position, run or confirmation id, object key or hash goes on an engineer's screen; the record
 # keeps all of them.
 
-PLACES = {"prd": "production", "dev": "test"}
+PLACES = {"prd": "Live wells", "dev": "Test wells"}    # as the upload form's switch names them
 VENDORS = {"F1": "SpyGlass", "F2": "ChampionX", "F3": "SLB", "F4": "Endurance (ELS)", "F5": "Baker Hughes ProLift",
            "F6": "XSize", "F7": "Valiant"}      # extraction/stage/stage.py's family codes, as extraction/assemble.py names them
 SOURCE_WORDS = {SOURCE: "the design document", "ops_entered": "outside the document, entered by operations"}
@@ -1138,7 +1154,8 @@ ID_LIKE = re.compile(r"\d{8}T\d{6}Z|[0-9a-f]{16,}", re.I)
 
 
 def place(environment) -> str:
-    """Where a write goes, as the engineer says it: production (prd) or test (dev)."""
+    """Where a write goes, as the engineer says it and the upload form's switch shows it: Live wells (prd) or Test
+    wells (dev)."""
     return PLACES.get(environment, "an unknown place")
 
 
@@ -1270,7 +1287,7 @@ REFUSALS = (
      r"|changed from the proposal but not marked manually corrected: .*|pump string: its final value is not its final "
      r"sections|design_document_ref is the writer's to set.*|row: .*|.* is not .*confirmations/<id>/request\.json",
      lambda m: APP_FAULT),
-    (re.escape(LAB_CHECK) + r" writes to test only.*", lambda m: m[0]),
+    (re.escape(LAB_CHECK) + r" writes to " + re.escape(PLACES["dev"]) + r" only.*", lambda m: m[0]),
     (r"runs/[^/]+/run\.json is not there.*", lambda m: f"This run's own record is missing, so it cannot be written. {FILES}"),
     (r"runs/[^/]+/run\.json says .*: the run has not ended.*",
      lambda m: "This run has not ended yet, so it cannot be entered by hand. Reopen it once it has ended."),
@@ -1287,8 +1304,8 @@ REFUSALS = (
     (r"intake/[^/]+\.pdf is not the document.*", lambda m: "The PDF kept for this run is not the document it read. "
                                                             "Ask whoever runs the app to put the right PDF back."),
     (r"environment is '(\w+)'; the upload's is '(\w+)'",
-     lambda m: f"This document was uploaded to the product's {place(m[2])} system, so its entry can be written to "
-               f"{place(m[2])} only, not to {place(m[1])}. Report it to whoever runs the app."),
+     lambda m: f"This document's upload is for {place(m[2])}, so its entry can be written to {place(m[2])} only, not "
+               f"to {place(m[1])}. Report it to whoever runs the app."),
     (r"(organization_id|well_id) is (.+); the run's is (.+)",
      lambda m: f"The {'organisation' if m[1] == 'organization_id' else 'well'} is {m[2]} here but {m[3]} in the run. "
                "Reopen the run and try again."),

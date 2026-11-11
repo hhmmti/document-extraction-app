@@ -24,23 +24,25 @@ export ESP_APP_MODE=s3
 export ESP_BUCKET=roam-ds-assets
 export ESP_INTAKE_PREFIX=esp-design-extraction/intake/
 export ESP_RUNS_PREFIX=esp-design-extraction/runs/
-export ESP_WELL_LIST_PATH="<well list CSV>"
+# optional, the defaults: where Athena puts the well lists' query results (the location the Athena console uses in
+# this account), and its workgroup
+export ESP_ATHENA_OUTPUT_LOCATION=s3://aws-athena-query-results-640168431387-us-east-1/ ESP_ATHENA_WORKGROUP=primary
 AWS_PROFILE=roam-ai PYTHONDONTWRITEBYTECODE=1 .venv/bin/streamlit run app/main.py
 ```
 
-`roam-ai` is an SSO profile for the datascience account, role `RoamDataScientist`, region `us-east-1`. If the app says S3 could not be read, log in again and check the variables. The well list is a CSV (`organization_id`, `well_id`) exported from Athena, `roam_prd_ddb.default.esp_well_configuration_v2`, and kept outside the repository. To refresh it, export it again; the form shows its row count, date and hash.
+`roam-ai` is an SSO profile for the datascience account, role `RoamDataScientist`, region `us-east-1`. If the app says the runs could not be read, log in again and check the variables; the page's technical section has the error. The form's wells are the product's live well lists, read from Athena when the form opens: **Live wells** from `roam_prd_ddb.default.esp_well_configuration_v2` (production) and **Test wells** from `roam_dev_ddb.default.esp_well_configuration_v2` (test), one query each, with its results under `ESP_ATHENA_OUTPUT_LOCATION` in the workgroup `ESP_ATHENA_WORKGROUP`. A list is kept until **Refresh** beside it; the form says when it was read. If a list cannot be read, the form stays off and says so, with **Retry**; its technical section has the error. Nothing falls back to a CSV.
 
-**New run from a PDF:** choose the organisation, then the well (filtered by organisation), add the PDF, tick *I understand this starts a paid model call* and press **Start the run**. Organisations that differ only by case are listed apart: pick the exact one. The form warns when the same PDF, organisation and well is already queued or running. The app puts the PDF at `intake/<run_id>.pdf` with its labels, the upload starts the function, and the app follows the run:
+**New run from a PDF:** choose **Live wells** (the default) or **Test wells**, then the organisation, then the well (filtered by organisation), add the PDF, tick *I understand this starts a paid model call* and press **Start the run**. Test wells also offer `lab-check`, whose well you type: any name, sent exactly as typed. Names are listed exactly as the product holds them, each character that would not show marked by its sign: ␣ a space at an edge or in a run of two or more, ° a no-break space, → a tab, ▫ another kind of space, ¦ a character with no width. A line says what the signs shown mean, and whether two names differ only by case or by such characters; no two names of a list show alike, so pick the exact one. A name with °, → or ▫, or with ¦ for a zero-width space or joiner, starts no run: the upload's labels take printable characters only, so as soon as such a name is chosen the form says no run can start for it yet, and **Start the run** stays off. The PDF's file name is checked the same way once it is added: if it holds such a character, the form says to rename the file and add it again, and Start stays off. The form warns when the same PDF, organisation and well is already queued or running from the same list: a Test wells run is no duplicate of a Live wells upload, nor the other way. The app puts the PDF at `intake/<run_id>.pdf` with its labels, `environment` among them (`prd` for live wells, `dev` for test wells, so the run and its confirmation go there), the upload starts the function, and the app follows the run:
 
 - **queued**: uploaded, no `run.json` yet. One run at a time (reserved concurrency 1), so a second upload waits here. The first run after a deploy waits about 40 s here for the cold start.
 - **running**: `run.json` says `running`; elapsed time shows against `deadline_at`, about 15 minutes after the start. The record names no stage until the end; CloudWatch has one line per stage.
-- **final**: **Pipeline: completed**, or **failed at** the stage that failed, with the error code and message. **Document review** is separate: a completed run can still need review. **Open the run** shows everything stored.
+- **final**: **Pipeline: completed**, or **failed**, with what happened in plain words: a scan's own message, or **Enter by hand** when the run can be entered by hand (its page's flow). The stage, the error code and the message are under **Run record (technical)**. **Document review** is separate: a completed run can still need review. **Open the run** shows everything stored.
 
 ## Where failures show
 
 Nothing alerts anyone. Look in four places:
 
-1. **The app:** the run list's *Pipeline* and *Error* columns, and the run page.
+1. **The app:** the run list's *Pipeline* column, with each run's id, stage and error code under *Run ids and codes (technical)*; the watch page's technical section; and the run page.
 2. **`runs/<run_id>/run.json`:** `status`, and `error` with `code`, `message`, `details` and `stage`. It is created as `running` and rewritten last.
 3. **The run-log row:** `pipeline_execution_id` is the run id; `status` goes `RUNNING` → `SUCCEEDED` or `FAILED`; on failure `data_json` holds `error_code`, `stage`, `message` and `stack_trace`. The row is under organisation `_unknown` when its label was not read or does not decode, and has `ADHOC#<request id>` as its id when the key holds no run id. The app reads S3 only, never this table.
 4. **CloudWatch:** one JSON line per stage with `run_id` and `stage`, the trace of an `INTERNAL_ERROR`, and Lambda's own lines, including its timeout.
@@ -69,7 +71,7 @@ aws logs tail /aws/lambda/esp-design-extraction --since 1h --profile roam-ai
 | `STORE_FAILED` | A write under `runs/` failed; `store.failed_at` names the file. If `run.json` could not even be created, only the run-log row and CloudWatch show it, and the app shows *not picked up* | Data science |
 | `INTAKE_INVALID` | The key is not `intake/<run_id>.pdf`, a label is missing or does not decode, or the PDF's SHA-256 is not its label's. The app checks labels before uploading, so this points to an upload made outside it | Upload again through the app |
 | `INTERNAL_ERROR` | Anything unexpected; the trace is in CloudWatch | Data science, with the trace |
-| *not picked up* | Queued over 5 minutes while no run is running | Look for the run id in the run log and CloudWatch. A `FAILED` row says why the function could not start the run; neither means the function was not invoked: tell data science |
+| *not picked up* | Queued over 5 minutes while no run is running | Look for the run id (the watch page's technical section names it) in the run log and CloudWatch. A `FAILED` row says why the function could not start the run; neither means the function was not invoked: tell data science |
 | *expired* | Queued over 6 hours, Lambda's limit for a waiting event. It will not run | Upload again |
 | *failed (stale)* | `running` past `deadline_at`: stopped at the 15-minute timeout, or the last `run.json` could not be written. The run-log row stays `RUNNING` | Read CloudWatch; upload again; data science if it repeats |
 

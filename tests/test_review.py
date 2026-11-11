@@ -26,7 +26,7 @@ import extraction.confirmation as C
 import lambda_function as L
 import test_app_s3 as TA
 import test_lambda as TL
-from extraction.intake import encode_labels
+from extraction.intake import decode_labels, encode_labels
 from extraction.well_entry import KEYS
 from test_confirm import BLOCKED, CATALOGUE, ORG, PDF, RUN_ID, SHA, WELL, entry, put_run, run_record
 from test_screens import exempt, screen, unplain
@@ -265,7 +265,7 @@ def confirmed_first(store) -> tuple[dict, dict]:
     R.batch(review, e, "not found", set(NOT_FOUND), at=AT)
     out = write(store, review, e)
     assert out["status"] == C.WRITTEN
-    return out, S.LocalRunStore(store.root).latest_version(SHA, ORG, WELL)
+    return out, S.LocalRunStore(store.root).latest_version(SHA, ORG, WELL, "prd")
 
 
 def test_a_rerun_with_unchanged_proposals_carries_every_decision(store):
@@ -314,6 +314,17 @@ def test_a_settlement_without_a_reason_is_not_carried_onto_a_value_that_now_bloc
 
 # ---- the environment, who, the older-design warning, the outcome ----
 
+def test_a_current_entry_with_no_design_date_is_said_to_have_none(offline):
+    cid = "20261030T000000Z-00000001"
+    offline.put(C.row_key("prd", cid), C.row_bytes({"organization_id": ORG, "well_id": WELL, "design_date": None,
+                                                    "confirmation_id": cid, "confirmed_at": "2026-10-30T00:00:00.000000"}))
+    at = app(run=RUN_ID)
+    assert ("The well's current entry in Live wells has no design date; this document is dated 2025-06-01: can't "
+            "compare.") in texts(at.caption)
+    assert not [c for c in texts(at.caption) if "dated nothing" in c]
+    plain_words(at)
+
+
 def test_lab_check_writes_to_dev_and_is_refused_in_prd_in_code(tmp_path):
     assert [R.environment_for(o) for o in (R.LAB_CHECK, "org-1", "Lab-Check")] == ["dev", "prd", "prd"]
     objects = C.LocalObjects(tmp_path / "store")
@@ -324,7 +335,7 @@ def test_lab_check_writes_to_dev_and_is_refused_in_prd_in_code(tmp_path):
     for key in [*keys_of(review, e, "found"), *keys_of(review, e, "not found")]:
         R.settle(review, e, key, at=AT)
     out = write(objects, review, e, lab, environment="prd")
-    assert (out["status"], out["reasons"]) == ("not sent", ["lab-check writes to test only, never to production."])
+    assert (out["status"], out["reasons"]) == ("not sent", ["lab-check writes to Test wells only, never to Live wells."])
     assert objects.keys(f"{C.ROOT}confirmations/") == []
     assert R.environment_problem(R.LAB_CHECK, "dev") is None and R.environment_problem("org-1", "prd") is None
     out = write(objects, review, e, lab, environment="dev")
@@ -339,7 +350,7 @@ def test_who_confirms(tmp_path):
                                                           "reload the page.")
     assert R.confirmer("local", {}, tmp_path) == (None, "This copy of the app only reviews: Write is off.")
     assert R.confirmer("local", {R.OFFLINE_ENV: "tester"}, tmp_path) == (
-        "tester", "Offline: Write saves on this computer only, and nothing reaches production or test.")
+        "tester", "Offline: Write saves on this computer only, and nothing reaches Live wells or Test wells.")
     assert R.confirmer("local", {R.OFFLINE_ENV: "tester"}, R.CLI.LAB / "store")[0] is None
 
 
@@ -470,18 +481,56 @@ def test_a_run_with_an_entry_opens_in_review_with_its_files_behind_run_details(o
     [view] = at.get("button_group")
     assert view.options == ["Review & confirm", "Run details (technical)"] and not at.tabs
     md = " ".join(texts(at.markdown))
-    for shown in (f"**{ORG}**", "**production**", "**Endurance (ELS) report**", "**2025-06-01**", "**tester**",
-                  "#### Found: 3", "#### Not found: 2"):
+    for shown in ("**Live wells**", "**Endurance (ELS) report**", "**2025-06-01**", "**tester**", "#### Found: 3",
+                  "#### Not found: 2"):
         assert shown in md, shown
-    assert "Offline: Write saves on this computer only, and nothing reaches production or test." in texts(at.caption)
+    assert {ORG, "Well\u2423\u2423#1"} <= set(texts(at.markdown))       # the names: marked, not in emphasis
+    assert "Offline: Write saves on this computer only, and nothing reaches Live wells or Test wells." in texts(at.caption)
     assert write_button(at).disabled and "5 values left to check" in texts(at.caption)
-    assert write_button(at).label == "Write to production"
+    assert write_button(at).label == "Write to Live wells"
     plain_words(at)
     at.get("button_group")[0].set_value("Run details (technical)").run()
     assert "The pipeline's own files for this run, exactly as it stored them: for checking the pipeline, not the " \
            "design." in texts(at.caption)
     assert [t.label for t in at.tabs] == ["Summary", "Extracted numbers", "Curves", "Findings", "Signals",
                                           "Notices and models", "Logs", "Report"]
+
+
+def test_a_name_with_an_edge_space_is_marked_on_the_header_and_the_write_pop_up_and_never_in_emphasis(offline):
+    """An edge space broke the names' emphasis, which then showed its asterisks: the header and the Write pop-up show
+    each name as the upload form marks it, ␣ for each space that would not show, and not in emphasis."""
+    org, well = " org-1", "Well  #1 "
+    run, the_entry = run_record(organization_id=org, well_id=well), {**to_check(), "organization_id": org, "well_id": well}
+    put_run(offline, the_entry, run=run)
+    at = app(run=RUN_ID)
+    assert {"\u2423org-1", "Well\u2423\u2423#1\u2423"} <= set(texts(at.markdown))
+    for key in FOUND:
+        at.button(key=f"settle-{RUN_ID}-{key}").click().run()
+    for key in NOT_FOUND:
+        at.button(key=f"empty-{RUN_ID}-{key}").click().run()
+    write_button(at).click().run()
+    assert ("Writes to **Live wells**, organisation \u2423org-1, well Well\u2423\u2423#1\u2423, confirming as "
+            "**tester**.") in texts(at.markdown)
+    assert unplain(at, *exempt(run, the_entry, None, "tester")) == []
+
+
+def test_the_header_and_the_write_pop_up_show_each_sign_and_one_line_says_what_the_signs_shown_mean(offline):
+    """The review: the names marked as the upload form marks them, and under the header and in the Write
+    pop-up one line for the signs shown."""
+    org, well = "org\u00a0-1", "Well\t#1\u200b "
+    run, the_entry = run_record(organization_id=org, well_id=well), {**to_check(), "organization_id": org, "well_id": well}
+    put_run(offline, the_entry, run=run)
+    at = app(run=RUN_ID)
+    line = "␣ marks a space that would not show, ° a no-break space, → a tab and ¦ a character with no width."
+    assert {"org°-1", "Well→#1¦␣"} <= set(texts(at.markdown)) and texts(at.caption).count(line) == 1
+    for key in FOUND:
+        at.button(key=f"settle-{RUN_ID}-{key}").click().run()
+    for key in NOT_FOUND:
+        at.button(key=f"empty-{RUN_ID}-{key}").click().run()
+    write_button(at).click().run()
+    assert "Writes to **Live wells**, organisation org°-1, well Well→#1¦␣, confirming as **tester**." in texts(at.markdown)
+    assert texts(at.caption).count(line) == 2                            # the header's, and the pop-up's
+    assert unplain(at, *exempt(run, the_entry, None, "tester")) == []
 
 
 def test_local_mode_reviews_without_writing(offline, monkeypatch):
@@ -500,12 +549,12 @@ def test_one_by_one_then_write_shows_what_was_written(offline):
         at.button(key=f"empty-{RUN_ID}-{key}").click().run()
     assert not write_button(at).disabled
     write_button(at).click().run()
-    assert at.button(key=f"write-go-{RUN_ID}").label == "Write to production"
+    assert at.button(key=f"write-go-{RUN_ID}").label == "Write to Live wells"
     plain_words(at)
     at.button(key=f"write-go-{RUN_ID}").click().run()
-    assert not at.exception and texts(at.success)[0].startswith("**Written to production**")
+    assert not at.exception and texts(at.success)[0].startswith("**Written to Live wells**")
     assert at.get("button_group")[0].options == ["Confirmed entry", "Run details (technical)"]
-    assert any("Confirmed**: written to **production** by **tester**" in m for m in texts(at.markdown))
+    assert any("Confirmed**: written to **Live wells** by **tester**" in m for m in texts(at.markdown))
     plain_words(at)
     [row] = offline.keys(C.row_prefix("prd"))
     assert json.loads(offline.get(row))["confirmed_by"] == "tester"
@@ -534,7 +583,7 @@ def test_the_batch_pop_ups_write_and_a_pulled_out_value_is_marked(offline):
     at.button(key=f"settle-{RUN_ID}-oil_sg").click().run()
     write_button(at).click().run()
     at.button(key=f"write-go-{RUN_ID}").click().run()
-    assert texts(at.success)[0].startswith("**Written to production**")
+    assert texts(at.success)[0].startswith("**Written to Live wells**")
     plain_words(at, to_check(entry(**BLOCKED)), "the vendor numbers from the top")
     [key] = [k for k in offline.keys(f"{C.ROOT}confirmations/") if k.endswith("request.json")]
     q = C.load(offline.get(key))
@@ -601,7 +650,7 @@ def test_s3_mode_writes_the_request_and_the_writer_lambda_answers(s3_mode):
     at.button(key=f"dlg-go-{RUN_ID}-not found").click().run()
     plain_words(at)
     at.button(key=f"write-go-{RUN_ID}").click().run()
-    assert texts(at.success)[0].startswith("**Written to production**")
+    assert texts(at.success)[0].startswith("**Written to Live wells**")
     plain_words(at)
     [key] = [k for k in fake.objects if k.endswith("/request.json")]
     assert C.load(fake.objects[key])["confirmed_by"] == "analyst-1"
@@ -613,8 +662,8 @@ def test_s3_mode_writes_the_request_and_the_writer_lambda_answers(s3_mode):
 UPLOADER = "engineer-7@example.com"
 PUSHED_FROM = "s3://esp-design-extraction-product-uploads-640168431387/dev/org-1/well-documents/Well  #1/esp_design/" \
               "current.pdf?versionId=v1"
-TO_TEST = ("This document was uploaded to the product's test system, so its entry can be written to test only, not to "
-           "production. Report it to whoever runs the app.")
+TO_TEST = ("This document's upload is for Test wells, so its entry can be written to Test wells only, not to Live "
+           "wells. Report it to whoever runs the app.")
 
 
 def pushed(environment="dev") -> dict:
@@ -623,23 +672,26 @@ def pushed(environment="dev") -> dict:
             "uploaded-by": quote(UPLOADER, safe=""), "pushed-from": quote(PUSHED_FROM, safe="")}
 
 
-def test_a_run_the_product_started_writes_to_its_uploads_environment_and_every_other_run_as_before():
+def test_a_run_writes_to_its_uploads_environment_label_and_an_unlabelled_run_as_before():
     product = {"origin": "product-upload", "environment": "dev"}
+    form = decode_labels(encode_labels(ORG, WELL, "design.pdf", SHA))                 # the form's four, then its label
     assert R.automatic(product) and not R.automatic({"environment": "dev"}) and not R.automatic(None)
     assert [R.environment_for("org-1", product), R.environment_for(R.LAB_CHECK, {**product, "environment": "prd"})] == [
-        "dev", "prd"]
-    for labels in (None, {}, {"environment": "dev"}, {"origin": "product-upload"},
-                   {"origin": "product-upload", "environment": "qa"}, {"origin": "upload-form", "environment": "dev"}):
+        "dev", "prd"]                                                               # a product upload
+    assert [R.environment_for(o, {**form, "environment": e}) for o, e in (("org-1", "dev"), (R.LAB_CHECK, "dev"),
+                                                                          ("org-1", "prd"))] == ["dev", "dev", "prd"]
+    for labels in (None, {}, form, {"origin": "product-upload"}, {"origin": "product-upload", "environment": "qa"},
+                   {**form, "environment": "Dev"}):                                # unlabelled, or not a valid label
         assert [R.environment_for(o, labels) for o in (R.LAB_CHECK, "org-1")] == ["dev", "prd"]
     assert R.environment_problem(R.LAB_CHECK, R.environment_for(R.LAB_CHECK, {**product, "environment": "prd"})) == \
-        "lab-check writes to test only, never to production."                   # still refused in prd
+        "lab-check writes to Test wells only, never to Live wells."                   # still refused in prd
 
 
 def test_the_writers_environment_refusal_in_plain_words():
     assert R.refusal_words("environment is 'prd'; the upload's is 'dev'") == TO_TEST
     assert R.refusal_words("environment is 'dev'; the upload's is 'prd'") == (
-        "This document was uploaded to the product's production system, so its entry can be written to production "
-        "only, not to test. Report it to whoever runs the app.")
+        "This document's upload is for Live wells, so its entry can be written to Live wells only, not to Test "
+        "wells. Report it to whoever runs the app.")
 
 
 def test_s3_mode_says_the_product_started_the_run_writes_to_its_uploads_environment_and_never_names_the_uploader(
@@ -647,15 +699,15 @@ def test_s3_mode_says_the_product_started_the_run_writes_to_its_uploads_environm
     s3_mode.metadata[C.pdf_key(RUN_ID)] = pushed()          # org-1, which writes to prd but for the label
     at = app(run=RUN_ID)
     md = " ".join(texts(at.markdown))
-    assert R.AUTOMATIC in md and "**test**" in md and write_button(at).label == "Write to test"
+    assert R.AUTOMATIC in md and "**Test wells**" in md and write_button(at).label == "Write to Test wells"
     plain_words(at)
     at.button(key=f"batch-{RUN_ID}").click().run()
     at.button(key=f"dlg-go-{RUN_ID}-found").click().run()
     at.button(key=f"dlg-go-{RUN_ID}-not found").click().run()
-    assert at.button(key=f"write-go-{RUN_ID}").label == "Write to test"
+    assert at.button(key=f"write-go-{RUN_ID}").label == "Write to Test wells"
     plain_words(at)
     at.button(key=f"write-go-{RUN_ID}").click().run()
-    assert texts(at.success)[0].startswith("**Written to test**")
+    assert texts(at.success)[0].startswith("**Written to Test wells**")
     plain_words(at)
     assert [k for k in s3_mode.objects if k.startswith(C.row_prefix("dev"))]
     assert not [k for k in s3_mode.objects if k.startswith(C.row_prefix("prd"))]
@@ -665,26 +717,30 @@ def test_s3_mode_says_the_product_started_the_run_writes_to_its_uploads_environm
     assert not [s for s in screen(at) if UPLOADER in s]
 
 
-def test_local_mode_reads_no_upload_labels_and_the_writers_environment_refusal_shows_in_plain_words(offline):
+def test_local_mode_reads_the_upload_labels_as_s3_mode_does_and_the_writer_refuses_another_environment(offline):
     offline.meta(C.pdf_key(RUN_ID)).write_text(json.dumps(pushed()))      # kept as LocalObjects keeps metadata
     at = app(run=RUN_ID)
-    assert R.AUTOMATIC not in " ".join(texts(at.markdown)) and write_button(at).label == "Write to production"
+    assert R.AUTOMATIC in " ".join(texts(at.markdown)) and write_button(at).label == "Write to Test wells"
     for key in FOUND:
         at.button(key=f"settle-{RUN_ID}-{key}").click().run()
     for key in NOT_FOUND:
         at.button(key=f"empty-{RUN_ID}-{key}").click().run()
-    assert write_button(at).disabled and f"Write is off. {TO_TEST}" in texts(at.caption)
+    assert not write_button(at).disabled
     plain_words(at)
-    at.session_state["dialog"] = (RUN_ID, "write")                         # the Write pop-up says it too
-    at.run()
-    assert f"Write is off. {TO_TEST}" in texts(at.warning)
-    plain_words(at)
+    review = at.session_state[f"review-{RUN_ID}"]["review"]
+    out = write(offline, review, to_check(), environment="prd")            # the writer, offline, against the label
+    assert out["status"] == "not sent" and [R.refusal_words(r) for r in out["reasons"]] == [TO_TEST]
     assert offline.keys(f"{C.ROOT}confirmations/") == []
+    write_button(at).click().run()
+    at.button(key=f"write-go-{RUN_ID}").click().run()
+    assert texts(at.success)[0].startswith("**Written to Test wells**")
+    plain_words(at)
+    assert offline.keys(C.row_prefix("dev")) and not offline.keys(C.row_prefix("prd"))
 
 
 @pytest.mark.parametrize("environment", ["prd", "dev"])
 def test_the_gate_keeps_a_lab_check_run_out_of_production_from_the_start_in_s3_mode(s3_mode, environment):
-    """A lab-check run the product pushed from prd: its header says production, and Write is off from the start with
+    """A lab-check run the product pushed from prd: its header says Live wells, and Write is off from the start with
     the lab-check reason, whatever is decided; R.write keeps its own refusal.  From dev: the gate as before."""
     lab, e = run_record(organization_id=R.LAB_CHECK), {**to_check(), "organization_id": R.LAB_CHECK}
     put_run(C.S3Objects(s3_mode), e, run=lab)
@@ -693,7 +749,7 @@ def test_the_gate_keeps_a_lab_check_run_out_of_production_from_the_start_in_s3_m
     at = app(run=RUN_ID)
     md, why = " ".join(texts(at.markdown)), [c for c in texts(at.caption) if c.startswith(("Write is off", "5 values"))]
     assert R.AUTOMATIC in md and f"**{R.place(environment)}**" in md and write_button(at).disabled
-    off = "Write is off. lab-check writes to test only, never to production."
+    off = "Write is off. lab-check writes to Test wells only, never to Live wells."
     assert why == ([off] if environment == "prd" else ["5 values left to check"])       # before any decision
     plain_words(at, e)
     at.button(key=f"batch-{RUN_ID}").click().run()
@@ -706,9 +762,9 @@ def test_the_gate_keeps_a_lab_check_run_out_of_production_from_the_start_in_s3_m
         assert not [k for k in s3_mode.objects if "/confirmations/" in k]               # nothing was sent
         assert R.write(C.S3Objects(s3_mode), at.session_state[f"review-{RUN_ID}"]["review"], e, lab,
                        environment="prd", confirmed_by="analyst-1", catalogue=lambda: CATALOGUE, offline=False)[
-            "reasons"] == ["lab-check writes to test only, never to production."]        # its own refusal, kept
+            "reasons"] == ["lab-check writes to Test wells only, never to Live wells."]        # its own refusal, kept
     else:
         assert not go.disabled
         go.click().run()
-        assert texts(at.success)[0].startswith("**Written to test**")
+        assert texts(at.success)[0].startswith("**Written to Test wells**")
         assert [k for k in s3_mode.objects if k.startswith(C.row_prefix("dev"))]

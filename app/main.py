@@ -1,5 +1,6 @@
-"""Run viewer: every run in the run store, and each run in full; its upload form starts a run, and a run's proposed
-well entry is reviewed and confirmed here.
+"""Run viewer: every run in the run store, and each run in full; its upload form starts a run on a well from the
+product's live well lists (app/wells.py), and a run's proposed well entry is reviewed and confirmed here.  The run list,
+the upload form and the watch page name a run in plain words; ids and codes are under each one's technical section.
 
     ESP_RUN_STORE_DIR=<run store dir> streamlit run app/main.py              # local mode, the default
     ESP_APP_MODE=s3 ESP_BUCKET=… ESP_INTAKE_PREFIX=… ESP_RUNS_PREFIX=… streamlit run app/main.py
@@ -42,9 +43,9 @@ if ROOT not in sys.path:              # `streamlit run` puts only app/ on the pa
 from app import intake  # noqa: E402
 from app import review as R  # noqa: E402
 from app import transcription as T  # noqa: E402
+from app import wells  # noqa: E402
 from app.store import (MODE_ENV, PDF_DIRS_ENV, S3_ENV, STORE_ENV, local_store_from_env, run_status,  # noqa: E402
                        s3_store_from_env)
-from app.wells import WELL_LIST_ENV, SnapshotError, load as load_wells  # noqa: E402
 from extraction import confirmation as C  # noqa: E402
 from extraction.catalogue import CatalogueNames  # noqa: E402
 from extraction.stage.reports_reader import read_report  # noqa: E402
@@ -96,6 +97,17 @@ FINAL = {"launch failed", "succeeded", "failed", "stale", "expired"}
 WAITING = ("queued", "not picked up", "expired")        # S3 mode: an upload with no run record yet
 ORIGIN = "How it started"                              # the run list's column for a run an upload in the product started
 AUTOMATIC_ICON = ":material/cloud_upload:"
+WELL_LISTS = R.PLACES   # the form's switch, in the review's words for where a run writes: never dev or prd
+NEAR = ("The list holds names that differ only by case or by characters that don't show; the exact name you choose is "
+        "sent.")
+TECH = "Details (technical)"                           # a plain screen's technical section, as Run details is
+REFUSED = {"organization-id": "organisation", "well-id": "well"}   # the form's words for a name the labels refuse
+RENAME = "This file's name holds a character the pipeline can't carry: rename the file and add it again."
+# The run list: what it shows, then what its technical section shows (`list_rows`).
+PLAIN_COLUMNS = ("Open", "Organisation", "Well", ORIGIN, "Document", "Started (UTC)", "Pipeline", "Document review",
+                 "Latest", "Cost", "Waited")
+TECH_COLUMNS = ("Run id", "Started (UTC)", "Organisation", "Well", "Family", "Route", "Pipeline, raw", "Error",
+                "Cost (USD)")
 MODE = os.environ.get(MODE_ENV) or "local"
 SECTIONS = ((True, "Whole string", "observation_is_composite = true"),
             (False, "Per section", "observation_is_composite = false"),
@@ -291,24 +303,41 @@ def waiting(store, now) -> dict:
             for r, t in uploads.items()}
 
 
+def run_words(record, now=None) -> str:
+    """The pipeline's status in plain words, for the run list and the watch page: completed, failed, failed (stale),
+    running, or unknown.  Run details' `pipeline` adds the stage a run failed at."""
+    status, stale = run_status(record, now)
+    if stale:
+        return "failed (stale)"
+    return {"succeeded": "completed", "failed": "failed", "running": "running"}.get(
+        status if isinstance(status, str) else "", "unknown")
+
+
+def document(record, labels) -> str:
+    """The document's file name, from the run's record or else its upload's labels; `—` when neither names it plainly."""
+    return text(R.document_name(record or {}) or R.document_name({"source": {"source_name": labels.get("source-name")}}))
+
+
 def list_rows(store) -> pd.DataFrame:
+    """One row per run, newest first: the columns the list shows (PLAIN_COLUMNS) and those its technical section
+    shows (TECH_COLUMNS)."""
     now, latest, rows = datetime.now(timezone.utc), set(), []
     runs = set(store.run_ids())
     queue = waiting(store, now)                                              # S3 mode: uploads with no record
     for run_id in sorted(runs | set(store.launch_ids()), reverse=True):     # newest first
-        row = {"Run id": run_id, "Started (UTC)": started({}, run_id), "Organisation": "—", "Well": "—",
-               "Latest": "", "Family": "—", "Route": "—", "Pipeline": "", "Document review": "—",
-               "Error": "", "Cost (USD)": None}
-        labels = store.intake_labels(run_id) or {}                           # S3 mode: the upload's
+        labels = store.intake_labels(run_id) or {}                           # the upload's, when it kept them
+        row = {"Open": "Open", "Run id": run_id, "Started (UTC)": started({}, run_id),
+               "Organisation": text(labels.get("organization-id")), "Well": text(labels.get("well-id")),
+               "Document": document({}, labels), "Latest": "", "Family": "—", "Route": "—", "Pipeline": "",
+               "Pipeline, raw": "", "Document review": "—", "Error": "", "Cost": "", "Cost (USD)": None}
         if R.automatic(labels):
             row[ORIGIN] = R.AUTOMATIC
         if run_id in queue:
             state, waited = queue[run_id]
-            rows.append({**row, "Organisation": text(labels.get("organization-id")),
-                         "Well": text(labels.get("well-id")), "Pipeline": state, "Waited": wait_text(waited)})
+            rows.append({**row, "Pipeline": state, "Pipeline, raw": state, "Waited": wait_text(waited)})
             continue
         if run_id not in runs:
-            rows.append({**row, "Pipeline": "launched, no record"})
+            rows.append({**row, "Pipeline": "launched, no record", "Pipeline, raw": "launched, no record"})
             continue
         try:
             record = store.record(run_id)
@@ -323,22 +352,26 @@ def list_rows(store) -> pd.DataFrame:
                 "Started (UTC)": started(record, run_id),
                 "Organisation": text(org),
                 "Well": text(well, "no well"),
+                "Document": document(record, labels),
                 "Latest": "latest" if is_latest else "",
                 "Family": family(record),
                 "Route": route_of(record),
-                "Pipeline": run,
+                "Pipeline": run_words(record, now),
+                "Pipeline, raw": run,
                 "Document review": review_line(record),
                 "Error": f"{text(dig(error, 'code'))} at {text(dig(error, 'stage'))}" if isinstance(error, dict) else "",
                 "Cost (USD)": cost if isinstance(cost := dig(record, "cost_usd"), (int, float)) else None,
+                "Cost": f"${cost:.2f}" if isinstance(cost, (int, float)) else "",
             })
         except FileNotFoundError:
-            row["Pipeline"] = "no run.json"
+            row.update({"Pipeline": "no record", "Pipeline, raw": "no run.json"})
         except Exception:  # noqa: BLE001 - an unreadable record still gets its row
-            row["Pipeline"] = "run.json unreadable"
+            row.update({"Pipeline": "record unreadable", "Pipeline, raw": "run.json unreadable"})
         rows.append(row)
     df = pd.DataFrame(rows)
-    if ORIGIN in df:                    # beside the organisation and the well, in view; empty for every other run
-        df.insert(df.columns.get_loc("Well") + 1, ORIGIN, df.pop(ORIGIN).fillna(""))
+    for column in (ORIGIN, "Waited"):   # empty for every run but those an upload in the product started, or waiting
+        if column in df:
+            df[column] = df[column].fillna("")
     return df
 
 
@@ -352,38 +385,53 @@ def show_list(store):
     if df.empty:
         st.info("This run store has no runs yet.")
         return
-    filters = {"Organisation": "org", "Well": "well", "Route": "route", "Pipeline": "status"}
-    picked = {col: box.multiselect(col, sorted(df[col].unique()), key=key, placeholder="All", bind="query-params")
-              for box, (col, key) in zip(st.columns(4), filters.items())}
-    view = df
+    names = ["Organisation", "Well"]
+    shown = df.assign(**{c: df[c].map(wells.labels(df[c])) for c in names})    # marked, and no two alike
+    filters = {"Organisation": "org", "Well": "well", "Pipeline": "status"}
+    picked = {col: box.multiselect(col, sorted(shown[col].unique()), key=key, placeholder="All", bind="query-params")
+              for box, (col, key) in zip(st.columns(3), filters.items())}
+    view = shown
     for col, chosen in picked.items():
         if chosen:
             view = view[view[col].isin(chosen)]
-    st.caption(f"{len(view)} of {len(df)} runs, newest first. Click a run id to open the run.")
-    st.dataframe(view, hide_index=True, key="runs", column_config={
-        "Run id": st.column_config.ButtonColumn(key="open-run", on_click=open_run, type="tertiary",
-                                                alignment="left", help="Open this run"),
+    signs = wells.key(df.loc[view.index, names].values.ravel())        # the signs the rows shown show
+    st.caption(f"{len(view)} of {len(df)} runs, newest first. Open a run with its button."
+               + (f" {signs}" if signs else ""))
+    st.session_state["runs-shown"] = list(view["Run id"])           # Open's row, as a run id (`open_run`)
+    st.dataframe(view[[c for c in PLAIN_COLUMNS if c in view]], hide_index=True, key="runs", column_config={
+        "Open": st.column_config.ButtonColumn(key="open-run", on_click=open_run, type="tertiary", alignment="left",
+                                              pinned=True, help="Open this run"),
+        "Document": st.column_config.TextColumn(help="The PDF's file name, as it was uploaded"),
         "Latest": st.column_config.TextColumn(help="The newest completed run for its organisation and well"),
-        "Family": st.column_config.TextColumn(help="`family`: the vendor template, as F-code (vendor)"),
-        "Route": st.column_config.TextColumn(
-            help="`route`: template (the vendor's contract) or generic (no template: every value needs review)"),
         "Pipeline": st.column_config.TextColumn(
-            help="`status` and `error.stage`: did extraction run? A `running` record past its `deadline_at` reads "
-                 "as failed (stale)."),
+            help="Whether extraction ran: completed, failed or running; failed (stale) when a run stopped without "
+                 "recording its end. An upload not yet started is queued, not picked up, or expired."),
         "Document review": st.column_config.TextColumn(
-            help="`review.needs_review`: values that need an engineer's check. Separate from the pipeline."),
-        "Error": st.column_config.TextColumn(help="`error.code` at `error.stage`"),
-        "Cost (USD)": st.column_config.NumberColumn(
-            format="$%.2f", help="`cost_usd`: the model call's cost; empty without a model call"),
-        **({"Waited": st.column_config.TextColumn(
-            help=f"S3 mode: how long an upload has waited for the function. Queued; not picked up after "
-                 f"{intake.PICKUP_S // 60} min with no run running; expired after {intake.EXPIRY_S // 3600} h")}
-           if "Waited" in view else {}),
-        **({ORIGIN: st.column_config.TextColumn(
-            width="large", help="S3 mode: the upload's `origin` label. A design PDF an engineer uploaded in the ESP "
-                                "product, pushed here and started by the product-upload function, with no form")}
-           if ORIGIN in view else {}),
+            help="The values that need an engineer's check. Separate from the pipeline."),
+        "Cost": st.column_config.TextColumn(help="The model call's cost, in US dollars; empty when none is recorded"),
+        "Waited": st.column_config.TextColumn(
+            help=f"How long an upload has waited to start: not picked up after {intake.PICKUP_S // 60} min with no "
+                 f"run running; expired after {intake.EXPIRY_S // 3600} h"),
+        ORIGIN: st.column_config.TextColumn(
+            width="large", help="A design PDF an engineer uploaded in the ESP product, which started this run with no "
+                                "form"),
     })
+    with st.expander("Run ids and codes (technical)"):
+        st.caption("Each run as recorded: its run id, its vendor family and route, its pipeline status with the stage "
+                   "it failed at, and its error code.")
+        st.dataframe(df.loc[view.index, [c for c in (*TECH_COLUMNS, "Waited", ORIGIN) if c in df]],
+                     hide_index=True, key="runs-technical", column_config={
+            "Family": st.column_config.TextColumn(help="`family`: the vendor template, as F-code (vendor)"),
+            "Route": st.column_config.TextColumn(
+                help="`route`: template (the vendor's contract) or generic (no template: every value needs review)"),
+            "Pipeline, raw": st.column_config.TextColumn(
+                help="`status` and `error.stage`: did extraction run? A `running` record past its `deadline_at` reads "
+                     "as failed (stale)."),
+            "Error": st.column_config.TextColumn(help="`error.code` at `error.stage`"),
+            "Cost (USD)": st.column_config.NumberColumn(
+                format="$%.2f", help="`cost_usd`: the model call's cost; empty when the record has none"),
+            ORIGIN: st.column_config.TextColumn(help="S3 mode: the upload's `origin` label"),
+        })
 
 
 # ---- one run ----
@@ -398,33 +446,37 @@ def goto(**view):
 
 
 def open_run():
-    click = st.session_state.get("open-run")
-    if click:
-        goto(run=click["label"])
+    """The run list's Open: its row, among the runs the list showed, as a run id."""
+    click, shown = st.session_state.get("open-run"), st.session_state.get("runs-shown") or []
+    if click and click["row"] < len(shown):
+        goto(run=shown[click["row"]])
 
 
-def status_cell(label, shown, look, field, raw):
-    """The plain-language status, in colour with an icon, above the raw field it comes from."""
+def status_cell(label, shown, look, field, raw, technical=True):
+    """The plain-language status, in colour with an icon, above the raw field it comes from (`technical`)."""
     color, icon = look
     st.markdown(f"#### {label}: :{color}[{icon} {plain(shown)}]")
-    st.caption(f"`{field}` = {plain(text(raw, 'null'))}")
+    if technical:
+        st.caption(f"`{field}` = {plain(text(raw, 'null'))}")
 
 
 UNKNOWN_LOOK = ("gray", ":material/help:")
 
 
-def pipeline_cell(record):
+def pipeline_cell(record, technical=True):
+    """Technical, the status with the stage a run failed at, above its field; else in plain words alone."""
     status, stale = run_status(record) if record else (None, False)
-    status_cell("Pipeline", pipeline(record) if record else "unknown",
+    status_cell("Pipeline", ((pipeline if technical else run_words)(record)) if record else "unknown",
                 ("red", ":material/timer_off:") if stale else RUN_LOOK.get(text(status), UNKNOWN_LOOK),
-                "status", dig(record, "status"))
+                "status", dig(record, "status"), technical)
 
 
-def review_cell(record):
+def review_cell(record, technical=True):
     shown = review_line(record) if record else "unknown"
     look = REVIEW_LOOK.get("no issues" if shown == "no issues" else "to check" if shown.endswith("to check") else "",
                            UNKNOWN_LOOK)
-    status_cell("Document review", shown, look, "spec_validation_status", dig(record, "spec_validation_status"))
+    status_cell("Document review", shown, look, "spec_validation_status", dig(record, "spec_validation_status"),
+                technical)
 
 
 def error_line(record):
@@ -440,18 +492,21 @@ def image_only(record):
         st.info(IMAGE_ONLY, icon=":material/document_scanner:")
 
 
-def enter_by_hand(run_id):
+def enter_by_hand(run_id, go=False):
     st.session_state[f"by-hand-{run_id}"] = True
+    if go:                                          # from the watch page: the run's page, in the same flow
+        goto(run=run_id)
 
 
-def by_hand_offer(run_id, record):
-    """Enter by hand, on the run's page: beside the image-only message (shown above it), else with a plain line."""
+def by_hand_offer(run_id, record, go=False):
+    """Enter by hand, on the run's page or (`go`) on the last screen of watching it: beside the image-only message
+    (shown above it), else with a plain line."""
     if dig(record, "error", "code") == "IMAGE_ONLY":
         st.caption(R.OFFER)
     else:
         st.info(R.failure_words(record), icon=":material/edit_note:")
     st.button("Enter by hand", type="primary", icon=":material/edit_note:", key=f"enter-{run_id}",
-              on_click=enter_by_hand, args=(run_id,),
+              on_click=enter_by_hand, args=(run_id, go),
               help="Open the review with nothing read, and type each value from the document")
 
 
@@ -469,13 +524,12 @@ def title_block(run_id, record, problem, labels=None, offer=False):
         if problem:
             st.warning(problem)
         with panel("run.json", record):
-            cost = dig(record, "cost_usd")
             for col, (label, value) in zip(st.columns([2, 3, 2, 3, 2]), [
                     ("Organisation", text(org)),
                     ("Well", text(well, "no well")),
                     ("Family", family(record)),
                     ("Started (UTC)", started(record, run_id)),
-                    ("Cost", f"${cost:.2f}" if isinstance(cost, (int, float)) else text(cost, "no model call"))]):
+                    ("Cost", cost_words(record))]):
                 col.metric(label, value)
             status, stale = run_status(record) if record else (None, False)
             left, right = st.columns(2)
@@ -505,9 +559,7 @@ def summary_tab(record):
         model = dig(record, "model")
         st.markdown("#### What ran")
         facts([
-            ("Mode", {"pdf": "PDF: full chain, one model call",
-                      "report": "existing report: no model call"}.get(dig(record, "mode"), dig(record, "mode")),
-             "mode"),
+            ("Mode", mode_words(record), "mode"),
             ("Family", family(record), "family"),
             ("Family taken from", {"detect": "Detect, from the PDF",
                                    "report_frontmatter": "the report's frontmatter"}.get(
@@ -519,7 +571,8 @@ def summary_tab(record):
             ("Forced from", dig(record, "forced_from"), "forced_from"),
             ("Organisation", dig(record, "organization_id"), "organization_id"),
             ("Well", text(dig(record, "well_id"), "no well: unmatched, so no load rows"), "well_id"),
-            *([("Model", "no model call", "model")] if not isinstance(model, dict) else [
+            *([("Model", "no model call" if model_call(record) is False else "no model call recorded", "model")]
+              if not isinstance(model, dict) else [
                 ("Model", model.get("model_id"), "model.model_id"),
                 ("Effort", model.get("effort"), "model.effort"),
                 ("Max tokens", model.get("max_tokens"), "model.max_tokens"),
@@ -569,6 +622,40 @@ def summary_tab(record):
                 st.json(dig(record, "error"))
         with st.expander("Full record (run.json)"):
             st.json(record)
+
+
+def model_call(record) -> bool | None:
+    """Whether the run made its model call: True, False, or None when its record does not say.  run.json's `model` is
+    set just before the call and never otherwise (extraction/run.py; the Lambda's own record of a run that failed
+    before the pipeline has none), and run.json is written only at a run's start and end.  So a report run made none,
+    a failed run without `model` failed before the call, and a running or stale one's record does not say yet."""
+    if dig(record, "mode") == "report":
+        return False
+    if isinstance(dig(record, "model"), dict):
+        return True
+    return False if run_status(record or {}) == ("failed", False) else None
+
+
+def mode_words(record) -> str:
+    """The run's mode, and whether it made its model call (`model_call`)."""
+    mode = dig(record, "mode")
+    if mode == "report":
+        return "existing report: no model call"
+    if mode != "pdf":
+        return mode
+    return {True: "PDF: full chain, one model call", False: "PDF: no model call was made: the run failed before it",
+            None: "PDF: no model call recorded"}[model_call(record)]
+
+
+def cost_words(record) -> str:
+    """The run's cost, or why it has none, by `model_call`'s rule: a call made, as a timed-out one, has no cost
+    recorded; it is not a run with no model call."""
+    cost = dig(record, "cost_usd")
+    if isinstance(cost, (int, float)):
+        return f"${cost:.2f}"
+    if cost is not None:
+        return text(cost)
+    return {True: "not recorded", False: "no model call", None: "none recorded"}[model_call(record)]
 
 
 def grains_tab(get, record, page_key):
@@ -868,14 +955,15 @@ def show_run(store, run_id):
     def get(name):
         return blob(store, run_id, name)
 
-    page_key = f"page-{run_id}"
+    page_key, labels = f"page-{run_id}", store.intake_labels(run_id)
     entry = stored_entry(get) if record and dig(record, "well_id") is not None else None
     by_hand = entry is None and bool(record) and R.by_hand(record, entry_stored=stored(get, C.ENTRY),
                                                            pdf_found=source_pdf(store, record) is not None)
     confirmed = store.latest_version(dig(record, "source", "pdf", "sha256"), record.get("organization_id"),
-                                     record["well_id"], run_id=run_id) if entry is not None or by_hand else None
+                                     record["well_id"], R.environment_for(record.get("organization_id"), labels),
+                                     run_id=run_id) if entry is not None or by_hand else None
     if entry is None and not confirmed and not (by_hand and st.session_state.get(f"by-hand-{run_id}")):
-        title_block(run_id, record, problem, store.intake_labels(run_id), offer=by_hand)   # the offer, if any
+        title_block(run_id, record, problem, labels, offer=by_hand)   # the offer, if any
         return run_details(store, get, record, page_key)
     views = ("Confirmed entry" if confirmed else "Enter by hand" if entry is None else "Review & confirm",
              "Run details (technical)")
@@ -883,7 +971,7 @@ def show_run(store, run_id):
                                 key=f"view-{run_id}-{bool(confirmed)}")
     if view == views[1]:
         st.caption(TECHNICAL)
-        title_block(run_id, record, problem, store.intake_labels(run_id))
+        title_block(run_id, record, problem, labels)
         return run_details(store, get, record, page_key)
     if confirmed:
         confirmed_view(store, run_id, record, confirmed, get, page_key)
@@ -1014,7 +1102,7 @@ def review_state(store, run_id, record, entry) -> dict:
     if key not in st.session_state:
         org, well, labels = record.get("organization_id"), record["well_id"], store.intake_labels(run_id)
         environment, kept = R.environment_for(org, labels), R.Kept(store.objects)
-        version = store.latest_version(dig(record, "source", "pdf", "sha256"), org, well)
+        version = store.latest_version(dig(record, "source", "pdf", "sha256"), org, well, environment)
         pdf = source_pdf(store, record)
         scan = None if pdf is None else T.recognise(pdf)            # a transcription: reviewed against its scan
         typed = scan is not None and scan.problem is None
@@ -1177,7 +1265,8 @@ def dates_note(ctx):
                    icon=":material/history:")
     elif d["case"] == "can't compare":
         undated = "has no design date, entered by hand" if ctx.manual else "prints no design date"
-        st.caption(f"The well's current entry in {R.place(ctx.env)} is dated {d['current'] or 'nothing'}; this document "
+        current = f"is dated {d['current']}" if d["current"] else "has no design date"
+        st.caption(f"The well's current entry in {R.place(ctx.env)} {current}; this document "
                    f"{'is dated ' + d['incoming'] if d['incoming'] else undated}: can't compare.")
     elif d["case"] == "not older":
         st.caption(f"The well's current entry in {R.place(ctx.env)} is dated {d['current']}; this document is not older.")
@@ -1187,7 +1276,8 @@ def review_header(ctx, on, why):
     org, well = ctx.record.get("organization_id"), ctx.record["well_id"]
     with st.container(border=True):
         facts_ = st.container(horizontal=True, gap="large")
-        for label, value in (("Organisation", visible(text(org))), ("Well", visible(well)),
+        names = {"Organisation": wells.marked(text(org)), "Well": wells.marked(well)}  # no emphasis: an edge space
+        for label, value in (*names.items(),                                              # would break it
                              ("Writes to", R.place(ctx.env)),
                              ("Report", "entered by hand" if ctx.manual else R.report_words(ctx.record, ctx.scan)),
                              ("Design date", "none, entered by hand" if ctx.manual else
@@ -1195,7 +1285,9 @@ def review_header(ctx, on, why):
                              ("Confirming as", ctx.name or "nobody")):
             with facts_.container(gap=None, width="content"):
                 st.caption(label)
-                st.markdown(f"**{plain(value)}**")
+                st.markdown(plain(value) if label in names else f"**{plain(value)}**")
+        if signs := wells.key([text(org), well]):
+            st.caption(signs)
         notes = st.container(horizontal=True, vertical_alignment="center")
         if ctx.automatic:                                   # who uploaded is never shown
             notes.badge(R.AUTOMATIC, icon=AUTOMATIC_ICON, color="blue")
@@ -1654,8 +1746,10 @@ def write_dialog(ctx, on, why):
 
     @st.dialog(f"Write to {R.place(ctx.env)}", width="medium", on_dismiss=close_dialog)
     def body():
-        st.markdown(f"Writes to **{R.place(ctx.env)}**, organisation **{plain(visible(text(org)))}**, well "
-                    f"**{plain(visible(well))}**, confirming as **{plain(ctx.name or 'nobody')}**.")
+        st.markdown(f"Writes to **{R.place(ctx.env)}**, organisation {plain(wells.marked(text(org)))}, well "  # names:
+                    f"{plain(wells.marked(well))}, confirming as **{plain(ctx.name or 'nobody')}**.")   # no emphasis
+        if signs := wells.key([text(org), well]):
+            st.caption(signs)
         name = R.document_name(ctx.record, ctx.scan)
         st.caption(f"Document: {plain(name) if name else 'the design document'}, entered by hand, no design date."
                    if ctx.manual else
@@ -1748,36 +1842,36 @@ def decided_words(v, earlier, by_hand=False) -> str | None:
 
 # ---- a new run, and watching it ----
 
-def visible(value: str) -> str:
-    """An id as the form shows it: edge spaces and runs of spaces become no-break spaces, so none collapse."""
-    return re.sub(r"^ +| +$| {2,}", lambda m: "\u00a0" * len(m.group()), value)
+def read_words(listed, shown: str) -> str:
+    """When the form's list was read, in plain words, and the rows it left out."""
+    at, n = listed.read_at, len(listed.pairs)
+    skipped = (f" {listed.skipped} row{'s' * (listed.skipped != 1)} with no organisation or no well "
+               f"{'were' if listed.skipped != 1 else 'was'} left out.") if listed.skipped else ""
+    return (f"{shown}: {n} well{'s' * (n != 1)}, read from the product at {at:%H:%M} UTC on {at.day} {at:%B %Y}."
+            f"{skipped}")
 
 
-def well_list():
-    """(snapshot, problem).  A problem disables the form and says why."""
-    path = os.environ.get(WELL_LIST_ENV)
-    if not path:
-        return None, f"Set {WELL_LIST_ENV} to the well list exported from Athena, then reload."
-    try:
-        snapshot = load_wells(path)
-    except SnapshotError as err:
-        return None, f"The well list {WELL_LIST_ENV} names cannot be used: {err}."
-    return snapshot, None if snapshot.pairs else "The well list has a header and no wells."
+def forget_choice():
+    """The switch moved: the organisation and well chosen from the other list go."""
+    for key in ("new-org", "new-well", "new-typed"):
+        st.session_state.pop(key, None)
 
 
-def same_request(store, run_id, record, sha256, organisation, well) -> bool:
-    """Whether a run is for this PDF, organisation and well.  In S3 mode the upload's labels say: a running
-    record there names none of them yet."""
+def same_request(store, run_id, record, sha256, organisation, well, environment) -> bool:
+    """Whether a run is for this PDF, organisation and well, and writes to this environment (`R.environment_for`, as
+    its review does).  The upload's labels say, where it kept them: in S3 mode a running record names none yet."""
     labels = store.intake_labels(run_id)
     if labels is not None:
-        return (labels["sha256"], labels["organization-id"], labels["well-id"]) == (sha256, organisation, well)
-    return (dig(record, "source", "pdf", "sha256") == sha256 and record.get("organization_id") == organisation
-            and record.get("well_id") == well)
+        same = (labels["sha256"], labels["organization-id"], labels["well-id"]) == (sha256, organisation, well)
+    else:
+        same = (dig(record, "source", "pdf", "sha256") == sha256 and record.get("organization_id") == organisation
+                and record.get("well_id") == well)
+    return same and R.environment_for(organisation, labels) == environment
 
 
-def running_duplicate(store, sha256, organisation, well):
-    """(run id, state) of a live run of the same PDF, organisation and well, or None: a run still running and
-    not stale, or, in S3 mode, an upload not yet picked up that has not expired."""
+def running_duplicate(store, sha256, organisation, well, environment):
+    """(run id, state) of a live run of the same PDF, organisation and well in the same environment, or None: a run
+    still running and not stale, or, in S3 mode, an upload not yet picked up that has not expired."""
     now = datetime.now(timezone.utc)
     for run_id in store.run_ids():
         try:
@@ -1785,10 +1879,10 @@ def running_duplicate(store, sha256, organisation, well):
         except Exception:  # noqa: BLE001 - an unreadable record is no duplicate
             continue
         if run_status(record, now) == ("running", False) and same_request(store, run_id, record, sha256,
-                                                                           organisation, well):
+                                                                           organisation, well, environment):
             return run_id, "running"
     for run_id, (state, _) in waiting(store, now).items():
-        if state != "expired" and same_request(store, run_id, {}, sha256, organisation, well):
+        if state != "expired" and same_request(store, run_id, {}, sha256, organisation, well, environment):
             return run_id, state
     return None
 
@@ -1796,28 +1890,59 @@ def running_duplicate(store, sha256, organisation, well):
 def show_upload(store):
     st.button("All runs", icon=":material/arrow_back:", on_click=goto, type="tertiary")
     st.title("New run from a PDF")
-    st.write("Choose the organisation and the well the design document belongs to, then upload the PDF. "
-             "The run starts in the background, and you can watch it here.")
-    snapshot, problem = well_list()
-    if problem:
-        st.error(problem)
-    if snapshot:
-        st.caption(f"Well list: {snapshot.rows} rows, modified {snapshot.modified:%Y-%m-%d %H:%M} UTC, "
-                   f"SHA-256 {snapshot.sha256[:12]}.")
-    off = problem is not None
-    org = st.selectbox("Organisation", [] if off else snapshot.organisations(), index=None, format_func=visible,
+    st.write("Choose live or test wells, then the organisation and the well the design document belongs to, and "
+             "upload the PDF. The run starts in the background, and you can watch it here.")
+    shown = st.segmented_control("Wells", list(WELL_LISTS.values()), default=WELL_LISTS["prd"], required=True,
+                                 key="new-wells", on_change=forget_choice,
+                                 help="Live wells are the product's production wells; test wells are its test "
+                                      "system's, with lab-check.")
+    environment = next(e for e, words in WELL_LISTS.items() if words == shown)
+    with st.spinner(f"Reading the {shown.lower()} from the product"):
+        listed, err = wells.cached(environment)
+    if err is not None:                     # the form stays off: no list is offered but the product's
+        st.error(f"The {shown.lower()} could not be read from the product, so the form is off. Retry; if it fails "
+                 "again, ask whoever runs the app.", icon=":material/cloud_off:")
+        st.button("Retry", icon=":material/refresh:", on_click=wells.refresh, args=(environment,), key="new-retry")
+        with st.expander(TECH):
+            st.code(f"{type(err).__name__}: {err}", language=None, wrap_lines=True)
+    else:
+        line = st.container(horizontal=True, vertical_alignment="center")
+        line.caption(read_words(listed, shown))
+        line.button("Refresh", icon=":material/refresh:", type="tertiary", on_click=wells.refresh, args=(environment,),
+                    key="new-refresh", help=f"Read the {shown.lower()} from the product again")
+    off = err is not None
+    organisations = [] if off else [o for o in listed.organisations() if o != R.LAB_CHECK]
+    if environment == "dev" and not off:                    # lab-check's wells are typed, never listed
+        organisations = sorted({*organisations, R.LAB_CHECK}, key=wells.display_order)
+    shown_orgs, names = wells.labels(organisations), []          # as every screen marks them, no two alike
+    org = st.selectbox("Organisation", organisations, index=None, format_func=shown_orgs.__getitem__,
                        placeholder="Choose an organisation", disabled=off, key="new-org")
-    if org is not None and snapshot.case_variants(org):
-        st.caption("Also in the list, differing only by case: "
-                   + ", ".join(plain(visible(v)) for v in snapshot.case_variants(org)))
-    well = st.selectbox("Well", [] if org is None else snapshot.wells(org), index=None, format_func=visible,
-                        placeholder="Choose a well", disabled=org is None, key="new-well")
+    if org == R.LAB_CHECK:
+        typed = st.text_input("Well", key="new-typed", placeholder="Type the well's name",
+                              help="Any name: it is sent exactly as typed.")
+        well = typed if typed.strip() else None
+    else:
+        names = [] if org is None else listed.wells(org)
+        shown_wells = wells.labels(names)
+        well = st.selectbox("Well", names, index=None, format_func=shown_wells.__getitem__,
+                            placeholder="Choose a well", disabled=org is None, key="new-well")
+    near = wells.near(organisations) or wells.near(names)
+    if line := " ".join(filter(None, [NEAR if near else "", wells.key([*organisations, *names])])):
+        st.caption(line)                                          # one line: alike names, and what each sign means
+    refused = [REFUSED[name] for name in intake.refused(org, well)]         # the upload's labels' own rule
+    if refused:                             # said as soon as the name is chosen, before any upload; Start stays off
+        st.error(f"No run can start for this {' and this '.join(refused)} yet, because "
+                 f"{'its name holds' if len(refused) == 1 else 'each name holds'} a character the pipeline can't "
+                 "carry.")
     upload = st.file_uploader("Design document (PDF)", type="pdf", disabled=off, key="new-pdf")
     data = upload.getvalue() if upload is not None else b""
     if upload is not None and not data:
         st.error("This file is empty.")
     elif upload is not None and not data.startswith(b"%PDF-"):
         st.error("This file is not a PDF: it does not start with %PDF-.")
+    misnamed = upload is not None and bool(intake.refused(source_name=upload.name))   # the labels' own rule, too
+    if misnamed:                            # said once the file is added; Start stays off
+        st.error(RENAME)
     scan = T.recognise(data) if data.startswith(b"%PDF-") else None
     if scan is not None and scan.problem:
         st.error(f"This file is marked as a transcription, but {scan.problem}, so it is refused. Upload the file "
@@ -1826,26 +1951,30 @@ def show_upload(store):
         st.info(f"A transcription of {plain(scan.name)}, {scan.pages} page{'s' * (scan.pages != 1)} typed from the "
                 "scan. The original scan is inside the file, and the review shows it beside the values.",
                 icon=":material/document_scanner:")
-    ready = well is not None and data.startswith(b"%PDF-") and not (scan is not None and scan.problem)
-    if ready and (dup := running_duplicate(store, hashlib.sha256(data).hexdigest(), org, well)):
+    ready = (well is not None and not refused and not misnamed and data.startswith(b"%PDF-")
+             and not (scan is not None and scan.problem))
+    sha = hashlib.sha256(data).hexdigest()
+    if ready and (dup := running_duplicate(store, sha, org, well, environment)):
         dup, state = dup
-        st.warning(f"Run {plain(dup)} for this PDF, organisation and well is still running. You can start "
-                   "another." if state == "running" else
-                   f"Run {plain(dup)} for this PDF, organisation and well is waiting for the function ({state}). "
-                   "You can start another.")
+        st.warning(f"A run of this PDF for this organisation and well is still running, started {started({}, dup)} "
+                   "UTC. You can start another." if state == "running" else
+                   f"An upload of this PDF for this organisation and well is waiting for the function ({state}), "
+                   f"since {started({}, dup)} UTC. You can start another.")
     st.warning(COST, icon=":material/payments:")
     confirmed = st.checkbox("I understand this starts a paid model call", disabled=not ready, key="new-confirm")
     if st.button("Start the run", type="primary", disabled=not (ready and confirmed)):
         try:
+            run_id = intake.new_run_id(datetime.now(timezone.utc))
             if MODE == "s3":
-                run_id = intake.new_run_id(datetime.now(timezone.utc))
-                intake.upload(store, run_id, data, org, well, upload.name)
-            else:
+                intake.upload(store, run_id, data, org, well, upload.name, environment)
+            else:                           # the labels first, where the store and the writer read them
                 pdf = intake.save_pdf(store.root, data)
-                run_id = intake.new_run_id(datetime.now(timezone.utc))
+                intake.label(store.root, run_id, data, intake.labels(org, well, upload.name, sha, environment))
                 intake.launch(store.root, pdf, org, well, run_id, upload.name)
-        except Exception as err:  # noqa: BLE001 - say why nothing started
-            st.error(f"The run could not be started ({type(err).__name__}: {plain(err)}).")
+        except Exception as err:  # noqa: BLE001 - say that nothing started; why is technical
+            st.error("The run could not be started. Try again; if it fails again, ask whoever runs the app.")
+            with st.expander(TECH):
+                st.code(f"{type(err).__name__}: {err}", language=None, wrap_lines=True)
             return
         goto(watch=run_id)
         st.rerun()
@@ -1882,6 +2011,7 @@ def watch_now(store, run_id):
 
 
 def render_watch(store, run_id) -> str:
+    """The run's state, in plain words; what only whoever runs the app needs is in a technical section."""
     state, record = watch_now(store, run_id)
     if state in WAITING:
         uploaded = store.uploaded_at(run_id)
@@ -1890,76 +2020,119 @@ def render_watch(store, run_id) -> str:
             st.info(f"Queued for {waited}: the upload is waiting for the function to pick it up.",
                     icon=":material/hourglass_top:")
         elif state == "not picked up":
-            st.warning(f"Not picked up: queued for {waited}, while no run is running. Look for this run id in the "
-                       "run log (DynamoDB `esp_design_extraction_logging`, as its `pipeline_execution_id`): a "
-                       "`FAILED` row there means the function could not start the run. Its CloudWatch logs "
-                       "(`/aws/lambda/esp-design-extraction`) say more.")
+            st.warning(f"Not picked up: queued for {waited}, while no run is running. Whoever runs the app can find "
+                       "out why with the technical details.")
+            with st.expander(TECH):
+                st.markdown(f"Look for run id `{run_id}` in the run log (DynamoDB `esp_design_extraction_logging`, as "
+                            "its `pipeline_execution_id`): a `FAILED` row there means the function could not start "
+                            "the run. Its CloudWatch logs (`/aws/lambda/esp-design-extraction`) say more.")
         else:
-            st.error(f"Expired: queued for {waited}, past the 6 hours Lambda keeps a waiting event. This upload "
-                     "will not run; upload the PDF again.")
+            st.error(f"Expired: queued for {waited}, longer than a waiting upload is kept. It will not run: upload the "
+                     "PDF again.")
     elif state == "starting":
         st.info("Starting: waiting for the run to write its record.", icon=":material/hourglass_top:")
     elif state == "no record yet":
         age = int(intake.age_s(run_id, datetime.now(timezone.utc)))
         st.info(f"No record yet, still running ({age} s).", icon=":material/hourglass_top:")
     elif state == "unreadable":
-        st.warning("`run.json` is there but cannot be read. Checking again.")
+        st.warning("The run's record is there but cannot be read yet. Checking again.")
     elif state == "launch failed":
         reason = "the process has exited" if intake.exited(run_id) else f"{intake.STARTUP_S} s have passed"
         st.error(f"Launch failed: the run wrote no record, and {reason}.")
-        try:
-            lines = store.launch_log(run_id).decode("utf-8", "replace").splitlines()
-            st.caption("The last 50 lines of the launch log:")
-            st.code("\n".join(lines[-50:]) or "(empty)", language=None, wrap_lines=True)
-        except FileNotFoundError:
-            st.caption("There is no launch log for this run.")
+        with st.expander("Launch log (technical)"):
+            try:
+                lines = store.launch_log(run_id).decode("utf-8", "replace").splitlines()
+                st.caption("The last 50 lines of the launch log:")
+                st.code("\n".join(lines[-50:]) or "(empty)", language=None, wrap_lines=True)
+            except FileNotFoundError:
+                st.caption("There is no launch log for this run.")
     else:
-        pipeline_cell(record)
+        pipeline_cell(record, technical=False)
         start, deadline = when(record.get("started_at")), when(record.get("deadline_at"))
         end = when(record.get("ended_at")) or datetime.now(timezone.utc)
         if start and deadline:
             st.metric("Elapsed", f"{clock((end - start).total_seconds())} of "
                                  f"{clock((deadline - start).total_seconds())}")
-            st.caption(f"`deadline_at` = {plain(record['deadline_at'])}")
+        failed = run_status(record)[0] == "failed"                      # stale too
         if state == "running":
             st.caption("Current stage: not in the record, which is written when the run starts and again "
                        "when it ends.")
         else:
-            review_cell(record)
+            review_cell(record, technical=False)
+            if failed:
+                failed_screen(store, run_id, record)
+            st.button("Open the run", type="secondary" if failed else "primary", on_click=goto, kwargs={"run": run_id})
+        with st.expander("Run record (technical)"):
             error_line(record)
-            image_only(record)
-            st.button("Open the run", type="primary", on_click=goto, kwargs={"run": run_id})
+            st.json({k: record.get(k) for k in ("run_id", "status", "started_at", "deadline_at", "ended_at",
+                                                "spec_validation_status")})
     return state
 
 
-def show_watch(store, run_id):
+def failed_screen(store, run_id, record):
+    """A failed upload's last screen: what happened, in plain words (a scan's own message for an image-only one), and
+    Enter by hand when the run offers it as on its page (`R.by_hand`, `show_run`), opening the same flow there."""
+    entry_stored = stored(lambda name: blob(store, run_id, name), C.ENTRY)
+    image_only(record)
+    if R.by_hand(record, entry_stored=entry_stored, pdf_found=source_pdf(store, record) is not None):
+        by_hand_offer(run_id, record, go=True)
+    elif dig(record, "error", "code") != "IMAGE_ONLY":
+        st.info(R.failed_words(record, entry_stored=entry_stored), icon=":material/info:")
+
+
+def watch_title(store, run_id, labels):
+    """The run as the engineer knows it, from its record or else its upload's labels: its document, organisation, well
+    and start; never its id."""
+    try:
+        record = store.record(run_id)
+    except Exception:  # noqa: BLE001 - no record yet, or not readable yet: the labels name it, or nothing does
+        record = {}
+    labels = labels or {}
+    org, well = dig(record, "organization_id") or labels.get("organization-id"), \
+        dig(record, "well_id") or labels.get("well-id")
+    name = document(record, labels)
+    st.subheader(plain(name) if name != "—" else "A new run")
+    st.caption(" · ".join([*([f"Organisation {plain(wells.marked(org))}"] if org else []),    # no emphasis: an
+                           *([f"well {plain(wells.marked(well))}"] if well else []),           # edge space breaks it
+                           f"started {started(record, run_id)} UTC"]))
+    if signs := wells.key([n for n in (org, well) if n]):
+        st.caption(signs)
+
+
+def show_watch(store, run_id) -> bool:
+    """Watching a run: True, an engineer's screen, whose sidebar names no bucket."""
     st.button("All runs", icon=":material/arrow_back:", on_click=goto, type="tertiary")
-    st.subheader(f"Run {plain(run_id)}")
     if run_id not in store.run_ids() and run_id not in store.launch_ids():
-        st.warning(f"There is no run {plain(run_id)} in this store.")
-        return
-    if R.automatic(store.intake_labels(run_id)):
+        st.warning("There is no such run in this store.")
+        return True
+    labels = store.intake_labels(run_id)
+    watch_title(store, run_id, labels)
+    if R.automatic(labels):
         st.badge(R.AUTOMATIC, icon=AUTOMATIC_ICON, color="blue")
     if watch_now(store, run_id)[0] in FINAL:
         render_watch(store, run_id)
-        return
+        return True
 
     @st.fragment(run_every=POLL_S)
     def live():
         if render_watch(store, run_id) in FINAL:
             st.rerun()                      # final: render it once more, without the timer
     live()
+    return True
 
 
-def route(store):
+def route(store) -> bool | None:
+    """Draws the page the query names.  True for an engineer's screen (the run list, the upload form, watching a run,
+    a run's review), whose sidebar says only when the runs were read."""
     if "upload" in st.query_params:
         show_upload(store)
-    elif st.query_params.get("watch"):
-        show_watch(store, st.query_params["watch"])
-    elif st.query_params.get("run"):
+        return True
+    if st.query_params.get("watch"):
+        return show_watch(store, st.query_params["watch"])
+    if st.query_params.get("run"):
         return show_run(store, st.query_params["run"])
-    else:
-        show_list(store)
+    show_list(store)
+    return True
 
 
 def s3_sidebar(store, technical=True):
@@ -1989,16 +2162,16 @@ if STORE is None:
     else:
         st.error(f"{MODE_ENV} is {plain(MODE)}: it must be local or s3.")
 elif MODE == "s3":
-    engineer = False
+    engineer = not st.query_params.get("run")      # a run's own page is technical until it opens on a review
     try:
         engineer = route(STORE) is True
-    except Exception as err:  # noqa: BLE001 - credentials, network or permissions: say so, not a trace
-        if st.query_params.get("run"):              # a run opens on an engineer's screen: plain words
-            st.error("The run could not be read. Your AWS sign-in may have expired: sign in again, then reload the "
-                     "page.")
-        else:
-            st.error(f"S3 could not be read ({type(err).__name__}: {plain(err)}). Check the AWS credentials "
-                     "(AWS_PROFILE; an expired SSO session needs `aws sso login`) and the bucket variables.")
+    except Exception as err:  # noqa: BLE001 - credentials, network or permissions: plain words, the rest technical
+        st.error(f"The run{'' if st.query_params.get('run') else 's'} could not be read. Your AWS sign-in may have "
+                 "expired: sign in again, then reload the page.")
+        with st.expander(TECH):
+            st.code(f"S3 could not be read ({type(err).__name__}: {err}). Check the AWS credentials (AWS_PROFILE; an "
+                    "expired SSO session needs `aws sso login`) and the bucket variables.", language=None,
+                    wrap_lines=True)
     s3_sidebar(STORE, technical=not engineer)
 else:
     route(STORE)

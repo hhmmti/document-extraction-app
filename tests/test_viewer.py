@@ -17,6 +17,7 @@ import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
+import test_screens as TS
 from app.store import PDF_DIRS_ENV, STORE_ENV, LocalRunStore, local_store_from_env, run_status
 from extraction.assets_dir import ASSETS_ENV
 from test_unit import F4_P1, F4_P2, make_pdf
@@ -164,6 +165,12 @@ def texts(elements):
             for e in elements]
 
 
+def runs(at) -> pd.DataFrame:
+    """The run list as shown, indexed by each row's run id from its technical table, in the same order."""
+    shown, recorded = at.dataframe[0].value, at.dataframe[1].value
+    return shown.set_index(pd.Index(recorded["Run id"], name="Run id"))
+
+
 # ---- the storage layer ----
 
 def test_run_ids_newest_first_and_only_run_directories(store):
@@ -248,21 +255,64 @@ def test_run_status_matches_the_writers_reader(tmp_path):
 
 def test_list_shows_every_run_with_both_statuses_and_the_latest_marker(store):
     at = app()
-    df = at.dataframe[0].value.set_index("Run id")
+    df, raw = runs(at), at.dataframe[1].value.set_index("Run id")
     assert list(df.index) == [ODD, BROKEN, NO_PDF, STALE, RUNNING, PARTIAL, GOOD, OLD]
     assert df.loc[GOOD, "Pipeline"] == "completed" and df.loc[GOOD, "Document review"] == "1 item to check"
-    assert df.loc[PARTIAL, "Pipeline"] == "failed at extract" and df.loc[GOOD, "Route"] == "template"
-    assert df.loc[PARTIAL, "Error"] == "MODEL_TIMEOUT at extract"
+    assert df.loc[PARTIAL, "Pipeline"] == "failed" and raw.loc[PARTIAL, "Pipeline, raw"] == "failed at extract"
+    assert raw.loc[GOOD, "Route"] == "template" and raw.loc[PARTIAL, "Error"] == "MODEL_TIMEOUT at extract"
     assert df.loc[RUNNING, "Pipeline"] == "running" and df.loc[STALE, "Pipeline"] == "failed (stale)"
-    assert df.loc[BROKEN, "Pipeline"] == "run.json unreadable"
-    assert df.loc[GOOD, "Cost (USD)"] == 0.5
+    assert df.loc[BROKEN, "Pipeline"] == "record unreadable" and raw.loc[BROKEN, "Pipeline, raw"] == "run.json unreadable"
+    assert df.loc[GOOD, "Cost"] == "$0.50" and raw.loc[GOOD, "Cost (USD)"] == 0.5
     assert {r for r in df.index if df.loc[r, "Latest"]} == {GOOD, NO_PDF}      # newest succeeded per well
 
 
 def test_list_filters_by_status(store):
     at = app()
     at.multiselect(key="status").set_value(["failed (stale)"]).run()
-    assert list(at.dataframe[0].value["Run id"]) == [STALE]
+    assert list(at.dataframe[1].value["Run id"]) == [STALE] and len(at.dataframe[0].value) == 1
+
+
+def test_the_list_marks_each_space_in_a_name_that_would_not_show_and_its_technical_table_keeps_it(tmp_path, monkeypatch):
+    """Org Alpha and Org Alpha with an edge space look the same unmarked: the list marks each space that would not show,
+    as the upload form does, says so, and filters by the names as it shows them; the technical table keeps them exactly."""
+    plain, spaced = "20990101T000001Z-00000001", "20990101T000002Z-00000002"
+    write_run(tmp_path, plain, record(plain, organization_id="Org Alpha", well_id="Well 1"), {})
+    write_run(tmp_path, spaced, record(spaced, organization_id="Org Alpha ", well_id=" Well  1"), {})
+    monkeypatch.setenv(STORE_ENV, str(tmp_path))
+    at = app()
+    df, raw = runs(at), at.dataframe[1].value.set_index("Run id")
+    assert df.loc[[plain, spaced], ["Organisation", "Well"]].values.tolist() == [
+        ["Org Alpha", "Well 1"], ["Org Alpha\u2423", "\u2423Well\u2423\u24231"]]
+    assert raw.loc[[plain, spaced], ["Organisation", "Well"]].values.tolist() == [
+        ["Org Alpha", "Well 1"], ["Org Alpha ", " Well  1"]]
+    assert "2 of 2 runs, newest first. Open a run with its button. ␣ marks a space that would not show." \
+           in texts(at.caption)
+    assert at.multiselect(key="org").options == ["Org Alpha", "Org Alpha\u2423"]
+    at.multiselect(key="org").set_value(["Org Alpha"]).run()
+    assert list(runs(at).index) == [plain]
+    assert "1 of 2 runs, newest first. Open a run with its button." in texts(at.caption)    # no mark shown, no line
+    at.multiselect(key="org").set_value(["Org Alpha\u2423"]).run()
+    assert list(runs(at).index) == [spaced]
+
+
+@pytest.mark.parametrize("column,key", [("Organisation", "org"), ("Well", "well")])
+@pytest.mark.parametrize("pair", TS.PAIRS.values(), ids=list(TS.PAIRS))
+def test_the_run_lists_filters_never_show_two_names_alike_and_each_keeps_exactly_its_own_runs(
+        tmp_path, monkeypatch, pair, column, key):
+    """The run list: two organisations, or two wells, that differ only by a character that doesn't show or
+    by case are two filter options, never shown alike, and choosing one keeps exactly its name's run."""
+    ids, field = ["20990101T000001Z-00000001", "20990101T000002Z-00000002"], {"Organisation": "organization_id",
+                                                                              "Well": "well_id"}[column]
+    for run_id, name in zip(ids, pair):
+        write_run(tmp_path, run_id, record(run_id, **{"organization_id": "Org Beta", "well_id": "Well 1", field: name}), {})
+    monkeypatch.setenv(STORE_ENV, str(tmp_path))
+    at = app()
+    options, kept = at.multiselect(key=key).options, {}
+    for option in options:
+        at.multiselect(key=key).set_value([option]).run()
+        kept[option] = list(runs(at).index)
+    assert sorted(kept.values()) == [[ids[0]], [ids[1]]], kept
+    assert len({TS.seen(o) for o in options}) == 2, options
 
 
 # ---- one run ----
@@ -327,10 +377,44 @@ def test_malformed_files_each_get_a_notice(store):
 
 
 def test_a_record_with_odd_types_still_renders(store):
-    assert app().dataframe[0].value.set_index("Run id").loc[ODD, "Pipeline"] == '["?"]'
+    at = app()
+    assert runs(at).loc[ODD, "Pipeline"] == "unknown"
+    assert at.dataframe[1].value.set_index("Run id").loc[ODD, "Pipeline, raw"] == '["?"]'
     at = app(ODD)
     assert "Pipeline: [\"?\"]" in " ".join(texts(at.markdown))
     assert "No source information for this run." in texts(at.info)
+
+
+FAILED_EARLY = {"status": "failed", "model": None, "tokens": None, "cost_usd": None,
+                "error": {"code": "PREP_FAILED", "stage": "prep", "message": "x", "details": {}}}
+
+
+@pytest.mark.parametrize("over,said,cost,model", [
+    ({}, "PDF: full chain, one model call", "$0.50", "model-x"),
+    ({"status": "failed", "error": {"code": "MODEL_TIMEOUT", "stage": "extract", "message": "x", "details": {}},
+      "tokens": None, "cost_usd": None}, "PDF: full chain, one model call", "not recorded", "model-x"),  # it timed out
+    (FAILED_EARLY, "PDF: no model call was made: the run failed before it", "no model call", "no model call"),
+    ({**FAILED_EARLY, "model": "not an object"}, "PDF: no model call was made: the run failed before it",
+     "no model call", "no model call"),
+    ({"status": "running", "deadline_at": "2999-01-01T00:00:00Z", "model": None, "cost_usd": None},
+     "PDF: no model call recorded", "none recorded", "no model call recorded"),
+    ({"status": "running", "deadline_at": "2000-01-01T00:00:00Z", "model": None, "cost_usd": None},
+     "PDF: no model call recorded", "none recorded", "no model call recorded"),        # stale: it may have made it
+    ({"mode": "report", "model": None, "cost_usd": None}, "existing report: no model call", "no model call",
+     "no model call"),
+])
+def test_the_summary_and_the_cost_line_say_one_model_call_only_for_a_run_that_reached_the_model(
+        tmp_path, monkeypatch, over, said, cost, model):
+    """The summary's mode line, its Model line and the run page's Cost: one rule (`model_call`), so a model timeout,
+    which made the call, never reads as a run with no model call."""
+    write_run(tmp_path / "store", GOOD, record(GOOD, **over), {})
+    monkeypatch.setenv(STORE_ENV, str(tmp_path / "store"))
+    monkeypatch.delenv(PDF_DIRS_ENV, raising=False)
+    at = app(GOOD)
+    facts = next(df.value for df in at.dataframe if "mode" in set(df.value.get("Field in run.json", ())))
+    facts = facts.set_index("Field in run.json")["Value"]
+    assert (facts["mode"], {m.label: m.value for m in at.metric}["Cost"], facts.get("model", facts.get(
+        "model.model_id"))) == (said, cost, model)
 
 
 def test_unknown_run_id(store):
