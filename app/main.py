@@ -1,6 +1,9 @@
 """Run viewer: every run in the run store, and each run in full; its upload form starts a run on a well from the
 product's live well lists (app/wells.py), and a run's proposed well entry is reviewed and confirmed here.  The run list,
 the upload form and the watch page name a run in plain words; ids and codes are under each one's technical section.
+Every technical view and detail (Run details, run ids and codes, error text, set-up hints) is drawn only with
+ESP_SHOW_TECHNICAL=1: without it every page is an engineer's, and what a page leaves out goes to the app's log
+(app/hosted.py, which also holds the app's AWS session, who is signed in, and the pump catalogue's fetch).
 
     ESP_RUN_STORE_DIR=<run store dir> streamlit run app/main.py              # local mode, the default
     ESP_APP_MODE=s3 ESP_BUCKET=… ESP_INTAKE_PREFIX=… ESP_RUNS_PREFIX=… streamlit run app/main.py
@@ -20,6 +23,7 @@ local store (README, "Confirming an entry").
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import io
 import json
@@ -30,6 +34,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -40,6 +45,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:              # `streamlit run` puts only app/ on the path
     sys.path.insert(0, ROOT)
 
+from app import hosted  # noqa: E402
 from app import intake  # noqa: E402
 from app import review as R  # noqa: E402
 from app import transcription as T  # noqa: E402
@@ -54,6 +60,7 @@ from extraction.validate.rules import page_numbers  # noqa: E402
 from extraction.validate.validate import catalogue as read_catalogue  # noqa: E402
 from extraction.well_entry import empty_entry  # noqa: E402
 
+SHOW = hosted.technical()             # the technical views and details: drawn only with ESP_SHOW_TECHNICAL=1
 FAMILIES = {code: slug for slug, code in FAMILY_LABEL.items()}
 GRAINS = {"pump_config": "Pump string", "esp_well_design_context": "Design context",
           "curve_observations": "Curve observations"}
@@ -87,25 +94,39 @@ CURVE = ["scenario_ordinal", "curve_observation_role", "pump_model", "sensitivit
 FREQUENCY = "frequency_hz_as_printed"
 RAMP = ["#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281",
         "#0d366b"]
-COST = ("This calls Opus on Bedrock in the datascience account; recent runs cost about USD 0.55–1.32 "
-        "and take 3–8 minutes.")
+DURATION = ("A run takes 3 to 8 minutes. When it finishes, you check what it read against the document, and confirm "
+            "it.")
+FOLLOWS = "This page follows the run; you can leave it and find the run again in the run list."
 POLL_S = 3
 IMAGE_ONLY = ("This document is a scan: its pages are pictures, with no text to read, so it cannot be read here. "
               "Transcribe the scan with the transcribe-design-scan skill, then upload the transcription it makes as a "
               "new run.")
 FINAL = {"launch failed", "succeeded", "failed", "stale", "expired"}
 WAITING = ("queued", "not picked up", "expired")        # S3 mode: an upload with no run record yet
-ORIGIN = "How it started"                              # the run list's column for a run an upload in the product started
+ORIGIN = "How it started"                              # the run list's column: an upload in the product, or the form here
+SIDE = "Wells"                                         # the run list's column for where a run writes: Live or Test wells
+RUN, NEWEST = "Run", "For its well"                    # the run list's columns: did the run read the document; the newest
+WAIT_WORDS = {"queued": "waiting to start"}            # an upload not yet started, where `intake.queue_state` says queued
 AUTOMATIC_ICON = ":material/cloud_upload:"
 WELL_LISTS = R.PLACES   # the form's switch, in the review's words for where a run writes: never dev or prd
-NEAR = ("The list holds names that differ only by case or by characters that don't show; the exact name you choose is "
-        "sent.")
-TECH = "Details (technical)"                           # a plain screen's technical section, as Run details is
+NEAR = ("Some names in this list differ only by case or by characters that don't show. The product keeps them apart: "
+        "choose the exact one you mean.")
+STOPPED = "stopped without finishing"                  # a run still recorded as running past its deadline
+NOBODY = "no one signed in"                            # after "Confirming as", when no name confirms
+# The Write pop-up's rows: how each value ends this confirmation (`R.tally`'s names), in the engineer's words.
+TALLY = {"settled one by one": "settled one by one", "settled in batches": "settled in group checks",
+         "pulled out": "left out of a group check", "corrected": "corrected", "accepted anyway": "accepted anyway",
+         "carried": "kept from an earlier confirmation", "settled by the extraction": "needed no check: kept as read",
+         "left to check": "left to check"}
+UNTOUCHED = "left empty: not from the document"        # entered by hand: the values that are never typed
+TECH = "Details (technical)"                           # a plain screen's technical section, as Run details is: `tech`
 REFUSED = {"organization-id": "organisation", "well-id": "well"}   # the form's words for a name the labels refuse
-RENAME = "This file's name holds a character the pipeline can't carry: rename the file and add it again."
-# The run list: what it shows, then what its technical section shows (`list_rows`).
-PLAIN_COLUMNS = ("Open", "Organisation", "Well", ORIGIN, "Document", "Started (UTC)", "Pipeline", "Document review",
-                 "Latest", "Cost", "Waited")
+RENAME = "This file's name holds a character a run can't carry: rename the file and add it again."
+# The run list: what it shows (a run's cost only with the technical views), then what its technical section shows
+# (`list_rows`).
+PLAIN_COLUMNS = ("Open", "Organisation", "Well", SIDE, "Document", RUN, "Document review", "Started", NEWEST, ORIGIN,
+                 *(("Cost",) if SHOW else ()), "Waited")     # what a run is and where it stands first: the rest may
+                                                             # need the table scrolled sideways
 TECH_COLUMNS = ("Run id", "Started (UTC)", "Organisation", "Well", "Family", "Route", "Pipeline, raw", "Error",
                 "Cost (USD)")
 MODE = os.environ.get(MODE_ENV) or "local"
@@ -143,16 +164,85 @@ def plain(value) -> str:
     return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>~$:])", r"\\\1", str(value))
 
 
+CONTACT = plain(hosted.contact())     # whom to tell or ask when something goes wrong, in every message that says so
+
+
+def tech(what, error, key=None, trace=False) -> bool:
+    """Whether a page's technical detail is drawn.  With the switch off it is not, and `error` (the exception, or the
+    detail in words) goes to the app's log instead, once per occurrence (`hosted.hidden`)."""
+    if not SHOW:
+        hosted.hidden(what, error, key, trace)
+    return SHOW
+
+
+def failed(err):
+    """An error nothing else caught: credentials, network or permissions in S3 mode, a fault anywhere.  Plain words
+    with whom to tell; the error and S3 mode's AWS hints are the page's technical section, and with the switch off go
+    to the log with the traceback.  Local mode with the switch on: raised, so Streamlit shows its traceback."""
+    if SHOW and MODE != "s3":
+        raise err
+    st.error(f"The run{'' if st.query_params.get('run') else 's'} could not be read. Reload the page; if it fails "
+             f"again, tell {CONTACT}.")
+    if tech("the page could not be shown", err, trace=True):
+        with st.expander(TECH):
+            st.code(f"S3 could not be read ({type(err).__name__}: {err}). Check the AWS credentials (AWS_PROFILE; an "
+                    "expired SSO session needs `aws sso login`) and the bucket variables.", language=None,
+                    wrap_lines=True)
+
+
+def guarded(body):
+    """A fragment's or a pop-up's body, which reruns outside the page's own handling: an error in it ends as
+    `failed`."""
+    @functools.wraps(body)
+    def run(*args, **kwargs):
+        try:
+            return body(*args, **kwargs)
+        except Exception as err:  # noqa: BLE001 - as the page's own: plain words, the rest technical
+            failed(err)
+    return run
+
+
+def named(label, name):
+    """Who confirms or confirmed, under its label, exactly as recorded and as plain text: `st.text` takes no Markdown,
+    which would make an address a link."""
+    with st.container(gap=None):
+        st.caption(label)
+        st.text(name)
+
+
 def family(record) -> str:
     code = dig(record, "family")
     return f"{code} ({FAMILIES[code]})" if isinstance(code, str) and code in FAMILIES else text(code)
 
 
 def started(record, run_id) -> str:
+    """Technical: the record's own start, in UTC as recorded, else the run id's."""
     when = dig(record, "started_at")
     if isinstance(when, str):
         return when.replace("T", " ").rstrip("Z")
     return f"{run_id[:4]}-{run_id[4:6]}-{run_id[6:8]} {run_id[9:11]}:{run_id[11:13]}:{run_id[13:15]}"
+
+
+def zone():
+    """The time zone every time an engineer sees shows in, and is named by (`R.when_words`): the browser's, as
+    Streamlit reports it; None, which shows as UTC, when the browser gives none or one this computer does not know."""
+    try:
+        return ZoneInfo(hosted.timezone())
+    except Exception:  # noqa: BLE001 - none given, or not a zone known here: UTC
+        return None
+
+
+def started_at(record, run_id) -> datetime | None:
+    """A run's one start time, wherever an engineer sees it: the moment its id carries, when it was uploaded, which
+    every page has from the first; the record's own start only for an id not in that form."""
+    try:
+        return datetime.strptime(run_id[:16], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return R.moment(dig(record, "started_at"))
+
+
+def started_words(record, run_id, name=True) -> str:
+    return R.when_words(started_at(record, run_id), zone(), name=name)
 
 
 def pipeline(record, now=None) -> str:
@@ -304,11 +394,12 @@ def waiting(store, now) -> dict:
 
 
 def run_words(record, now=None) -> str:
-    """The pipeline's status in plain words, for the run list and the watch page: completed, failed, failed (stale),
-    running, or unknown.  Run details' `pipeline` adds the stage a run failed at."""
+    """The pipeline's status in plain words, for the run list and the watch page: completed, failed, stopped without
+    finishing (still recorded as running past its deadline), running, or unknown.  Run details' `pipeline` keeps the
+    record's own words and adds the stage a run failed at."""
     status, stale = run_status(record, now)
     if stale:
-        return "failed (stale)"
+        return STOPPED
     return {"succeeded": "completed", "failed": "failed", "running": "running"}.get(
         status if isinstance(status, str) else "", "unknown")
 
@@ -318,26 +409,67 @@ def document(record, labels) -> str:
     return text(R.document_name(record or {}) or R.document_name({"source": {"source_name": labels.get("source-name")}}))
 
 
+def confirmations(store) -> tuple[dict, dict]:
+    """The store's confirmed rows, as the run list and the watch page need them: {(environment, run id): the run's
+    latest row}, a confirmed run; and {(environment, document, organisation, well): the well's latest row for that
+    document}, whose version a new review of the document starts from."""
+    by_run, by_well = {}, {}
+    for row in store.rows():
+        for found, key in ((by_run, (row["environment"], row.get("run_id"))),
+                           (by_well, (row["environment"], row.get("document_sha256"), row["organization_id"],
+                                      row["well_id"]))):
+            if key not in found or C.latest(row) > C.latest(found[key]):
+                found[key] = row
+    return by_run, by_well
+
+
+def side(organisation, labels) -> str:
+    """Live wells or Test wells: where the run writes, by the review's own rule (`R.environment_for`)."""
+    return R.place(R.environment_for(organisation, labels))
+
+
+def review_words(store, run_id, record, labels, found) -> str:
+    """The run's review, as the run list and the watch page say it.  A confirmed run (`found`, `confirmations`) says
+    so, with where and the day.  A run with an entry to review: what the review page counts when it opens
+    (`R.left_to_check`: the entry as the run left it, against the catalogue, with what the document's latest confirmed
+    version for the well carries), in its words.  A run still running, not yet; any other, nothing to review."""
+    by_run, by_well = found
+    org, well = dig(record, "organization_id"), dig(record, "well_id")
+    environment = R.environment_for(org, labels)
+    if row := by_run.get((environment, run_id)):
+        return f"confirmed: {R.place(environment)}, {R.when_words(row['confirmed_at'], zone(), date=True)}"
+    if run_status(record) == ("running", False):
+        return "not yet"
+    entry = run_entry(lambda name: blob(store, run_id, name), record)
+    if entry is None:
+        return "nothing to review"
+    carried = by_well.get((environment, dig(record, "source", "pdf", "sha256"), org, well))
+    return R.left_words(R.left_to_check(entry, record, store.version_of(carried) if carried else None,
+                                        catalogue_names()[1]))
+
+
 def list_rows(store) -> pd.DataFrame:
     """One row per run, newest first: the columns the list shows (PLAIN_COLUMNS) and those its technical section
     shows (TECH_COLUMNS)."""
     now, latest, rows = datetime.now(timezone.utc), set(), []
     runs = set(store.run_ids())
     queue = waiting(store, now)                                              # S3 mode: uploads with no record
+    found = confirmations(store)                                             # the confirmed rows, read once
     for run_id in sorted(runs | set(store.launch_ids()), reverse=True):     # newest first
         labels = store.intake_labels(run_id) or {}                           # the upload's, when it kept them
         row = {"Open": "Open", "Run id": run_id, "Started (UTC)": started({}, run_id),
+               "Started": started_words({}, run_id, name=False),
                "Organisation": text(labels.get("organization-id")), "Well": text(labels.get("well-id")),
-               "Document": document({}, labels), "Latest": "", "Family": "—", "Route": "—", "Pipeline": "",
+               SIDE: side(labels["organization-id"], labels) if labels else "—", ORIGIN: R.origin_words(labels),
+               "Document": document({}, labels), NEWEST: "", "Family": "—", "Route": "—", RUN: "",
                "Pipeline, raw": "", "Document review": "—", "Error": "", "Cost": "", "Cost (USD)": None}
-        if R.automatic(labels):
-            row[ORIGIN] = R.AUTOMATIC
         if run_id in queue:
             state, waited = queue[run_id]
-            rows.append({**row, "Pipeline": state, "Pipeline, raw": state, "Waited": wait_text(waited)})
+            rows.append({**row, RUN: WAIT_WORDS.get(state, state), "Pipeline, raw": state,
+                         "Document review": "not yet", "Waited": wait_text(waited)})
             continue
         if run_id not in runs:
-            rows.append({**row, "Pipeline": "launched, no record", "Pipeline, raw": "launched, no record"})
+            rows.append({**row, RUN: "launched, no record", "Pipeline, raw": "launched, no record"})
             continue
         try:
             record = store.record(run_id)
@@ -350,44 +482,47 @@ def list_rows(store) -> pd.DataFrame:
             latest |= {key} if is_latest else set()
             row.update({
                 "Started (UTC)": started(record, run_id),
+                "Started": started_words(record, run_id, name=False),
                 "Organisation": text(org),
                 "Well": text(well, "no well"),
+                SIDE: side(org, labels) if org is not None else "—",
                 "Document": document(record, labels),
-                "Latest": "latest" if is_latest else "",
+                NEWEST: "newest completed run" if is_latest else "",
                 "Family": family(record),
                 "Route": route_of(record),
-                "Pipeline": run_words(record, now),
+                RUN: run_words(record, now),
                 "Pipeline, raw": run,
-                "Document review": review_line(record),
+                "Document review": review_words(store, run_id, record, labels, found),
                 "Error": f"{text(dig(error, 'code'))} at {text(dig(error, 'stage'))}" if isinstance(error, dict) else "",
                 "Cost (USD)": cost if isinstance(cost := dig(record, "cost_usd"), (int, float)) else None,
                 "Cost": f"${cost:.2f}" if isinstance(cost, (int, float)) else "",
             })
         except FileNotFoundError:
-            row.update({"Pipeline": "no record", "Pipeline, raw": "no run.json"})
+            row.update({RUN: "no record", "Pipeline, raw": "no run.json"})
         except Exception:  # noqa: BLE001 - an unreadable record still gets its row
-            row.update({"Pipeline": "record unreadable", "Pipeline, raw": "run.json unreadable"})
+            row.update({RUN: "record unreadable", "Pipeline, raw": "run.json unreadable"})
         rows.append(row)
     df = pd.DataFrame(rows)
-    for column in (ORIGIN, "Waited"):   # empty for every run but those an upload in the product started, or waiting
-        if column in df:
-            df[column] = df[column].fillna("")
+    if "Waited" in df:                  # empty for every run but an upload still waiting
+        df["Waited"] = df["Waited"].fillna("")
     return df
 
 
 def show_list(store):
     st.title("Design-document runs")
-    st.write("Each run takes one design document through detection, extraction, checks and storage. "
-             "**Pipeline** says whether extraction ran. **Document review** says whether the values need an "
-             "engineer's check.")
+    st.write("Each run reads one ESP design document and proposes the well's pump string and design values, for an "
+             "engineer to check against the document and confirm. Start one with **New run from a PDF**, or open a "
+             f"run below to review what it read. **{RUN}** says whether the document was read. **Document review** "
+             "says how many of its values are left for an engineer to check, or that the run is confirmed. **Wells** "
+             "says where a run writes: Live wells or Test wells.")
     st.button("New run from a PDF", icon=":material/upload_file:", on_click=goto, kwargs={"upload": "1"})
     df = list_rows(store)
     if df.empty:
-        st.info("This run store has no runs yet.")
+        st.info("There are no runs yet. Start one with New run from a PDF.")
         return
     names = ["Organisation", "Well"]
     shown = df.assign(**{c: df[c].map(wells.labels(df[c])) for c in names})    # marked, and no two alike
-    filters = {"Organisation": "org", "Well": "well", "Pipeline": "status"}
+    filters = {"Organisation": "org", "Well": "well", RUN: "status"}
     picked = {col: box.multiselect(col, sorted(shown[col].unique()), key=key, placeholder="All", bind="query-params")
               for box, (col, key) in zip(st.columns(3), filters.items())}
     view = shown
@@ -402,20 +537,28 @@ def show_list(store):
         "Open": st.column_config.ButtonColumn(key="open-run", on_click=open_run, type="tertiary", alignment="left",
                                               pinned=True, help="Open this run"),
         "Document": st.column_config.TextColumn(help="The PDF's file name, as it was uploaded"),
-        "Latest": st.column_config.TextColumn(help="The newest completed run for its organisation and well"),
-        "Pipeline": st.column_config.TextColumn(
-            help="Whether extraction ran: completed, failed or running; failed (stale) when a run stopped without "
-                 "recording its end. An upload not yet started is queued, not picked up, or expired."),
+        "Started": st.column_config.TextColumn(f"Started ({R.zone_name(zone())})",
+                                               help="When the run was started, in your browser's time zone"),
+        SIDE: st.column_config.TextColumn(help="Where the run writes when it is confirmed: Live wells are the "
+                                               "product's production wells, Test wells its test system's"),
+        NEWEST: st.column_config.TextColumn(help="Marks the newest completed run for its organisation and well"),
+        RUN: st.column_config.TextColumn(
+            help=f"Whether the document was read: completed, failed or running; {STOPPED} when a run ended without "
+                 "recording its end. An upload not yet started is waiting to start, not picked up, or expired."),
         "Document review": st.column_config.TextColumn(
-            help="The values that need an engineer's check. Separate from the pipeline."),
+            help="A confirmed run says so, with where it was written and the day. Otherwise: how many values the "
+                 "review opens with left to check; a review in progress in a browser is not counted until it is "
+                 "written."),
         "Cost": st.column_config.TextColumn(help="The model call's cost, in US dollars; empty when none is recorded"),
         "Waited": st.column_config.TextColumn(
             help=f"How long an upload has waited to start: not picked up after {intake.PICKUP_S // 60} min with no "
                  f"run running; expired after {intake.EXPIRY_S // 3600} h"),
         ORIGIN: st.column_config.TextColumn(
-            width="large", help="A design PDF an engineer uploaded in the ESP product, which started this run with no "
-                                "form"),
+            help="Here, with New run from a PDF; or automatically, by a design PDF an engineer uploaded in the ESP "
+                 "product"),
     })
+    if not SHOW:
+        return
     with st.expander("Run ids and codes (technical)"):
         st.caption("Each run as recorded: its run id, its vendor family and route, its pipeline status with the stage "
                    "it failed at, and its error code.")
@@ -437,7 +580,10 @@ def show_list(store):
 # ---- one run ----
 
 def goto(**view):
-    """Switch views: drop the current view's parameter and set the next one's (none: the run list)."""
+    """Switch views: drop the current view's parameter and set the next one's (none: the run list).  The places a
+    review's cards were drawn in are forgotten (`card_groups`): the next visit draws each where it now belongs."""
+    for key in [k for k in st.session_state if str(k).startswith("placed-")]:
+        del st.session_state[key]
     for key in ("run", "watch", "upload"):
         if key in st.query_params:
             del st.query_params[key]
@@ -466,17 +612,24 @@ UNKNOWN_LOOK = ("gray", ":material/help:")
 def pipeline_cell(record, technical=True):
     """Technical, the status with the stage a run failed at, above its field; else in plain words alone."""
     status, stale = run_status(record) if record else (None, False)
-    status_cell("Pipeline", ((pipeline if technical else run_words)(record)) if record else "unknown",
+    status_cell("Pipeline" if technical else RUN, ((pipeline if technical else run_words)(record)) if record else "unknown",
                 ("red", ":material/timer_off:") if stale else RUN_LOOK.get(text(status), UNKNOWN_LOOK),
                 "status", dig(record, "status"), technical)
 
 
-def review_cell(record, technical=True):
+def review_cell(record):
+    """Technical: the review as the run's record counts it, above its field."""
     shown = review_line(record) if record else "unknown"
     look = REVIEW_LOOK.get("no issues" if shown == "no issues" else "to check" if shown.endswith("to check") else "",
                            UNKNOWN_LOOK)
-    status_cell("Document review", shown, look, "spec_validation_status", dig(record, "spec_validation_status"),
-                technical)
+    status_cell("Document review", shown, look, "spec_validation_status", dig(record, "spec_validation_status"))
+
+
+def review_status(words):
+    """The engineer's: the review in the run list's words (`review_words`), in colour."""
+    look = (REVIEW_LOOK["no issues"] if words.startswith(("confirmed", "nothing left")) else
+            REVIEW_LOOK["to check"] if words.endswith("left to check") else UNKNOWN_LOOK)
+    status_cell("Document review", words, look, None, None, technical=False)
 
 
 def error_line(record):
@@ -936,12 +1089,17 @@ def source_pane(store, get, record, page_key):
             st.image(page_png(sha, page - 1, data), caption=" ".join(note), width="stretch")
 
 
+def run_entry(get, record) -> dict | None:
+    """The entry a run offers for review: its well_entry.json, when the run names a well."""
+    return stored_entry(get) if record and dig(record, "well_id") is not None else None
+
+
 def show_run(store, run_id):
     if run_id not in store.run_ids() and run_id in store.launch_ids():
         return show_watch(store, run_id)                 # launched, no record yet
     st.button("All runs", icon=":material/arrow_back:", on_click=goto, type="tertiary")
     if run_id not in store.run_ids():
-        st.warning(f"There is no run {plain(run_id)} in this store.")
+        st.warning(f"There is no run {plain(run_id)} in this store." if SHOW else NO_SUCH_RUN)
         return
     record, problem = {}, None
     try:
@@ -956,19 +1114,22 @@ def show_run(store, run_id):
         return blob(store, run_id, name)
 
     page_key, labels = f"page-{run_id}", store.intake_labels(run_id)
-    entry = stored_entry(get) if record and dig(record, "well_id") is not None else None
+    entry = run_entry(get, record)
     by_hand = entry is None and bool(record) and R.by_hand(record, entry_stored=stored(get, C.ENTRY),
                                                            pdf_found=source_pdf(store, record) is not None)
     confirmed = store.latest_version(dig(record, "source", "pdf", "sha256"), record.get("organization_id"),
                                      record["well_id"], R.environment_for(record.get("organization_id"), labels),
                                      run_id=run_id) if entry is not None or by_hand else None
     if entry is None and not confirmed and not (by_hand and st.session_state.get(f"by-hand-{run_id}")):
+        if not SHOW:
+            return plain_run(store, run_id, problem)
         title_block(run_id, record, problem, labels, offer=by_hand)   # the offer, if any
         return run_details(store, get, record, page_key)
     views = ("Confirmed entry" if confirmed else "Enter by hand" if entry is None else "Review & confirm",
              "Run details (technical)")
-    view = st.segmented_control("View", views, default=views[0], required=True, label_visibility="collapsed",
-                                key=f"view-{run_id}-{bool(confirmed)}")
+    view = views[0] if not SHOW else st.segmented_control(     # the switch off: the engineer's view, and no other
+        "View", views, default=views[0], required=True, label_visibility="collapsed",
+        key=f"view-{run_id}-{bool(confirmed)}")
     if view == views[1]:
         st.caption(TECHNICAL)
         title_block(run_id, record, problem, labels)
@@ -979,6 +1140,18 @@ def show_run(store, run_id):
         review_view(store, run_id, record, entry or empty_entry(record["organization_id"], record["well_id"]), get,
                     page_key)
     return True                                     # an engineer's screen: the sidebar names no bucket
+
+
+def plain_run(store, run_id, problem) -> bool:
+    """A run with nothing to review, with the switch off: in place of Run details, the watch page's words on what
+    happened to it and what to do next (Enter by hand, where the run offers it); or, its record missing or unreadable,
+    that.  An engineer's screen: True."""
+    if problem:
+        st.warning(f"This run's own record is missing or cannot be read, so there is nothing to show for it. Upload "
+                   f"the document again; if you need this run itself, tell {CONTACT}.")
+        hosted.hidden(f"run {run_id}", problem, key=("record", run_id))
+        return True
+    return watch(store, run_id, here=True)
 
 
 def run_details(store, get, record, page_key):
@@ -1013,12 +1186,30 @@ STATUS_LOOK = {C.SETTLED: ("green", ":material/check_circle:", "settled"),
                C.CORRECTED: ("blue", ":material/edit:", "corrected"),
                C.TO_CHECK: ("orange", ":material/flag:", "to check"),
                C.BLOCKS: ("red", ":material/block:", "blocks publish")}
+# A value nobody checked is never shown as settled: kept as read, or, the two Write or operations fill, not from the
+# document.
+KEPT_LOOK = ("gray", ":material/radio_button_unchecked:", R.KEPT_AS_READ)
+OUTSIDE_LOOK = ("gray", ":material/radio_button_unchecked:", "not from the document")
+TO_CHECK_GROUPS = ("found", "not found")
+GROUP_NAME = {"found": "Found", "not found": "Not found"}
 GROUP_HINT = {"found": "Read from the document, to check against it.",
-              "not found": "Nothing was read: settle each as empty if the document does not print it."}
+              "not found": "Nothing was read: settle each as empty if the document does not print it.",
+              "checked": "Settled or corrected by an engineer, here or in an earlier confirmation of this document.",
+              "kept": "Read with nothing flagged, so no one has checked these: each is written as read unless you "
+                      "correct it."}
+FOLDED = {"checked": ("Settled or corrected", ":material/task_alt:"),            # the groups shown folded
+          "kept": ("Kept as read, not checked", ":material/radio_button_unchecked:")}
 BATCH_TITLE = {"string": "The pump string", "found": "Values found", "not found": "Values not found"}
+BATCH = "Check group by group"                      # the button that opens the group checks, one pop-up each
+STARTED_AS = {C.SETTLED: "needed no check", C.TO_CHECK: "to check", C.BLOCKS: "blocks publish"}
 TECHNICAL = "The pipeline's own files for this run, exactly as it stored them: for checking the pipeline, not the design."
-NO_CATALOGUE = ("The pump catalogue could not be read on this computer, so models cannot be picked or checked here. "
-                "Whoever runs the app should check its set-up.")
+NO_CATALOGUE = f"The pump catalogue could not be read, so models cannot be picked or checked here. Tell {CONTACT}."
+NO_SUCH_RUN = "There is no such run. Go back to all runs, and open one from the list."
+REVIEW = ("Check each value below against the document beside it: settle it, correct it, or settle it as empty when "
+          f"the document does not print it. **{BATCH}** does the same a group at a time: the pump string, then the "
+          "values found, then those not found. When nothing is left to check, Write saves the well's entry.")
+WRITTEN = ("This entry is written, and nothing here can change it. To change the well's entry, start a new run from "
+           "the same document and confirm that one: what was corrected here comes back in it.")
 ROLE_WORDS = {None: "none", "primary": "primary", "taper": "taper", "gas_handler": "gas handler"}
 PRINTED_HELP = ("Give every name the document prints for this section, as printed: the equipment list's and the "
                 "schematic's, for instance, separated by semicolons.")
@@ -1062,7 +1253,8 @@ def catalogue_names():
     """(the snapshot, model -> has a head curve; its names), or (None, None) when it cannot be read here."""
     try:
         models = catalogue()
-    except Exception:  # noqa: BLE001 - no snapshot on this computer: the string's screens say so
+    except Exception as err:  # noqa: BLE001 - no snapshot here: the string's screens say so, the log says why
+        hosted.hidden("the pump catalogue could not be read", err, key=("catalogue", str(err)))
         return None, None
     return models, CatalogueNames(models)
 
@@ -1118,7 +1310,8 @@ def review_state(store, run_id, record, entry) -> dict:
 
 def context(store, run_id, record, state, page_key) -> SimpleNamespace:
     if "confirmer" not in st.session_state:                     # read once per app session
-        st.session_state["confirmer"] = R.confirmer(MODE, os.environ, getattr(store, "root", None))
+        st.session_state["confirmer"] = R.confirmer(MODE, os.environ, getattr(store, "root", None),
+                                                    headers=hosted.request_headers(), technical=SHOW)
     name, who = st.session_state["confirmer"]
     sha, pdf = dig(record, "source", "pdf", "sha256"), source_pdf(store, record)
     models, names = catalogue_names()
@@ -1127,7 +1320,7 @@ def context(store, run_id, record, state, page_key) -> SimpleNamespace:
                            dates=state["dates"], version=state["version"], name=name, who=who,
                            offline=MODE == "local" and name is not None, sha=sha, pdf=pdf, page_key=page_key,
                            models=models, names=names, scan=state["scan"], automatic=state["automatic"],
-                           manual=R.manual(state["entry"]))
+                           manual=R.manual(state["entry"]), store=store, just=state.get("just"))
 
 
 def source_pdf(store, record) -> bytes | None:
@@ -1165,14 +1358,35 @@ def document_pane(store, record, page_key, pdf=None):
     try:
         pdf, sha = shown_pdf(scan, pdf, sha, f"{page_key}-shown")
         total = page_count(sha, pdf)
-        page = st.number_input("Page", min_value=1, step=1, key=page_key)
+        turner = st.container(horizontal=True, vertical_alignment="bottom")
+        page = turner.number_input("Page", min_value=1, step=1, key=page_key)
         if page > total:
             st.warning(f"Page {page} is past the end of this {total}-page document.")
             return
+        if turner.button("Full size", icon=":material/zoom_out_map:", key=f"{page_key}-full"):
+            full_page(sha, pdf, total, page_key, name)
         with st.container(height=PANE - 120, border=False):
             st.image(page_png(sha, page - 1, pdf), caption=f"Page {page} of {total}", width="stretch")
     except Exception:  # noqa: BLE001 - a PDF that will not open: say so, the review carries on
         st.warning(BAD_PDF)
+
+
+def follow(key, page_key):
+    """The full-size pop-up's page was turned: the pane's page follows it."""
+    st.session_state[page_key] = st.session_state[key]
+
+
+def full_page(sha, pdf, total, page_key, name):
+    """One page at the pop-up's full width, large enough to read its print, opened on the pane's page (so on the page a
+    chip turned it to), with its own page turner, which the pane follows."""
+    @st.dialog(name or "Source document", width="large", on_dismiss="rerun")
+    @guarded
+    def body():
+        key = f"{page_key}-full-page"
+        page = st.number_input("Page", min_value=1, max_value=total, step=1, key=key, on_change=follow,
+                               value=min(st.session_state.get(page_key) or 1, total), args=(key, page_key))
+        st.image(page_png(sha, page - 1, pdf), caption=f"Page {page} of {total}", width="stretch")
+    body()
 
 
 def gate(ctx) -> tuple[bool, str]:
@@ -1203,9 +1417,9 @@ def gate(ctx) -> tuple[bool, str]:
     try:
         reasons = R.check(ctx.kept, ctx.review, ctx.entry, ctx.record, confirmed_by=ctx.name, environment=ctx.env,
                           catalogue=catalogue, at=datetime.now(timezone.utc))
-    except Exception:  # noqa: BLE001 - e.g. no catalogue snapshot: say why Write is off
-        return False, ("Write is off: the checks before writing could not run on this computer. Whoever runs the app "
-                       "should check its set-up.")
+    except Exception as err:  # noqa: BLE001 - e.g. no catalogue snapshot: say that Write is off; the log says why
+        hosted.hidden("the checks before Write could not run", err, key=("gate", str(err)))
+        return False, f"Write is off: the checks before writing could not run. Tell {hosted.contact()}."
     return (False, "Write is off. " + " ".join(dict.fromkeys(map(R.refusal_words, reasons)))) if reasons else (True, "")
 
 
@@ -1221,22 +1435,27 @@ def start_batch(run_id):
 
 
 def decide(run_id, how, key):
-    """A decision made one by one: settle, or settle as empty."""
+    """A decision made one by one, by a press on the page: settle, settle as empty, or back to the value as read.  The
+    value is marked as just decided (`actions`)."""
     state = st.session_state[f"review-{run_id}"]
     how(state["review"], state["entry"], key, at=now_text())
+    state["just"] = key
 
 
 def accept(run_id, key):
     state = st.session_state[f"review-{run_id}"]
     R.accept_anyway(state["review"], state["entry"], key, st.session_state.get(f"anyway-{run_id}-{key}") or "",
                     at=now_text())
+    state["just"] = key
 
 
-def save_correction(run_id, key):
+def save_correction(run_id, key) -> list[str]:
+    """The Correct form's fields, as the correction of `key`, the value it was opened from: [] when it is made, else
+    why not."""
     ss, base = st.session_state, f"fix-{run_id}-{key}"
     state = ss[f"review-{run_id}"]
     value, problem = R.parse_value(key, ss.get(f"{base}-value"))
-    ss[f"{base}-problems"] = [problem] if problem else R.correct(
+    return [problem] if problem else R.correct(
         state["review"], state["entry"], key, value=value, unit=ss.get(f"{base}-unit"), source=ss.get(f"{base}-source"),
         note=ss.get(f"{base}-note"), at=now_text())
 
@@ -1282,18 +1501,23 @@ def review_header(ctx, on, why):
                              ("Report", "entered by hand" if ctx.manual else R.report_words(ctx.record, ctx.scan)),
                              ("Design date", "none, entered by hand" if ctx.manual else
                               ctx.dates["incoming"] or "not printed"),
-                             ("Confirming as", ctx.name or "nobody")):
+                             ("Confirming as", ctx.name or NOBODY)):
             with facts_.container(gap=None, width="content"):
                 st.caption(label)
-                st.markdown(plain(value) if label in names else f"**{plain(value)}**")
+                if label == "Confirming as":                # as text, never Markdown: an address is no link
+                    st.text(value)
+                else:
+                    st.markdown(plain(value) if label in names else f"**{plain(value)}**")
         if signs := wells.key([text(org), well]):
             st.caption(signs)
+        if not ctx.manual:                                  # entered by hand, BY_HAND below says what to do
+            st.caption(REVIEW)
         notes = st.container(horizontal=True, vertical_alignment="center")
         if ctx.automatic:                                   # who uploaded is never shown
             notes.badge(R.AUTOMATIC, icon=AUTOMATIC_ICON, color="blue")
         if dig(ctx.record, "route") == "generic" and not ctx.manual:
             notes.badge(R.NOT_KNOWN, icon=":material/rate_review:", color="orange")
-        if ctx.who:
+        if ctx.who and ctx.name is not None:                # with no one to confirm as, the line beside Write says why
             notes.caption(plain(ctx.who))
         if ctx.manual:                                      # nothing was read: every value is typed
             st.info(plain(R.BY_HAND), icon=":material/edit_note:")
@@ -1304,13 +1528,13 @@ def review_header(ctx, on, why):
         dates_note(ctx)
         if ctx.version:
             carried = sum(v["carried"] for v in ctx.review["values"].values())
-            st.caption(f"Confirmed before: {carried} value{'s' * (carried != 1)} come{'s' * (carried == 1)} back from "
-                       f"{plain(R.confirmation_words(ctx.version))}.")
+            st.text(f"Confirmed before: {carried} value{'s' * (carried != 1)} come{'s' * (carried == 1)} back from "
+                    f"{R.confirmation_words(ctx.version, zone())}.")       # as text: it names who confirmed
         buttons = st.container(horizontal=True, vertical_alignment="center")
         nothing = next_step(ctx.review, ctx.entry) == "write"
-        buttons.button("Review in batches", icon=":material/done_all:", key=f"batch-{ctx.run_id}", disabled=nothing,
-                       on_click=start_batch, args=(ctx.run_id,),
-                       help="Nothing is left to batch" if nothing else "The string, then the values found, then those not found")
+        buttons.button(BATCH, icon=":material/done_all:", key=f"batch-{ctx.run_id}", disabled=nothing,
+                       on_click=start_batch, args=(ctx.run_id,),    # what it does: REVIEW, above.  No tooltip while it
+                       help="Nothing is left to check" if nothing else None)   # can be pressed: a pressed button's stays up
         buttons.button(f"Write to {R.place(ctx.env)}", type="primary", icon=":material/save:", key=f"write-{ctx.run_id}",
                        disabled=not on, on_click=open_dialog, args=(ctx.run_id, "write"))
         if not on:
@@ -1320,50 +1544,80 @@ def review_header(ctx, on, why):
 def value_line(ctx, key):
     """One value: its label, value and unit, printed text, page chips, status, reasons, and what can be done."""
     v, item, rid = ctx.review["values"][key], ctx.items[key], ctx.run_id
+    corrected = v["status"] == C.CORRECTED
     with st.container(border=True, key=f"line-{rid}-{key}"):
         head = st.container(horizontal=True, vertical_alignment="center", gap="small")
         head.markdown(f"**{plain(R.label(key))}**")
-        head.markdown(plain(shown(v["final"])) if v["final"] is not None else ":gray[*not found*]")
+        head.markdown(f":gray[*{R.REF_WORDS}*]" if key == C.DESIGN_DOCUMENT_REF else     # as the confirmed view has it
+                      plain(shown(v["final"])) if v["final"] is not None else
+                      ":gray[*empty*]" if corrected else ":gray[*not found*]")
         if item.get("printed") is not None:
             head.caption(f"printed “{plain(item['printed'])}”")
         chips(head, item.get("page"), ctx.page_key, f"chip-{rid}-{key}")
         status_badges(ctx, head, key)
+        if corrected:
+            st.caption(plain(correction_words(ctx, key)))
         if v["moved"] and not ctx.manual:                  # entered by hand, the new run read nothing
-            st.caption(f"The new run reads {plain(shown(R.proposal(ctx.entry, key)))}; the correction above is carried "
+            st.caption(f"The new run reads {plain(shown(R.proposal(ctx.entry, key)))}; the correction above comes "
                        "from the earlier confirmation.")
         words = [R.in_words(r) for r in item["reasons"]] + ([f"Note: {R.note_words(item['note'])}"] if item.get("note") else [])
-        if words:
-            st.caption(plain(" ".join(dict.fromkeys(words))))
+        if words:                                           # once corrected, they are about what was read
+            st.caption(plain(("About the value as read: " if corrected and not ctx.manual else "")
+                             + " ".join(dict.fromkeys(words))))
         if key != C.DESIGN_DOCUMENT_REF:
             actions(ctx, key)
 
 
+def correction_words(ctx, key) -> str:
+    """A corrected value's correction, under it: what it was corrected from, where the new value comes from when not
+    the document, and the note typed with it."""
+    v, read = ctx.review["values"][key], R.proposal(ctx.entry, key)
+    final = v["final"] or {}
+    said = ("Typed by hand." if ctx.manual else
+            f"Corrected from {shown(read)}, as read." if read is not None else "Corrected: nothing was read.")
+    if final.get("source") == "ops_entered":
+        said += f" From {R.SOURCE_WORDS['ops_entered']}."
+    return said + (f" Note with the correction: “{final['note']}”" if final.get("note") else "")
+
+
 def status_badges(ctx, parent, key):
     v = ctx.review["values"][key]
-    color, icon, label = STATUS_LOOK.get(v["status"], ("gray", ":material/help:", v["status"]))
+    color, icon, label = ((OUTSIDE_LOOK if key in R.NOT_FROM_THE_DOCUMENT else KEPT_LOOK)   # nobody checked it
+                          if R.unchecked(ctx.review, key) else
+                          STATUS_LOOK.get(v["status"], ("gray", ":material/help:", v["status"])))
     parent.badge(label, icon=icon, color=color)
     if v["accept_anyway"]:
         parent.badge("accepted anyway", icon=":material/gavel:", color="red", help=v["accept_anyway"])
-    if (n := R.pulled_out(ctx.review, key)) is not None:
-        parent.badge(f"pulled out of batch {n}", icon=":material/undo:", color="violet")
-    if v["carried"]:
-        parent.badge("carried", icon=":material/history:", color="gray",
-                     help=f"From {R.confirmation_words(ctx.version or {})}")
+    if R.pulled_out(ctx.review, key) is not None:
+        parent.badge("left out of a group check", icon=":material/undo:", color="violet")
+    if v["carried"]:                                        # the header names whose confirmation, as text
+        parent.badge("kept from before", icon=":material/history:", color="gray",
+                     help="Kept from the confirmation of "
+                          f"{R.when_words((ctx.version or {}).get('confirmed_at'), zone())}")
 
 
 def actions(ctx, key):
-    """Settle, correct, settle as empty, accept anyway: what the value's state allows."""
+    """Settle, correct, settle as empty, accept anyway, back to the value as read: what the value's state allows, each
+    button saying what it does.  A value decided a moment ago by a press here (`ctx.just`) shows one button only, at
+    the row's far end, which brings these back: its card has not moved (`card_groups`) and no button is where the
+    press was, so a second press does nothing."""
     v, rid = ctx.review["values"][key], ctx.run_id
+    if ctx.just == key:
+        st.container(horizontal=True, horizontal_alignment="right").button(
+            "Change it", icon=":material/tune:", key=f"again-{rid}-{key}")
+        return
     proposed, blocks = R.proposal(ctx.entry, key), R.blocking(ctx.review, ctx.entry, key)
     row = st.container(horizontal=True, gap="small")
     as_proposed = v["status"] == C.SETTLED and v["final"] == proposed and not v["accept_anyway"]
-    if not R.proposal_blocks(ctx.entry, key) and not as_proposed and (key == R.STRING or not ctx.manual):
+    settles = not R.proposal_blocks(ctx.entry, key) and not as_proposed and (key == R.STRING or not ctx.manual)
+    corrected = key != R.STRING and v["status"] == C.CORRECTED     # its Settle would undo it: said as that, and last
+    if settles and not corrected:
         row.button("Settle as empty" if key == R.STRING and ctx.manual else            # by hand, nothing is proposed
                    "Settle as proposed" if key == R.STRING else "Settle", icon=":material/check:",
                    key=f"settle-{rid}-{key}", on_click=decide, args=(rid, R.settle, key))
     if key != R.STRING:
-        with row.popover("Correct", icon=":material/edit:", key=f"fixpop-{rid}-{key}"):
-            correction_form(ctx, key)
+        row.button("Correct", icon=":material/edit:", key=f"correct-{rid}-{key}", on_click=open_dialog,
+                   args=(rid, f"fix:{key}"))
         if (v["final"] is not None or v["status"] in R.UNDECIDED) and not (blocks and proposed is None):
             row.button("Settle as empty", icon=":material/do_not_disturb_on:", key=f"empty-{rid}-{key}",
                        on_click=decide, args=(rid, R.settle_empty, key))
@@ -1373,36 +1627,67 @@ def actions(ctx, key):
                                placeholder="Recorded with the value as its accept-anyway reason")
             st.button("Accept anyway", type="primary", key=f"anyway-go-{rid}-{key}", disabled=not (why or "").strip(),
                       on_click=accept, args=(rid, key))
+    if settles and corrected and proposed is not None:
+        row.button("Back to the value as read", icon=":material/undo:", key=f"settle-{rid}-{key}", on_click=decide,
+                   args=(rid, R.settle, key))
     if key == R.STRING:
         row.button("Edit sections", icon=":material/table_edit:", key=f"sections-{rid}", on_click=edit,
                    args=(rid, R.open_editor), help="Edit the string's sections here, beside the document")
 
 
-def correction_form(ctx, key):
-    base, v = f"fix-{ctx.run_id}-{key}", ctx.review["values"][key]
-    current = v["final"] or R.proposal(ctx.entry, key) or {}
-    st.text_input("Value", value=text(current.get("value"), ""), key=f"{base}-value",
-                  help=R.PRESSURE_HELP if key in R.PRESSURES else None)
-    st.selectbox("Unit", R.allowed_units(key), key=f"{base}-unit", help="The units the product takes for this value")
-    st.selectbox("Source", R.SOURCES, index=R.SOURCES.index("ops_entered") if key == "vapor_pressure_psia" else 0,
-                 format_func=R.SOURCE_WORDS.get, key=f"{base}-source")
-    st.text_input("Note", key=f"{base}-note", placeholder="Optional")
-    st.button("Save the correction", type="primary", key=f"{base}-save", on_click=save_correction,
-              args=(ctx.run_id, key))
-    for problem in st.session_state.get(f"{base}-problems") or []:
-        st.error(plain(problem))
+def correction_dialog(ctx, key):
+    """The Correct form, as a pop-up named for its value: what was read and why it is flagged, the fields, and the
+    document's pages beside them, opened at the value's page.  One form at a time, opened from one value
+    (`open_dialog`) and saving that value only; a correction saved closes it, and nothing of it stays on screen."""
+    rid, base, v, item = ctx.run_id, f"fix-{ctx.run_id}-{key}", ctx.review["values"][key], ctx.items[key]
+
+    @st.dialog(f"Correct {R.label(key)}", width="large", on_dismiss=close_dialog)
+    @guarded
+    def body():
+        form, pages = st.columns([2, 3], gap="medium")
+        with pages:
+            dialog_pages(ctx, f"fix-{key}", [key])
+        with form:
+            read, current = R.proposal(ctx.entry, key), v["final"] or R.proposal(ctx.entry, key) or {}
+            st.caption(plain(" ".join(dict.fromkeys(
+                ["Nothing was read for this value." if read is None else
+                 f"Read as {shown(read)}" + (f", printed “{item['printed']}”." if item.get("printed") is not None
+                                             else "."),
+                 *(R.in_words(r) for r in item["reasons"])]))))
+            st.text_input("Value", value=text(current.get("value"), ""), key=f"{base}-value",
+                          help=R.PRESSURE_HELP if key in R.PRESSURES else None)
+            st.selectbox("Unit", R.allowed_units(key), key=f"{base}-unit",
+                         help="The units the product takes for this value")
+            st.selectbox("Source", R.SOURCES, index=R.SOURCES.index("ops_entered") if key == "vapor_pressure_psia" else 0,
+                         format_func=R.SOURCE_WORDS.get, key=f"{base}-source")
+            st.text_input("Note", key=f"{base}-note", placeholder="Optional")
+            problems = []
+            if st.button("Save the correction", type="primary", key=f"{base}-save"):
+                problems = save_correction(rid, key)
+                if not problems:                    # made: the form closes, and its fields go with it
+                    close_dialog()
+                    st.rerun()
+            for problem in problems:
+                st.error(plain(problem))
+    body()
 
 
 def sections_table(ctx, page_key, table_key):
-    """The string as read: one row per section, its page a button that turns `page_key`'s viewer."""
+    """The string as read: one row per section, its page a button that turns `page_key`'s viewer; then, under the
+    table, each flagged section's reason, whole: a table's cell would cut it, here and full screen."""
     block = ctx.entry["review"]["pump_string"]
     rows = [{"page": s.get("page"), "order": s.get("section_order"), "model": s.get("pump_model"),
              "as printed": s.get("pump_model_as_printed"), "stages": s.get("stages"),
-             "role": s.get("section_role") and R.words_of(s["section_role"]), "status": s.get("status"),
-             "why": " ".join(dict.fromkeys(R.in_words(r) for r in s.get("reasons") or []))}
+             "role": s.get("section_role") and R.words_of(s["section_role"]),
+             "flag": None if s.get("status") == C.SETTLED else s.get("status")}     # no flag is not a check passed
             for s in block["sections"]]
     if rows:
         table(cells(rows), table_key, page_key, "page")
+        for i, section in enumerate(block["sections"], 1):
+            if section.get("reasons"):
+                name = section.get("pump_model_as_printed") or section.get("pump_model")
+                st.caption(plain(f"{R.sentence_case(R.section_name(i))}{f' ({name})' if name else ''}: "
+                                 + " ".join(dict.fromkeys(map(R.in_words, section["reasons"])))))
     elif not ctx.manual:                                  # by hand, the checks below say to add them
         st.caption("No sections were read.")
 
@@ -1431,7 +1716,7 @@ def string_view(ctx, page_key, table_key):
         sections_table(ctx, page_key, table_key)
     else:
         carried = v["carried"] and len(v["history"]) == v["since"]
-        st.caption(f"Carried from {plain(R.confirmation_words(ctx.version or {}))}:" if carried else
+        st.caption("Kept from the earlier confirmation:" if carried else
                    "As entered:" if ctx.manual else "As corrected:")
         st.dataframe(cells(section_rows(v["sections"], v["display"])), hide_index=True)
         if not ctx.manual:                              # by hand, nothing was read to show beside it
@@ -1610,31 +1895,79 @@ FIELD_OF = {"model": "pump_model", "per": "stages_per_housing_as_printed", "role
 
 def review_view(store, run_id, record, entry, get, page_key):
     """Review & confirm: the decisions beside the PDF, the Write button always in view."""
-    ctx = context(store, run_id, record, review_state(store, run_id, record, entry), page_key)
+    state = review_state(store, run_id, record, entry)
+    ctx = context(store, run_id, record, state, page_key)
     on, why = gate(ctx)
     outcome_box(run_id)
     review_header(ctx, on, why)
-    groups = R.groups(ctx.review, ctx.entry)
+    drawn, now = card_groups(run_id, ctx.review, ctx.entry)
     left, right = st.columns([1, 1], gap="medium")
     with right:
         document_pane(store, record, page_key, ctx.pdf)
-    with left, st.container(height=PANE, border=False):
-        string_block(ctx)
-        for group in ("found", "not found"):
-            if groups[group]:
-                st.markdown(f"#### {group.capitalize()}: {len(groups[group])}")
-                st.caption(R.BY_HAND_HINT if ctx.manual else GROUP_HINT[group])
-                for key in groups[group]:
-                    value_line(ctx, key)
-        with st.expander(f"Decided: {len(groups['decided'])}", icon=":material/task_alt:"):
-            for key in groups["decided"]:
-                value_line(ctx, key)
+    with left:
+        st.caption(plain(scroll_cue(ctx, now)))
+        with st.container(height=PANE, border=False):
+            string_block(ctx)
+            for group in TO_CHECK_GROUPS:
+                if drawn[group]:
+                    st.markdown(f"#### {group_heading(group, drawn[group], now)}")
+                    st.caption(R.BY_HAND_HINT if ctx.manual else GROUP_HINT[group])
+                    for key in drawn[group]:
+                        value_line(ctx, key)
+            for group, (title, icon) in FOLDED.items():     # keyed: it stays open when its count changes
+                if drawn[group]:
+                    with st.expander(f"{title}: {sum(now[key] == group for key in drawn[group])}", icon=icon,
+                                     key=f"{group}-{run_id}"):
+                        st.caption(GROUP_HINT[group])
+                        for key in drawn[group]:
+                            value_line(ctx, key)
+    state.pop("just", None)                     # the next press anywhere brings the value's buttons back
     dialog = st.session_state.get("dialog")
     if dialog and dialog[0] == run_id:          # statements, not an expression: magic would write its None
         if dialog[1] == "write":
             write_dialog(ctx, on, why)
+        elif dialog[1].startswith("fix:"):
+            correction_dialog(ctx, dialog[1].removeprefix("fix:"))
         else:
             batch_dialog(ctx, dialog[1])
+
+
+def card_groups(run_id, review, entry) -> tuple[dict, dict]:
+    """({group: the keys whose cards it draws}, {key: the group the value is in now}).  The groups: found and not
+    found, the values still to check (`R.groups`); checked, those an engineer settled or corrected, here or in an
+    earlier confirmation; kept, those kept as read, which nobody checked.  A card stays in the group it was first drawn
+    in on this visit, so deciding a value moves no other card under the pointer; a value to check again is drawn
+    among those to check.  `goto` forgets the places: the next visit draws each value where it now belongs."""
+    now = {key: group for group, keys in R.groups(review, entry).items() if group in TO_CHECK_GROUPS for key in keys}
+    places = st.session_state.setdefault(f"placed-{run_id}", {})
+    drawn = {group: [] for group in (*TO_CHECK_GROUPS, *FOLDED)}
+    for key in R.reviewed(entry):
+        if key == R.STRING:
+            continue
+        now.setdefault(key, "kept" if R.unchecked(review, key) else "checked")
+        if now[key] in TO_CHECK_GROUPS:
+            places[key] = now[key]
+        drawn[places.setdefault(key, now[key])].append(key)
+    return drawn, now
+
+
+def group_heading(group, keys, now) -> str:
+    """`Found: 2`; once some of its cards are decided and still drawn there, `Found: 1 of 2 left to check`."""
+    left = sum(now[key] == group for key in keys)
+    return f"{GROUP_NAME[group]}: {left}" + ("" if left == len(keys) else f" of {len(keys)} left to check")
+
+
+def scroll_cue(ctx, now) -> str:
+    """Above the values, which scroll on their own beside the document: what among them is left to check, so that
+    none waits below what shows with nothing to say so."""
+    counts = {group: sum(g == group for g in now.values()) for group in TO_CHECK_GROUPS}
+    left = [*(["the pump string"] if R.undecided(ctx.review, ctx.entry, R.STRING) else []),
+            *([f"{counts['found']} value{'s' * (counts['found'] != 1)} found"] if counts["found"] else []),
+            *([f"{counts['not found']} not found"] if counts["not found"] else [])]
+    if not left:
+        return "Nothing in this list is left to check. The list scrolls on its own."
+    return (f"Left to check in this list: {R.join(left)}. The list scrolls on its own, so "
+            f"{'it' if len(left) == 1 and left[0] == 'the pump string' else 'some'} may be below what shows.")
 
 
 def dialog_pages(ctx, step, keys):
@@ -1665,7 +1998,8 @@ def pages_of(ctx, key) -> list[int]:
 def batch_dialog(ctx, step):
     rid, keys = ctx.run_id, R.groups(ctx.review, ctx.entry)[step]
 
-    @st.dialog(f"Batch: {BATCH_TITLE[step].lower()}", width="large", on_dismiss=close_dialog)
+    @st.dialog(f"Group check: {BATCH_TITLE[step].lower()}", width="large", on_dismiss=close_dialog)
+    @guarded
     def body():
         items, pages = st.columns([3, 2], gap="medium")
         with pages:
@@ -1693,21 +2027,22 @@ def batch_dialog(ctx, step):
                 pull = go.button("Leave it to check", key=f"dlg-pull-{rid}-{step}")
             else:                       # nothing ticked: the button pulls everything out
                 affirm = go.button(R.sentence(step, ctx.entry, sorted(chosen), scan=ctx.review.get("scan"))
-                                   if chosen else f"Pull {'it' if len(keys) == 1 else f'all {len(keys)}'} out",
+                                   if chosen else f"Leave {'it' if len(keys) == 1 else f'all {len(keys)}'} out",
                                    type="primary" if chosen else "secondary", key=f"dlg-go-{rid}-{step}")
                 pull = False
             if step == "string" and go.button("Edit sections", icon=":material/table_edit:", key=f"dlg-sections-edit-{rid}",
-                                              help="Pull the string out of this batch and edit its sections on the "
-                                                   "review, beside the document"):
+                                              help="Leave the string out of this group check and edit its sections "
+                                                   "on the review, beside the document"):
                 R.batch(ctx.review, ctx.entry, "string", set(), at=now_text())      # this batch's pull-out step
                 R.open_editor(ctx.review)
                 close_dialog()
                 st.rerun()
             if step != "string":
-                st.caption("Unticked values are pulled out: they stay to check and are marked on the review. A value "
-                           "that blocks publish cannot be ticked: decide it one by one.")
+                st.caption("Unticked values are left out of this group check: they stay to check and are marked on "
+                           "the review. A value that blocks publish cannot be ticked: decide it one by one.")
             elif not anyway:
-                st.caption("Unticked, the string is pulled out: it stays to check and is marked on the review.")
+                st.caption("Unticked, the string is left out of this group check: it stays to check and is marked on "
+                           "the review.")
             if affirm or pull:
                 R.batch(ctx.review, ctx.entry, step, set() if pull else chosen, at=now_text(),
                         reason=reason if anyway and not pull else None)
@@ -1745,11 +2080,13 @@ def write_dialog(ctx, on, why):
     rid, org, well = ctx.run_id, ctx.record.get("organization_id"), ctx.record["well_id"]
 
     @st.dialog(f"Write to {R.place(ctx.env)}", width="medium", on_dismiss=close_dialog)
+    @guarded
     def body():
         st.markdown(f"Writes to **{R.place(ctx.env)}**, organisation {plain(wells.marked(text(org)))}, well "  # names:
-                    f"{plain(wells.marked(well))}, confirming as **{plain(ctx.name or 'nobody')}**.")   # no emphasis
+                    f"{plain(wells.marked(well))}.")                                                    # no emphasis
         if signs := wells.key([text(org), well]):
             st.caption(signs)
+        named("Confirming as", ctx.name or NOBODY)
         name = R.document_name(ctx.record, ctx.scan)
         st.caption(f"Document: {plain(name) if name else 'the design document'}, entered by hand, no design date."
                    if ctx.manual else
@@ -1759,10 +2096,9 @@ def write_dialog(ctx, on, why):
         dates_note(ctx)
         tally = R.tally(ctx.review)
         st.markdown("What will be recorded:")
-        st.dataframe(pd.DataFrame([("left empty, as proposed" if ctx.manual and k == "settled by the extraction" else k,
-                                    tally[k]) for k in (
-            "settled one by one", "settled in batches", "pulled out", "corrected", "accepted anyway", "carried",
-            "settled by the extraction", "left to check")], columns=["Values", "Count"]), hide_index=True)
+        st.dataframe(pd.DataFrame([(UNTOUCHED if ctx.manual and k == "settled by the extraction" else words, tally[k])
+                                   for k, words in TALLY.items() if tally[k]],       # a row with none is left out
+                                  columns=["Values", "Count"]), hide_index=True)
         if not on:
             st.warning(plain(why))
         if st.button(f"Write to {R.place(ctx.env)}", type="primary", key=f"write-go-{rid}", disabled=not on):
@@ -1772,6 +2108,7 @@ def write_dialog(ctx, on, why):
             st.session_state[f"outcome-{rid}"] = out
             if out["status"] == C.WRITTEN:
                 st.session_state.pop(f"review-{rid}", None)
+                ctx.store.refresh()                 # the run list then says this run is confirmed
             close_dialog()
             st.rerun()
     body()
@@ -1783,16 +2120,18 @@ def confirmed_view(store, run_id, record, version, get, page_key):
     earlier = earlier_confirmations(store, record, version)
     pdf = source_pdf(store, record)
     with st.container(border=True):
-        st.markdown(f"**Confirmed**: written to **{R.place(version['environment'])}** by "
-                    f"**{plain(version['confirmed_by'])}** on {R.when_words(version['confirmed_at'])}.")
+        st.markdown(f"**Confirmed**: written to **{R.place(version['environment'])}** on "
+                    f"{plain(R.when_words(version['confirmed_at'], zone()))}.")
+        named("Confirmed by", text(version["confirmed_by"]))
         name = R.document_name(record, None if pdf is None else T.recognise(pdf))
         if version.get("entry_method") == C.MANUAL:
             st.caption(f"Document: {plain(name) if name else 'the design document'}. Entered by hand: nothing was read "
-                       "from it, and every value was typed from it. No design date.")
+                       f"from it. {typed_words(version)} No design date.")
         else:
             st.caption(f"Document: {plain(name) if name else 'the design document'}"
                        f"{', typed from the scan' if version.get('entry_method') == 'transcription' else ''}, design "
                        f"dated {plain(version.get('design_date') or 'not printed')}.")
+        st.caption(WRITTEN)
     left, right = st.columns([1, 1], gap="medium")
     with right:
         document_pane(store, record, page_key, pdf)
@@ -1800,14 +2139,21 @@ def confirmed_view(store, run_id, record, version, get, page_key):
         final_sections = version["pump_string"]["final_sections"]
         unwritten = final_sections and not dig(next(v for v in version["values"] if v["key"] == R.STRING), "final")
         rows = [{"value": R.label(v["key"]),
-                 "as written": (("recorded below, not written" if unwritten else "the string below")
-                                if v["key"] == R.STRING and final_sections else shown(v["final"])),
-                 "from": R.SOURCE_WORDS.get(dig(v, "final", "source")), "status": v["status"],
-                 "started as": v["starting_status"], "accepted anyway because": v.get("accept_anyway"),
+                 "as written": (WRITE_FILLED if v["key"] == C.DESIGN_DOCUMENT_REF else
+                                ("kept on record below: not in the well's entry" if unwritten else "the string below")
+                                if v["key"] == R.STRING and final_sections else
+                                "empty" if v["final"] is None and v["status"] == C.CORRECTED else shown(v["final"])),
+                 "from": "Write" if v["key"] == C.DESIGN_DOCUMENT_REF else R.SOURCE_WORDS.get(dig(v, "final", "source")),
+                 "status": written_status(v),
+                 "started as": STARTED_AS.get(v["starting_status"], v["starting_status"]),
+                 "accepted anyway because": v.get("accept_anyway"),
                  "how it was decided": decided_words(v, earlier, by_hand=version.get("entry_method") == C.MANUAL)}
                 for v in version["values"]]
+        st.caption("Each value as written. Its status says who decided it: settled or corrected by an engineer, or "
+                   "kept as read, which no one checked.")
         st.dataframe(cells(rows), hide_index=True)
-        st.markdown("#### The pump string as recorded, not written" if unwritten else "#### The pump string as written")
+        st.markdown("#### The pump string, kept on record: not in the well's entry" if unwritten else
+                    "#### The pump string as written")
         history = next(v for v in version["values"] if v["key"] == R.STRING).get("history") or []
         st.dataframe(cells(section_rows(final_sections, R.carried_display(final_sections, history)[0])), hide_index=True)
         failed = [R.in_words(f"{c['check']}: {c['why']}") for c in version["pump_string"]["checks_on_final_sections"]
@@ -1824,31 +2170,53 @@ def earlier_confirmations(store, record, version) -> dict:
             cid = (s.get("reason") or "").removeprefix("carried from ")
             if cid != (s.get("reason") or "") and cid not in out:
                 try:
-                    out[cid] = R.confirmation_words(C.load(store.objects.get(C.version_key(sha, cid))))
+                    out[cid] = R.confirmation_words(C.load(store.objects.get(C.version_key(sha, cid))), zone())
                 except Exception:  # noqa: BLE001 - not readable: the step says "an earlier confirmation"
                     out[cid] = None
     return out
 
 
+WRITE_FILLED = "filled in by Write"                 # design_document_ref, as the review said it would be
+
+
+def written_status(v) -> str:
+    """A written value's status, in the review's badges' words: never settled for a value nobody checked, in this
+    confirmation or in one it was kept from."""
+    if v["status"] == C.SETTLED and not R.decided_by_someone(v.get("history")):
+        return OUTSIDE_LOOK[2] if v["key"] in R.NOT_FROM_THE_DOCUMENT else R.KEPT_AS_READ
+    return {C.SETTLED: "settled", C.CORRECTED: "corrected"}.get(v["status"], v["status"])
+
+
+def typed_words(version) -> str:
+    """What an entry by hand typed from its document: its values, counted, and the pump string."""
+    n = sum(v["status"] == C.CORRECTED and v["final"] is not None for v in version["values"] if v["key"] != R.STRING)
+    typed = [*([f"{n} value{'s' * (n != 1)}"] if n else []),
+             *(["the pump string"] if version["pump_string"]["final_sections"] else [])]
+    return (f"Typed from it: {R.join(typed)}; every other value was left empty." if typed else
+            "Nothing was typed from it.")
+
+
 def decided_words(v, earlier, by_hand=False) -> str | None:
     """How a written value was decided: its last step, in words.  Entered by hand, the proposal read nothing."""
+    if v["key"] == C.DESIGN_DOCUMENT_REF:
+        return "it points to this confirmation's record"
     if not v.get("history"):
         return None
     step = v["history"][-1]
     if by_hand and step.get("by") == "extraction":
-        return "left empty, as proposed"
-    return R.step_words(step, earlier.get((step.get("reason") or "").removeprefix("carried from ")))
+        return UNTOUCHED
+    return R.step_words(step, earlier.get((step.get("reason") or "").removeprefix("carried from ")), zone())
 
 
 # ---- a new run, and watching it ----
 
 def read_words(listed, shown: str) -> str:
     """When the form's list was read, in plain words, and the rows it left out."""
-    at, n = listed.read_at, len(listed.pairs)
+    at, n = listed.read_at.astimezone(zone() or timezone.utc), len(listed.pairs)
     skipped = (f" {listed.skipped} row{'s' * (listed.skipped != 1)} with no organisation or no well "
                f"{'were' if listed.skipped != 1 else 'was'} left out.") if listed.skipped else ""
-    return (f"{shown}: {n} well{'s' * (n != 1)}, read from the product at {at:%H:%M} UTC on {at.day} {at:%B %Y}."
-            f"{skipped}")
+    return (f"{shown}: {n} well{'s' * (n != 1)}, read from the product at {at:%H:%M} {R.zone_name(zone())} on {at.day} "
+            f"{at:%B %Y}.{skipped}")
 
 
 def forget_choice():
@@ -1892,24 +2260,27 @@ def show_upload(store):
     st.title("New run from a PDF")
     st.write("Choose live or test wells, then the organisation and the well the design document belongs to, and "
              "upload the PDF. The run starts in the background, and you can watch it here.")
-    shown = st.segmented_control("Wells", list(WELL_LISTS.values()), default=WELL_LISTS["prd"], required=True,
-                                 key="new-wells", on_change=forget_choice,
+    shown = st.segmented_control("Wells", list(WELL_LISTS.values()), required=True, key="new-wells",
+                                 default=st.session_state.get("wells-chosen", WELL_LISTS["prd"]),   # the side last
+                                 on_change=forget_choice,                                           # chosen here
                                  help="Live wells are the product's production wells; test wells are its test "
                                       "system's, with lab-check.")
+    st.session_state["wells-chosen"] = shown        # kept for the session: the form comes back on this side
     environment = next(e for e, words in WELL_LISTS.items() if words == shown)
     with st.spinner(f"Reading the {shown.lower()} from the product"):
         listed, err = wells.cached(environment)
     if err is not None:                     # the form stays off: no list is offered but the product's
         st.error(f"The {shown.lower()} could not be read from the product, so the form is off. Retry; if it fails "
-                 "again, ask whoever runs the app.", icon=":material/cloud_off:")
+                 f"again, ask {CONTACT}.", icon=":material/cloud_off:")
         st.button("Retry", icon=":material/refresh:", on_click=wells.refresh, args=(environment,), key="new-retry")
-        with st.expander(TECH):
-            st.code(f"{type(err).__name__}: {err}", language=None, wrap_lines=True)
+        if tech(f"the {shown.lower()} could not be read", err):
+            with st.expander(TECH):
+                st.code(f"{type(err).__name__}: {err}", language=None, wrap_lines=True)
     else:
         line = st.container(horizontal=True, vertical_alignment="center")
         line.caption(read_words(listed, shown))
         line.button("Refresh", icon=":material/refresh:", type="tertiary", on_click=wells.refresh, args=(environment,),
-                    key="new-refresh", help=f"Read the {shown.lower()} from the product again")
+                    key="new-refresh")              # no tooltip: once pressed it would stay up, over the line beside it
     off = err is not None
     organisations = [] if off else [o for o in listed.organisations() if o != R.LAB_CHECK]
     if environment == "dev" and not off:                    # lab-check's wells are typed, never listed
@@ -1919,7 +2290,7 @@ def show_upload(store):
                        placeholder="Choose an organisation", disabled=off, key="new-org")
     if org == R.LAB_CHECK:
         typed = st.text_input("Well", key="new-typed", placeholder="Type the well's name",
-                              help="Any name: it is sent exactly as typed.")
+                              help="Any name is taken, exactly as you type it: check its spelling.")
         well = typed if typed.strip() else None
     else:
         names = [] if org is None else listed.wells(org)
@@ -1932,8 +2303,7 @@ def show_upload(store):
     refused = [REFUSED[name] for name in intake.refused(org, well)]         # the upload's labels' own rule
     if refused:                             # said as soon as the name is chosen, before any upload; Start stays off
         st.error(f"No run can start for this {' and this '.join(refused)} yet, because "
-                 f"{'its name holds' if len(refused) == 1 else 'each name holds'} a character the pipeline can't "
-                 "carry.")
+                 f"{'its name holds' if len(refused) == 1 else 'each name holds'} a character a run can't carry.")
     upload = st.file_uploader("Design document (PDF)", type="pdf", disabled=off, key="new-pdf")
     data = upload.getvalue() if upload is not None else b""
     if upload is not None and not data:
@@ -1956,12 +2326,13 @@ def show_upload(store):
     sha = hashlib.sha256(data).hexdigest()
     if ready and (dup := running_duplicate(store, sha, org, well, environment)):
         dup, state = dup
-        st.warning(f"A run of this PDF for this organisation and well is still running, started {started({}, dup)} "
-                   "UTC. You can start another." if state == "running" else
-                   f"An upload of this PDF for this organisation and well is waiting for the function ({state}), "
-                   f"since {started({}, dup)} UTC. You can start another.")
-    st.warning(COST, icon=":material/payments:")
-    confirmed = st.checkbox("I understand this starts a paid model call", disabled=not ready, key="new-confirm")
+        st.warning(f"A run of this PDF for this organisation and well is still running, started "
+                   f"{started_words({}, dup)}. You can start another." if state == "running" else
+                   f"An upload of this PDF for this organisation and well has not started yet "
+                   f"({WAIT_WORDS.get(state, state)}), since {started_words({}, dup)}. You can start another.")
+    st.info(DURATION, icon=":material/schedule:")
+    confirmed = st.checkbox("I've checked the organisation, the well and the document", disabled=not ready,
+                            key="new-confirm")
     if st.button("Start the run", type="primary", disabled=not (ready and confirmed)):
         try:
             run_id = intake.new_run_id(datetime.now(timezone.utc))
@@ -1972,9 +2343,10 @@ def show_upload(store):
                 intake.label(store.root, run_id, data, intake.labels(org, well, upload.name, sha, environment))
                 intake.launch(store.root, pdf, org, well, run_id, upload.name)
         except Exception as err:  # noqa: BLE001 - say that nothing started; why is technical
-            st.error("The run could not be started. Try again; if it fails again, ask whoever runs the app.")
-            with st.expander(TECH):
-                st.code(f"{type(err).__name__}: {err}", language=None, wrap_lines=True)
+            st.error(f"The run could not be started. Try again; if it fails again, ask {CONTACT}.")
+            if tech("a run could not be started", err):
+                with st.expander(TECH):
+                    st.code(f"{type(err).__name__}: {err}", language=None, wrap_lines=True)
             return
         goto(watch=run_id)
         st.rerun()
@@ -2010,62 +2382,88 @@ def watch_now(store, run_id):
     return intake.watch_state(record, run_id, now, intake.exited(run_id)), record
 
 
-def render_watch(store, run_id) -> str:
-    """The run's state, in plain words; what only whoever runs the app needs is in a technical section."""
+def render_watch(store, run_id, here=False) -> str:
+    """The run's state in plain words, and what to do next.  What only whoever looks after the app needs is a
+    technical section (`tech`): drawn with the switch on, logged with it off.  `here`: this is the run's own page
+    (`plain_run`), so nothing offers to open it."""
     state, record = watch_now(store, run_id)
     if state in WAITING:
         uploaded = store.uploaded_at(run_id)
-        waited = wait_text((datetime.now(timezone.utc) - uploaded).total_seconds()) if uploaded else "—"
-        if state == "queued":
-            st.info(f"Queued for {waited}: the upload is waiting for the function to pick it up.",
-                    icon=":material/hourglass_top:")
+        seconds = (datetime.now(timezone.utc) - uploaded).total_seconds() if uploaded else 0
+        waited = wait_text(seconds) if uploaded else "—"
+        if state == "queued":                               # under a minute, how long says nothing
+            st.info(f"Waiting to start{f', for {waited} so far' if seconds >= 60 else ''}: the upload is waiting its "
+                    f"turn. {FOLLOWS}", icon=":material/hourglass_top:")
         elif state == "not picked up":
-            st.warning(f"Not picked up: queued for {waited}, while no run is running. Whoever runs the app can find "
-                       "out why with the technical details.")
-            with st.expander(TECH):
-                st.markdown(f"Look for run id `{run_id}` in the run log (DynamoDB `esp_design_extraction_logging`, as "
-                            "its `pipeline_execution_id`): a `FAILED` row there means the function could not start "
-                            "the run. Its CloudWatch logs (`/aws/lambda/esp-design-extraction`) say more.")
+            st.warning(f"Not picked up: the upload has waited {waited}, while no run is running. Upload the PDF again; "
+                       f"if that upload is not picked up either, tell {CONTACT}.")
+            if tech("an upload was not picked up", f"run {run_id}, queued for {waited}", key=("not picked up", run_id)):
+                with st.expander(TECH):
+                    st.markdown(f"Look for run id `{run_id}` in the run log (DynamoDB `esp_design_extraction_logging`,"
+                                " as its `pipeline_execution_id`): a `FAILED` row there means the function could not "
+                                "start the run. Its CloudWatch logs (`/aws/lambda/esp-design-extraction`) say more.")
         else:
-            st.error(f"Expired: queued for {waited}, longer than a waiting upload is kept. It will not run: upload the "
-                     "PDF again.")
+            st.error(f"Expired: the upload waited {waited}, longer than a waiting upload is kept. It will not run: "
+                     "upload the PDF again.")
     elif state == "starting":
-        st.info("Starting: waiting for the run to write its record.", icon=":material/hourglass_top:")
+        st.info(f"Starting: the run is getting under way. {FOLLOWS}", icon=":material/hourglass_top:")
     elif state == "no record yet":
         age = int(intake.age_s(run_id, datetime.now(timezone.utc)))
-        st.info(f"No record yet, still running ({age} s).", icon=":material/hourglass_top:")
+        st.info(f"Still starting, after {age} s. {FOLLOWS}", icon=":material/hourglass_top:")
     elif state == "unreadable":
-        st.warning("The run's record is there but cannot be read yet. Checking again.")
+        st.warning("The run's status cannot be read yet. Checking again.")
     elif state == "launch failed":
-        reason = "the process has exited" if intake.exited(run_id) else f"{intake.STARTUP_S} s have passed"
-        st.error(f"Launch failed: the run wrote no record, and {reason}.")
-        with st.expander("Launch log (technical)"):
-            try:
-                lines = store.launch_log(run_id).decode("utf-8", "replace").splitlines()
-                st.caption("The last 50 lines of the launch log:")
-                st.code("\n".join(lines[-50:]) or "(empty)", language=None, wrap_lines=True)
-            except FileNotFoundError:
-                st.caption("There is no launch log for this run.")
+        reason = ("it stopped as soon as it started" if intake.exited(run_id) else
+                  f"nothing was heard from it for {intake.STARTUP_S} s")
+        st.error(f"The run did not start: {reason}. Upload the PDF again; if that run does not start either, tell "
+                 f"{CONTACT}.")
+        if tech("a run did not start", f"run {run_id}: {reason}; what it printed is in the run store, "
+                                       f"launch/{run_id}.log", key=("launch failed", run_id)):
+            with st.expander("Launch log (technical)"):
+                try:
+                    lines = store.launch_log(run_id).decode("utf-8", "replace").splitlines()
+                    st.caption("The last 50 lines of the launch log:")
+                    st.code("\n".join(lines[-50:]) or "(empty)", language=None, wrap_lines=True)
+                except FileNotFoundError:
+                    st.caption("There is no launch log for this run.")
     else:
         pipeline_cell(record, technical=False)
         start, deadline = when(record.get("started_at")), when(record.get("deadline_at"))
         end = when(record.get("ended_at")) or datetime.now(timezone.utc)
-        if start and deadline:
-            st.metric("Elapsed", f"{clock((end - start).total_seconds())} of "
-                                 f"{clock((deadline - start).total_seconds())}")
+        if start and (deadline or not SHOW):                            # its limit: a technical detail
+            st.metric("Elapsed", clock((end - start).total_seconds())
+                      + (f" of {clock((deadline - start).total_seconds())}" if SHOW else ""))
         failed = run_status(record)[0] == "failed"                      # stale too
         if state == "running":
-            st.caption("Current stage: not in the record, which is written when the run starts and again "
-                       "when it ends.")
+            st.caption(f"The document is being read, which takes 3 to 8 minutes. {FOLLOWS} When it finishes, open the "
+                       "run to check its values and confirm them.")
         else:
-            review_cell(record, technical=False)
-            if failed:
+            words = review_words(store, run_id, record, store.intake_labels(run_id), confirmations(store))
+            review_status(words)
+            entry = run_entry(lambda name: blob(store, run_id, name), record)
+            if words.startswith("confirmed"):
+                st.caption("This run is confirmed. Open the run to see what was written.")
+            elif failed or entry is None:                               # what happened, and what can be done
                 failed_screen(store, run_id, record)
-            st.button("Open the run", type="secondary" if failed else "primary", on_click=goto, kwargs={"run": run_id})
-        with st.expander("Run record (technical)"):
-            error_line(record)
-            st.json({k: record.get(k) for k in ("run_id", "status", "started_at", "deadline_at", "ended_at",
-                                                "spec_validation_status")})
+            else:
+                st.caption("The document has been read. Open the run to check its values against the document, and "
+                           "confirm them.")
+            if not here and (SHOW or entry is not None or words.startswith("confirmed")):   # the switch off: only
+                                                                        # a run with a review, or a confirmed one
+                st.button("Open the run", type="secondary" if failed else "primary", on_click=goto,
+                          kwargs={"run": run_id})
+        error = dig(record, "error")
+        if SHOW:
+            with st.expander("Run record (technical)"):
+                error_line(record)
+                st.json({k: record.get(k) for k in ("run_id", "status", "started_at", "deadline_at", "ended_at",
+                                                    "spec_validation_status")})
+        elif failed:                                                    # the record's error, to the log instead
+            hosted.hidden(f"run {run_id} failed",
+                          f"{text(dig(error, 'code'))} at {text(dig(error, 'stage'))}: {text(dig(error, 'message'))}"
+                          if isinstance(error, dict) else
+                          f"stale: still recorded as running after its deadline, {text(record.get('deadline_at'))}",
+                          key=("run failed", run_id))
     return state
 
 
@@ -2077,12 +2475,12 @@ def failed_screen(store, run_id, record):
     if R.by_hand(record, entry_stored=entry_stored, pdf_found=source_pdf(store, record) is not None):
         by_hand_offer(run_id, record, go=True)
     elif dig(record, "error", "code") != "IMAGE_ONLY":
-        st.info(R.failed_words(record, entry_stored=entry_stored), icon=":material/info:")
+        st.info(plain(R.failed_words(record, entry_stored=entry_stored)), icon=":material/info:")
 
 
 def watch_title(store, run_id, labels):
-    """The run as the engineer knows it, from its record or else its upload's labels: its document, organisation, well
-    and start; never its id."""
+    """The run as the engineer knows it, from its record or else its upload's labels: its document, organisation, well,
+    where it writes (Live or Test wells) and its start; never its id."""
     try:
         record = store.record(run_id)
     except Exception:  # noqa: BLE001 - no record yet, or not readable yet: the labels name it, or nothing does
@@ -2094,7 +2492,8 @@ def watch_title(store, run_id, labels):
     st.subheader(plain(name) if name != "—" else "A new run")
     st.caption(" · ".join([*([f"Organisation {plain(wells.marked(org))}"] if org else []),    # no emphasis: an
                            *([f"well {plain(wells.marked(well))}"] if well else []),           # edge space breaks it
-                           f"started {started(record, run_id)} UTC"]))
+                           *([side(org, labels)] if org else []),
+                           f"started {started_words(record, run_id)}"]))
     if signs := wells.key([n for n in (org, well) if n]):
         st.caption(signs)
 
@@ -2103,19 +2502,25 @@ def show_watch(store, run_id) -> bool:
     """Watching a run: True, an engineer's screen, whose sidebar names no bucket."""
     st.button("All runs", icon=":material/arrow_back:", on_click=goto, type="tertiary")
     if run_id not in store.run_ids() and run_id not in store.launch_ids():
-        st.warning("There is no such run in this store.")
+        st.warning(NO_SUCH_RUN)
         return True
+    return watch(store, run_id)
+
+
+def watch(store, run_id, here=False) -> bool:
+    """The run by name, then its state (`render_watch`), followed until it is final."""
     labels = store.intake_labels(run_id)
     watch_title(store, run_id, labels)
     if R.automatic(labels):
         st.badge(R.AUTOMATIC, icon=AUTOMATIC_ICON, color="blue")
     if watch_now(store, run_id)[0] in FINAL:
-        render_watch(store, run_id)
+        render_watch(store, run_id, here)
         return True
 
     @st.fragment(run_every=POLL_S)
+    @guarded
     def live():
-        if render_watch(store, run_id) in FINAL:
+        if render_watch(store, run_id, here) in FINAL:
             st.rerun()                      # final: render it once more, without the timer
     live()
     return True
@@ -2142,36 +2547,57 @@ def s3_sidebar(store, technical=True):
         if technical:
             st.caption(f"S3 mode: runs under `s3://{store.bucket}/{store.runs_prefix}`, uploads under "
                        f"`{store.intake_prefix}`." + (f" Listed at {listed:%H:%M:%S} UTC." if listed else ""))
-        elif listed:
-            st.caption(f"Runs read at {listed:%H:%M:%S} UTC.")
+        else:                                   # what Refresh does is said here, not in a tooltip: a pressed
+            asof = (f"The run list is as of {listed.astimezone(zone() or timezone.utc):%H:%M} "    # button's stays up
+                    f"{R.zone_name(zone())}. ") if listed else ""
+            st.caption(f"{asof}Refresh reads it again.")
         st.button("Refresh", icon=":material/refresh:", on_click=store.refresh,
-                  help="List the bucket again, and re-read every run that is not final" if technical
-                  else "Read the runs again")
+                  help="List the bucket again, and re-read every run that is not final" if technical else None)
 
 
 st.set_page_config(page_title="Design-document runs", page_icon=":material/description:", layout="wide")
-STORE = local_store_from_env() if MODE == "local" else s3_store_from_env() if MODE == "s3" else None
+# An error outside the page's own handling (a button's callback): Streamlit's traceback, or, with the switch off, its
+# one line that says nothing of the error; Streamlit logs the traceback to standard error either way.
+st.set_option("client.showErrorDetails", "full" if SHOW else "none")
+try:
+    hosted.role()                           # one of the two role settings without the other: said before any AWS call
+    STORE, NOT_SET, COMMAND = (local_store_from_env() if MODE == "local" else s3_store_from_env() if MODE == "s3"
+                               else None), None, None
+except hosted.SetUp as err:
+    STORE, NOT_SET, COMMAND = None, str(err), None
+except Exception as err:  # noqa: BLE001 - S3 mode's session not built (the role not assumed): as runs not read
+    st.title("Design-document runs")
+    failed(err)
+    st.stop()
 if STORE is None:
     st.title("Design-document runs")
-    if MODE == "local":
-        st.info(f"Set {STORE_ENV} to a run store directory, then start the viewer again.")
-        st.code(f"{STORE_ENV}=<run store dir> streamlit run app/main.py", language="bash")
-    elif MODE == "s3":
-        st.info(f"S3 mode reads the bucket the Lambda writes: set {', '.join(S3_ENV)} as the stack sets them, "
-                "each prefix ending in /, then start the viewer again.")
+    if NOT_SET is None and MODE == "local":
+        NOT_SET, COMMAND = (f"Set {STORE_ENV} to a run store directory, then start the viewer again.",
+                            f"{STORE_ENV}=<run store dir> streamlit run app/main.py")
+    elif NOT_SET is None and MODE == "s3":
+        NOT_SET = (f"S3 mode reads the bucket the Lambda writes: set {', '.join(S3_ENV)} as the stack sets them, "
+                   "each prefix ending in /, then start the viewer again.")
+    elif NOT_SET is None:
+        NOT_SET = f"{MODE_ENV} is {plain(MODE)}: it must be local or s3."
+    if not tech("the app is not set up", NOT_SET, key=("set-up", NOT_SET)):     # which setting: to the log
+        st.error(f"This app is not set up yet, so it has nothing to show. Tell {CONTACT}.")
+    elif MODE in ("local", "s3"):
+        st.info(NOT_SET)
+        if COMMAND:
+            st.code(COMMAND, language="bash")
     else:
-        st.error(f"{MODE_ENV} is {plain(MODE)}: it must be local or s3.")
-elif MODE == "s3":
-    engineer = not st.query_params.get("run")      # a run's own page is technical until it opens on a review
-    try:
-        engineer = route(STORE) is True
-    except Exception as err:  # noqa: BLE001 - credentials, network or permissions: plain words, the rest technical
-        st.error(f"The run{'' if st.query_params.get('run') else 's'} could not be read. Your AWS sign-in may have "
-                 "expired: sign in again, then reload the page.")
-        with st.expander(TECH):
-            st.code(f"S3 could not be read ({type(err).__name__}: {err}). Check the AWS credentials (AWS_PROFILE; an "
-                    "expired SSO session needs `aws sso login`) and the bucket variables.", language=None,
-                    wrap_lines=True)
-    s3_sidebar(STORE, technical=not engineer)
+        st.error(NOT_SET)
 else:
-    route(STORE)
+    if MODE == "s3" and "catalogue-asked" not in st.session_state:
+        st.session_state["catalogue-asked"] = True      # a session asks once; a process fetches it once
+        try:
+            hosted.fetch_catalogue(STORE.client, STORE.bucket)
+        except Exception as err:  # noqa: BLE001 - no catalogue: the review says so where it needs one, the log why
+            hosted.hidden("the pump catalogue could not be fetched", err)
+    engineer = not SHOW or not st.query_params.get("run")   # a run's own page is technical until it opens on a review
+    try:
+        engineer = route(STORE) is True or not SHOW
+    except Exception as err:  # noqa: BLE001 - plain words, the rest technical
+        failed(err)
+    if MODE == "s3":
+        s3_sidebar(STORE, technical=not engineer)

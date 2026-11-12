@@ -4,6 +4,7 @@ own records are needed, the Lambda handler writes them into the same fake.  No A
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -28,9 +29,10 @@ from test_viewer import FULL, PDF, PDF_SHA, record, runs, texts
 BUCKET, INTAKE, RUNS = TL.BUCKET, TL.INTAKE, TL.RUNS
 # The run list's column (app/main.py) and its words (app/review.py) for a run an upload in the product started.
 ORIGIN, AUTOMATIC = "How it started", "Started automatically by an upload in the product"
+HERE = "Started here, with New run"
 ORG, WELL = "Org Alpha", "Well  #1"            # test_intake's invented ids, the form's first choices below
-COST = ("This calls Opus on Bedrock in the datascience account; recent runs cost about USD 0.55–1.32 and "
-        "take 3–8 minutes.")
+DURATION = ("A run takes 3 to 8 minutes. When it finishes, you check what it read against the document, and confirm "
+            "it.")
 needs_assets = pytest.mark.skipif(not os.environ.get(ASSETS_ENV), reason=f"the pipeline reads the assets; set {ASSETS_ENV}")
 
 
@@ -170,7 +172,7 @@ def test_encoding_refuses_what_the_handler_would(values, bad):
 
 def test_the_forms_checks_stay_and_nothing_is_sent_unconfirmed(fake):
     at = form()
-    assert COST in texts(at.warning) and start_button(at).disabled
+    assert DURATION in texts(at.info) and start_button(at).disabled
     for name, content, message in (("a.pdf", b"", "empty"), ("b.pdf", b"not a pdf", "does not start with %PDF-")):
         at.file_uploader(key="new-pdf").upload(name, content, "application/pdf").run()
         assert any(message in e for e in texts(at.error)) and start_button(at).disabled
@@ -191,7 +193,7 @@ def test_an_upload_has_the_key_type_and_labels_and_the_handler_accepts_them(fake
     assert fake.metadata[key] == {**encode_labels(org, well, "Désign report 1.pdf", PDF_SHA), "environment": environment}
     assert S.s3_store_from_env().intake_labels(run_id)["environment"] == environment     # as the writer reads it
     assert optional_labels(fake.metadata[key]) == {"environment": environment}
-    assert any(i.startswith("Queued for") for i in texts(at.info))              # now on the watch view
+    assert any(i.startswith("Waiting to start: ") for i in texts(at.info))      # now on the watch view
     operation, first = handler(run_id).writes[0]     # the handler's own validation: its RUNNING row follows it
     assert (operation, first["status"], first["organization_id"], first["well_ids"]) == ("PutItem", "RUNNING", org, [well])
     assert json.loads(first["data_json"])["source_name"] == "Désign report 1.pdf"
@@ -278,9 +280,10 @@ def test_the_list_shows_each_state(fake, handler):
     at = app()
     df, raw = runs(at), at.dataframe[1].value.set_index("Run id")
     assert list(df.index) == [expired, late, queued, stale, failed, done]
-    assert df.loc[[done, failed, stale], "Pipeline"].tolist() == ["completed", "failed", "failed (stale)"]
+    assert df.loc[[done, failed, stale], "Run"].tolist() == ["completed", "failed", "stopped without finishing"]
     assert (raw.loc[failed, "Pipeline, raw"], raw.loc[failed, "Error"]) == ("failed at labels", "INTAKE_INVALID at labels")
-    assert df.loc[[queued, late, expired], "Pipeline"].tolist() == ["queued", "not picked up", "expired"]
+    assert df.loc[[queued, late, expired], "Run"].tolist() == ["waiting to start", "not picked up", "expired"]
+    assert df.loc[[queued, late, expired], "Document review"].tolist() == ["not yet"] * 3
     assert df.loc[[queued, late, expired], "Waited"].tolist() == ["2 min", "10 min", "7 h 0 min"]
     assert df.loc[[queued, stale], "Organisation"].tolist() == [ORG, ORG]      # from the uploads' labels
 
@@ -291,17 +294,18 @@ def test_with_a_run_running_a_long_wait_is_still_queued(fake, handler):
     as_running(fake, handler, running)
     upload(fake, late, age=timedelta(minutes=10))
     df = runs(app())
-    assert df.loc[running, ["Pipeline", "Well"]].tolist() == ["running", "Well\u2423\u2423#1"]     # spacing marked
-    assert df.loc[late, "Pipeline"] == "queued"
+    assert df.loc[running, ["Run", "Well"]].tolist() == ["running", "Well\u2423\u2423#1"]     # spacing marked
+    assert df.loc[late, "Run"] == "waiting to start"
     metrics = {m.label: m.value for m in app(run=running).metric}            # its technical page: exactly
     assert (metrics["Organisation"], metrics["Well"]) == (ORG, WELL)
 
 
 @pytest.mark.parametrize("age,running,element,shown", [
-    (timedelta(minutes=1), False, "info", "Queued for 1 min"),
-    (timedelta(minutes=10), True, "info", "Queued for 10 min"),
-    (timedelta(minutes=10), False, "warning", "Not picked up: queued for 10 min"),
-    (timedelta(hours=7), False, "error", "Expired: queued for 7 h 0 min"),
+    (timedelta(seconds=5), False, "info", "Waiting to start: the upload is waiting its turn."),   # no "for 5 s"
+    (timedelta(minutes=1), False, "info", "Waiting to start, for 1 min so far: "),
+    (timedelta(minutes=10), True, "info", "Waiting to start, for 10 min so far: "),
+    (timedelta(minutes=10), False, "warning", "Not picked up: the upload has waited 10 min"),
+    (timedelta(hours=7), False, "error", "Expired: the upload waited 7 h 0 min"),
 ])
 def test_the_watch_view_shows_an_uploads_wait(fake, handler, age, running, element, shown):
     run_id = rid(5)
@@ -321,14 +325,14 @@ def test_the_watch_view_follows_an_upload_to_its_final_record(fake):
     run_id = rid(5)
     upload(fake, run_id)
     at = app(watch=run_id)
-    assert any(i.startswith("Queued for") for i in texts(at.info))
+    assert any(i.startswith("Waiting to start") for i in texts(at.info))
     stored_run(fake, run_id, {"run_id": run_id, "status": "running", "started_at": R.utc(datetime.now(timezone.utc)),
                               "deadline_at": "2999-01-01T00:00:00Z"})
     at.run()
-    assert "Pipeline: running" in markdown(at)
+    assert "Run: running" in markdown(at)
     stored_run(fake, run_id, record(run_id))
     at.run()
-    assert "Pipeline: completed" in markdown(at)
+    assert "Run: completed" in markdown(at)
     next(b for b in at.button if b.label == "Open the run").click().run()
     assert [t.label for t in at.tabs][:1] == ["Summary"]                       # the run's own page
 
@@ -337,8 +341,8 @@ def test_the_watch_view_follows_an_upload_to_its_final_record(fake):
 
 @pytest.mark.parametrize("case,warned", [
     ("running", "is still running"),
-    ("queued", "is waiting for the function (queued)"),
-    ("not picked up", "is waiting for the function (not picked up)"),
+    ("queued", "has not started yet (waiting to start)"),
+    ("not picked up", "has not started yet (not picked up)"),
     ("expired", None),
     ("stale", None),
     ("another well", None),
@@ -413,8 +417,8 @@ def test_an_unknown_mode_is_refused_and_s3_needs_its_variables(fake, monkeypatch
 def test_an_s3_failure_is_said_plainly(fake):
     fake.fail["ListObjectsV2", INTAKE] = TL.client_error(400, "ExpiredToken", "ListObjectsV2")
     at = app()
-    assert texts(at.error) == ["The runs could not be read. Your AWS sign-in may have expired: sign in again, then "
-                               "reload the page."]
+    assert texts(at.error) == ["The runs could not be read. Reload the page; if it fails again, tell whoever looks "
+                               "after this app."]
     assert "S3 could not be read (ClientError" in technical(at) and "aws sso login" in technical(at)
     no_id_or_code(at)
 
@@ -427,8 +431,8 @@ def test_the_list_upload_and_watch_pages_sidebar_says_only_when_the_runs_were_re
     names = (ORG, "org alpha", "Beta Org", WELL, "well #2", "doc.pdf", "org-test", "well-a")
     for at in (app(), app(upload="1"), app(watch=queued), app(watch=done)):
         said = texts(at.sidebar.caption)
-        assert len(said) == 1 and said[0].startswith("Runs read at ") and [b.label for b in at.sidebar.button] == [
-            "Refresh"]
+        assert len(said) == 1 and re.fullmatch(r"The run list is as of \d\d:\d\d UTC\. Refresh reads it again\.", said[0])
+        assert [(b.label, b.help or None) for b in at.sidebar.button] == [("Refresh", None)]   # no tooltip to stay up
         no_id_or_code(at, *names)
     at = app(run=done)                                  # Run details, technical: where S3 mode reads
     assert any(BUCKET in c for c in texts(at.sidebar.caption))
@@ -457,9 +461,10 @@ def test_the_store_gives_the_optional_labels_beside_the_four(fake):
 
 
 def test_a_run_the_product_started_says_so_in_the_list_and_on_its_queue_and_watch_pages(fake):
-    pushed, form, queued = rid(1), rid(2), rid(3)
-    upload(fake, form)
-    assert ORIGIN not in app().dataframe[0].value                      # the form's uploads alone: the list as before
+    pushed, form, queued, bare = rid(1), rid(2), rid(3), rid(4)
+    upload(fake, form, metadata={**encode_labels(ORG, WELL, "doc.pdf", PDF_SHA), "environment": "prd"})   # as the form's
+    upload(fake, bare)                                                 # the four labels alone: not the form's
+    assert runs(app())[ORIGIN].tolist() == ["not recorded", HERE]      # never blank
     for run_id in (pushed, queued):
         upload(fake, run_id, metadata=pushed_labels())
     stored_run(fake, pushed, record(pushed))                           # one has its run, one is queued
@@ -467,12 +472,14 @@ def test_a_run_the_product_started_says_so_in_the_list_and_on_its_queue_and_watc
     at = app()
     df = runs(at)
     assert df.loc[[queued, pushed], ORIGIN].tolist() == [AUTOMATIC, AUTOMATIC]
-    assert df.loc[[queued, pushed], "Pipeline"].tolist() == ["queued", "completed"] and df.loc[form, ORIGIN] == ""
-    assert list(df.columns[2:4]) == ["Well", ORIGIN]                            # beside the organisation and well
+    assert df.loc[[queued, pushed], "Run"].tolist() == ["waiting to start", "completed"] and df.loc[form, ORIGIN] == HERE
+    assert df.loc[[queued, pushed, form], "Wells"].tolist() == ["Test wells", "Test wells", "Live wells"]
+    assert list(df.columns[:4]) == ["Open", "Organisation", "Well", "Wells"] and ORIGIN in df     # the side: beside
+                                                                                                # the organisation and well
     pages = [at]
     for run_id, says in ((queued, True), (form, False)):
         watch = app(watch=run_id)
-        assert any(i.startswith("Queued for") for i in texts(watch.info))
+        assert any(i.startswith("Waiting to start") for i in texts(watch.info))
         assert (AUTOMATIC in " ".join(texts(watch.markdown))) == says
         pages.append(watch)
     assert not [s for page in pages for s in screen(page) if UPLOADER in s]       # who uploaded is never shown

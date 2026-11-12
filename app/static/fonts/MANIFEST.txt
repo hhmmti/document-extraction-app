@@ -1,0 +1,16 @@
+# The app's fonts, served by the app itself (.streamlit/config.toml: static serving, and one font face per file), so
+# that a page asks no outside server for them.  Each file is a verbatim copy from the google/fonts repository on
+# GitHub, fetched 2026-11-10 from its main branch; each family's OFL.txt, its licence (SIL Open Font License 1.1), is
+# beside its files and is kept word for word.  The SHA-256 is the pin: the branch may move.
+# Columns: SHA-256, file, source URL.  tests/test_hosted.py checks every file here against its SHA-256.
+
+95aa02c7c43096e0dd44d787ba6216864a67157e402adab59b35572e0c1577ea  barlow/Barlow-Regular.ttf  https://raw.githubusercontent.com/google/fonts/main/ofl/barlow/Barlow-Regular.ttf
+f8906f762cb73dca441da034bc363b2d8e2e68bc10d5c05e58717646c20cc4b4  barlow/Barlow-Medium.ttf  https://raw.githubusercontent.com/google/fonts/main/ofl/barlow/Barlow-Medium.ttf
+86577cb32f8abe3673db53ca0f4221e6856751a4f6730c867e00f720f8bb1fc5  barlow/Barlow-SemiBold.ttf  https://raw.githubusercontent.com/google/fonts/main/ofl/barlow/Barlow-SemiBold.ttf
+186d750eb496a4c17a76385f82be6aea2ac1cf2de074a811d63786cf374ea73f  barlow/OFL.txt  https://raw.githubusercontent.com/google/fonts/main/ofl/barlow/OFL.txt
+4998b693a190b76f2b11315844345a8546c1e2e6a320905507a9eed04edf8b48  barlowsemicondensed/BarlowSemiCondensed-Medium.ttf  https://raw.githubusercontent.com/google/fonts/main/ofl/barlowsemicondensed/BarlowSemiCondensed-Medium.ttf
+bd299f4bc5b44d30be8d42e9bad3a5df7d66af1cd55d0ed72a8b8916360a1424  barlowsemicondensed/BarlowSemiCondensed-SemiBold.ttf  https://raw.githubusercontent.com/google/fonts/main/ofl/barlowsemicondensed/BarlowSemiCondensed-SemiBold.ttf
+186d750eb496a4c17a76385f82be6aea2ac1cf2de074a811d63786cf374ea73f  barlowsemicondensed/OFL.txt  https://raw.githubusercontent.com/google/fonts/main/ofl/barlowsemicondensed/OFL.txt
+6a3412f058c7d8dfd9170c41e85ade48e5156ecb89356110ca57a0a27734af46  ibmplexmono/IBMPlexMono-Regular.ttf  https://raw.githubusercontent.com/google/fonts/main/ofl/ibmplexmono/IBMPlexMono-Regular.ttf
+a9b4c49bb299e05b5f6c481e7fb5e78943d2793249a0c8874ab574a2d1ea6755  ibmplexmono/IBMPlexMono-Medium.ttf  https://raw.githubusercontent.com/google/fonts/main/ofl/ibmplexmono/IBMPlexMono-Medium.ttf
+7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da  ibmplexmono/OFL.txt  https://raw.githubusercontent.com/google/fonts/main/ofl/ibmplexmono/OFL.txt

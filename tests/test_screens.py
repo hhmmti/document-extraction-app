@@ -390,6 +390,7 @@ def walk(at, rid):
     groups = R.groups(review, entry)
     number = next((k for g in ("found", "not found") for k in groups[g] if VALUE_TYPE.get(k) == "double"), None)
     if number:                                          # a correction refused, with its reason shown
+        at.button(key=f"correct-{rid}-{number}").click().run()
         at.text_input(key=f"fix-{rid}-{number}-value").input("x").run()
         at.button(key=f"fix-{rid}-{number}-save").click().run()
         yield "review mode, a correction refused", at

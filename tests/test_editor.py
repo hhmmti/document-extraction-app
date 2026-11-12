@@ -192,7 +192,7 @@ def test_b_gas_handlers_not_in_the_catalogue_are_recorded_and_not_written(store)
     assert version["pump_string"]["final_sections"] == v["sections"]                         # the version keeps it
     assert {c["check"]: c["result"] for c in version["pump_string"]["checks_on_final_sections"]}["models"] == "fail"
     assert R.step_words({**recorded(version)["history"][-1], "by": "tester"}).startswith(
-        "sections edited (2 added; not written, 2 sections not in the catalogue), by tester")
+        "sections edited (2 added; kept on record only, 2 sections not in the catalogue), by tester")
 
 
 # ---- (c) an order check failing after an edit: accepted anyway, the edits kept ----
@@ -427,7 +427,7 @@ def test_g_the_rerun_on_screen(offline, fresh_catalogue):
     rerun(offline, e2)
     at = app(run=RERUN)
     said = texts(at.caption)
-    assert any(c.startswith("Carried from tester's confirmation of") for c in said)
+    assert "Kept from the earlier confirmation:" in said
     assert any("Recorded, not written" in i for i in texts(at.info))
     plain_words(at, e2, WHY, "REDA 400/400 MGH", "REDA 400/400 AGH")
 
@@ -468,7 +468,7 @@ def test_h_a_catalogue_model_with_no_stage_count_is_recorded_for_a_reason(store)
     version = C.load(store.get(out["version_key"]))
     assert recorded(version)["history"][-1]["reason"] == step["reason"]
     assert R.step_words({**recorded(version)["history"][-1], "by": "tester"}).startswith(
-        "sections edited (stages changed; not written), by tester")
+        "sections edited (stages changed; kept on record only), by tester")
     e2 = to_check(entry(**TWO))                                         # a re-run carries the reason back
     review2 = R.start(e2, rerun(store, e2), S.LocalRunStore(store.root).latest_version(SHA, ORG, WELL, "prd"), at=AT,
                       names=NAMES)

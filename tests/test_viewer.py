@@ -257,18 +257,21 @@ def test_list_shows_every_run_with_both_statuses_and_the_latest_marker(store):
     at = app()
     df, raw = runs(at), at.dataframe[1].value.set_index("Run id")
     assert list(df.index) == [ODD, BROKEN, NO_PDF, STALE, RUNNING, PARTIAL, GOOD, OLD]
-    assert df.loc[GOOD, "Pipeline"] == "completed" and df.loc[GOOD, "Document review"] == "1 item to check"
-    assert df.loc[PARTIAL, "Pipeline"] == "failed" and raw.loc[PARTIAL, "Pipeline, raw"] == "failed at extract"
+    assert df.loc[GOOD, "Run"] == "completed" and df.loc[GOOD, "Document review"] == "nothing to review"   # no entry
+    assert df.loc[RUNNING, "Document review"] == "not yet"
+    assert df.loc[PARTIAL, "Run"] == "failed" and raw.loc[PARTIAL, "Pipeline, raw"] == "failed at extract"
     assert raw.loc[GOOD, "Route"] == "template" and raw.loc[PARTIAL, "Error"] == "MODEL_TIMEOUT at extract"
-    assert df.loc[RUNNING, "Pipeline"] == "running" and df.loc[STALE, "Pipeline"] == "failed (stale)"
-    assert df.loc[BROKEN, "Pipeline"] == "record unreadable" and raw.loc[BROKEN, "Pipeline, raw"] == "run.json unreadable"
+    assert df.loc[RUNNING, "Run"] == "running" and df.loc[STALE, "Run"] == "stopped without finishing"
+    assert raw.loc[STALE, "Pipeline, raw"] == "failed (stale)"                 # the technical table: the record's words
+    assert df.loc[BROKEN, "Run"] == "record unreadable" and raw.loc[BROKEN, "Pipeline, raw"] == "run.json unreadable"
     assert df.loc[GOOD, "Cost"] == "$0.50" and raw.loc[GOOD, "Cost (USD)"] == 0.5
-    assert {r for r in df.index if df.loc[r, "Latest"]} == {GOOD, NO_PDF}      # newest succeeded per well
+    assert {r for r in df.index if df.loc[r, "For its well"]} == {GOOD, NO_PDF}      # newest succeeded per well
+    assert set(df["For its well"]) == {"", "newest completed run"}
 
 
 def test_list_filters_by_status(store):
     at = app()
-    at.multiselect(key="status").set_value(["failed (stale)"]).run()
+    at.multiselect(key="status").set_value(["stopped without finishing"]).run()
     assert list(at.dataframe[1].value["Run id"]) == [STALE] and len(at.dataframe[0].value) == 1
 
 
@@ -378,7 +381,7 @@ def test_malformed_files_each_get_a_notice(store):
 
 def test_a_record_with_odd_types_still_renders(store):
     at = app()
-    assert runs(at).loc[ODD, "Pipeline"] == "unknown"
+    assert runs(at).loc[ODD, "Run"] == "unknown"
     assert at.dataframe[1].value.set_index("Run id").loc[ODD, "Pipeline, raw"] == '["?"]'
     at = app(ODD)
     assert "Pipeline: [\"?\"]" in " ".join(texts(at.markdown))

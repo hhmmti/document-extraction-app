@@ -362,7 +362,7 @@ def test_a_scan_offers_entry_by_hand_beside_its_message(offline):
 
 def test_a_failed_upload_ends_on_a_plain_screen_whose_offer_opens_the_same_flow(offline):
     at = app(watch=RUN_ID)
-    assert SCAN_WORDS in texts(at.info) and R.OFFER in texts(at.caption) and "#### Pipeline: failed" in texts(at.markdown)
+    assert SCAN_WORDS in texts(at.info) and R.OFFER in texts(at.caption) and "#### Run: failed" in texts(at.markdown)
     assert "IMAGE_ONLY" in technical(at)                                 # the code: technical only
     no_id_or_code(at, ORG, WELL, "design.pdf")
     at.button(key=f"enter-{RUN_ID}").click().run()                       # the run's page, entered by hand
@@ -383,7 +383,7 @@ def test_a_failed_upload_ends_on_a_plain_screen_whose_offer_opens_the_same_flow(
     ({"code": "MODEL_TIMEOUT", "stage": "extract", "message": "x"},
      "Nothing was read from this document. Uploading the document again retries the extraction."),
     ({"code": "ASSET_INVALID", "stage": "assets", "message": "x"},
-     "Nothing was read from this document. Whoever runs the app can see why in the technical details."),
+     "Nothing was read from this document. Tell whoever looks after this app, who can see why."),
 ])
 def test_a_failed_upload_whose_pdf_is_not_in_the_store_says_what_happened_without_the_offer(offline, error, said):
     offline.path(C.pdf_key(RUN_ID)).unlink()                            # nothing to enter it beside
@@ -413,12 +413,16 @@ def test_entered_by_hand_then_written_then_confirmed(offline):
     assert R.BY_HAND in texts(at.info) and "**entered by hand**" in " ".join(texts(at.markdown))
     assert write_button(at).disabled
     assert f"Write is off. {R.NOTHING_ENTERED} 16 values left to check." in texts(at.caption)
-    assert at.text_input(key=f"fix-{RUN_ID}-bubble_point_psia-value").help == R.PRESSURE_HELP
+    at.button(key=f"correct-{RUN_ID}-gas_sg").click().run()             # the Correct form: a pop-up, one at a time
     assert not at.text_input(key=f"fix-{RUN_ID}-gas_sg-value").help
+    at.button(key=f"correct-{RUN_ID}-bubble_point_psia").click().run()
+    assert at.text_input(key=f"fix-{RUN_ID}-bubble_point_psia-value").help == R.PRESSURE_HELP
+    assert not [t for t in at.text_input if t.key == f"fix-{RUN_ID}-gas_sg-value"]     # the other's is gone
     plain_words(at)
     at.text_input(key=f"fix-{RUN_ID}-bubble_point_psia-value").input("2014.7").run()
     at.text_input(key=f"fix-{RUN_ID}-bubble_point_psia-note").input(PRESSURE["note"]).run()
     at.button(key=f"fix-{RUN_ID}-bubble_point_psia-save").click().run()
+    assert "dialog" not in at.session_state and not at.text_input           # saved: the form is closed, and gone
     assert write_button(at).disabled and "15 values left to check" in texts(at.caption)
     at.button(key=f"batch-{RUN_ID}").click().run()
     plain_words(at, PRESSURE["note"])
@@ -484,6 +488,7 @@ def test_a_transcription_entered_by_hand_keeps_its_warning_and_scan_and_goes_as_
     assert any(w.startswith("This document is a transcription typed by Claude") for w in texts(at.warning))
     assert next(b for b in at.get("button_group") if b.key == f"page-{RUN_ID}-shown").value == "Original scan"
     plain_words(at, "Design scan.pdf")
+    at.button(key=f"correct-{RUN_ID}-bubble_point_psia").click().run()
     at.text_input(key=f"fix-{RUN_ID}-bubble_point_psia-value").input("2014.7").run()
     at.button(key=f"fix-{RUN_ID}-bubble_point_psia-save").click().run()
     at.button(key=f"batch-{RUN_ID}").click().run()
@@ -497,6 +502,7 @@ def test_a_transcription_entered_by_hand_keeps_its_warning_and_scan_and_goes_as_
 
 def test_a_second_run_of_the_document_opens_with_its_values_back(offline):
     at = enter(app(run=RUN_ID))
+    at.button(key=f"correct-{RUN_ID}-bubble_point_psia").click().run()
     at.text_input(key=f"fix-{RUN_ID}-bubble_point_psia-value").input("2014.7").run()
     at.button(key=f"fix-{RUN_ID}-bubble_point_psia-save").click().run()
     at.button(key=f"batch-{RUN_ID}").click().run()
@@ -507,7 +513,7 @@ def test_a_second_run_of_the_document_opens_with_its_values_back(offline):
     at = enter(app(run=SECOND), SECOND)
     state = at.session_state[f"review-{SECOND}"]["review"]
     assert state["values"]["bubble_point_psia"]["status"] == C.CORRECTED and state["values"]["bubble_point_psia"]["carried"]
-    assert any(c.startswith("Confirmed before: 18 values come back from tester's confirmation of") for c in texts(at.caption))
+    assert any(c.startswith("Confirmed before: 18 values come back from tester's confirmation of") for c in texts(at.text))
     assert not write_button(at, SECOND).disabled                        # everything came back, the pressure typed
     plain_words(at)
 
@@ -520,7 +526,8 @@ def test_s3_mode_enters_by_hand_and_the_writer_lambda_writes_it(s3_mode, fresh_c
         del fake.objects[key]
     put_failed(C.S3Objects(fake))
     at = enter(app(run=RUN_ID))
-    assert R.BY_HAND in texts(at.info) and "**analyst-1**" in " ".join(texts(at.markdown))
+    assert R.BY_HAND in texts(at.info) and texts(at.text) == ["analyst-1"]
+    at.button(key=f"correct-{RUN_ID}-bubble_point_psia").click().run()
     at.text_input(key=f"fix-{RUN_ID}-bubble_point_psia-value").input("2014.7").run()
     at.button(key=f"fix-{RUN_ID}-bubble_point_psia-save").click().run()
     at.button(key=f"batch-{RUN_ID}").click().run()

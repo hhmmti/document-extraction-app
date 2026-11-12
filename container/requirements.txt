@@ -1,0 +1,9 @@
+pypdf==6.12.1
+pdfplumber==0.11.9
+boto3==1.43.108
+pandas==2.2.2
+pyarrow==22.0.0
+numpy==2.5.0
+streamlit==1.65.0
+plotly==7.1.0
+pypdfium2==5.14.0

@@ -3,6 +3,7 @@
 
 [server]
 address = "localhost"          # runs hold client data: not served to the network
+enableStaticServing = true     # app/static/: the fonts below, so a page asks no outside server for them
 
 [browser]
 gatherUsageStats = false
@@ -18,9 +19,54 @@ secondaryBackgroundColor = "#E8ECE8"     # drafting film: widgets, code
 textColor = "#1F2A2E"                    # slate ink
 borderColor = "#CDD4CF"
 dataframeHeaderBackgroundColor = "#E8ECE8"
-font = "Barlow:https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&display=swap, sans-serif"
-headingFont = "Barlow Semi Condensed:https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600&display=swap, sans-serif"
-codeFont = "IBM Plex Mono:https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap, monospace"
+font = "Barlow, sans-serif"                       # the three families are the font faces below, served by the app
+headingFont = "Barlow Semi Condensed, sans-serif"
+codeFont = "IBM Plex Mono, monospace"
 baseRadius = "small"
 metricValueFontSize = "1.15rem"
 chartCategoricalColors = ["#2a78d6", "#eb6834", "#1baf7a"]
+
+# The fonts, bundled under app/static/fonts/ (its MANIFEST.txt has each file's source and SHA-256; each family's
+# OFL.txt is its licence).  A url is relative to the app's address, so it follows --server.baseUrlPath.
+
+[[theme.fontFaces]]
+family = "Barlow"
+url = "app/static/fonts/barlow/Barlow-Regular.ttf"
+weight = 400
+style = "normal"
+
+[[theme.fontFaces]]
+family = "Barlow"
+url = "app/static/fonts/barlow/Barlow-Medium.ttf"
+weight = 500
+style = "normal"
+
+[[theme.fontFaces]]
+family = "Barlow"
+url = "app/static/fonts/barlow/Barlow-SemiBold.ttf"
+weight = 600
+style = "normal"
+
+[[theme.fontFaces]]
+family = "Barlow Semi Condensed"
+url = "app/static/fonts/barlowsemicondensed/BarlowSemiCondensed-Medium.ttf"
+weight = 500
+style = "normal"
+
+[[theme.fontFaces]]
+family = "Barlow Semi Condensed"
+url = "app/static/fonts/barlowsemicondensed/BarlowSemiCondensed-SemiBold.ttf"
+weight = 600
+style = "normal"
+
+[[theme.fontFaces]]
+family = "IBM Plex Mono"
+url = "app/static/fonts/ibmplexmono/IBMPlexMono-Regular.ttf"
+weight = 400
+style = "normal"
+
+[[theme.fontFaces]]
+family = "IBM Plex Mono"
+url = "app/static/fonts/ibmplexmono/IBMPlexMono-Medium.ttf"
+weight = 500
+style = "normal"

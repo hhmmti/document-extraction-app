@@ -14,6 +14,7 @@ exists comes from the listing, never from a failed read.  The source PDF is read
 Both also read confirmed entries, in extraction/confirmation.py's layout (their store root, or the bucket's
 esp-design-extraction/): `current_entry`, `current_entries`, `latest_version` and `result`, each within one
 environment.  Rows and versions never change, so each is read once and kept; listings and results are read each time.
+The run list reads every row at once (`rows`), which the S3 store lists once and keeps until `refresh`.
 """
 
 from __future__ import annotations
@@ -90,6 +91,15 @@ class RunStore(ABC):
         if key not in kept:
             kept[key] = C.load(self.objects.get(key))
         return kept[key]
+
+    def rows(self) -> list[dict]:
+        """Every confirmed row, of both environments: what the run list reads to say which runs are confirmed.  One
+        listing per environment, and each row read once."""
+        return [self._kept(key) for environment in C.ENVIRONMENTS for key in self.objects.keys(C.row_prefix(environment))]
+
+    def version_of(self, row: dict) -> dict:
+        """The version a row commits: the confirmation as the design record keeps it, read once."""
+        return self._kept(C.version_key(row["document_sha256"], row["confirmation_id"]))
 
     def current_entries(self, environment: str) -> dict:
         """{(organization_id, well_id): the current row} in this environment: each well's latest confirmed row."""
@@ -230,6 +240,7 @@ class S3RunStore(RunStore):
         self._reads = {}            # (run id, file name) -> bytes
         self._labels = {}           # run id -> the upload's labels, or None
         self._pdfs = {}             # (location, sha256) -> bytes, or None when the content has another hash
+        self._rows = None           # every confirmed row, as listed; None until listed, and after a refresh
 
     def _objects(self, prefix: str):
         """Every object under `prefix`, a page at a time."""
@@ -309,12 +320,18 @@ class S3RunStore(RunStore):
             self._pdfs[location, sha256] = data if hashlib.sha256(data).hexdigest() == sha256 else None
         return self._pdfs[location, sha256]
 
+    def rows(self) -> list[dict]:
+        """As the base, the two listings kept until `refresh`, as the runs' own listing is."""
+        if self._rows is None:
+            self._rows = super().rows()
+        return self._rows
+
     def refresh(self, run_id: str | None = None) -> None:
         """Forget what may have changed: the listings, and every read of a run that is not final.  With
         `run_id`, only that run is listed and read again."""
         if run_id is None:
             final = {r for r, name in self._reads if name == "run.json" and self._final(r)}
-            self._listing = None
+            self._listing = self._rows = None
             self._labels.clear()
             self._reads = {k: v for k, v in self._reads.items() if k[0] in final}
         elif self._listing is not None and not self._final(run_id):
@@ -333,9 +350,10 @@ class S3RunStore(RunStore):
 
 
 def s3_client():
-    """An S3 client from the standard AWS environment: AWS_PROFILE, or the other usual sources."""
-    import boto3                     # S3 mode only: local mode never loads the AWS SDK
-    return boto3.client("s3")
+    """An S3 client from the app's one AWS session (app/hosted.py): the role it is set to assume, else the standard
+    AWS environment (AWS_PROFILE, or the other usual sources)."""
+    from app import hosted           # S3 mode only: local mode never loads the AWS SDK for its store
+    return hosted.session().client("s3")
 
 
 _S3_STORES: dict[tuple, S3RunStore] = {}

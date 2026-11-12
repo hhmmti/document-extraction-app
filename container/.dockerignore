@@ -1,0 +1,9 @@
+# Caches and editor files, wherever they are in the build context.
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.DS_Store
+**/.idea
+**/.vscode
+**/*.swp
+**/*~

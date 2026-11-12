@@ -4,7 +4,8 @@
 
 prd is the product's production list, dev its test list: the Athena data sources roam_prd_ddb and roam_dev_ddb in the
 datascience account, each a DynamoDB connector over default.esp_well_configuration_v2.  One query per environment
-(`read`), through boto3's Athena client: start it, poll it, page through its results.  ESP_ATHENA_OUTPUT_LOCATION and
+(`read`), through an Athena client of the app's one AWS session (app/hosted.py): start it, poll it, page through its
+results.  ESP_ATHENA_OUTPUT_LOCATION and
 ESP_ATHENA_WORKGROUP name the query results location and the workgroup.  A failure is kept as well, until the form's
 Retry reads again; nothing falls back to a CSV.
 
@@ -127,8 +128,9 @@ def query(environment: str) -> str:
 
 
 def athena_client():
-    import boto3                     # loaded only when the form reads a list
-    return boto3.client("athena", region_name=REGION)
+    """An Athena client from the app's one AWS session (app/hosted.py), loaded only when the form reads a list."""
+    from app import hosted
+    return hosted.session().client("athena", region_name=REGION)
 
 
 def read(environment: str, client=None, environ=os.environ) -> WellList:

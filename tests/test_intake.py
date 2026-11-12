@@ -43,18 +43,18 @@ needs_assets = pytest.mark.skipif(not os.environ.get(ASSETS_ENV), reason=f"needs
 LIVE = [("Org Alpha", "Well  #1"), ("Org Alpha", "well #2"), ("Org Alpha", "Well  #1"), ("org alpha", "Lower Well"),
         ("Beta Org", "B 1")]
 TEST = [("Test Org", "T 1"), ("Test Org", "T 2")]
-NEAR = ("The list holds names that differ only by case or by characters that don't show; the exact name you choose is "
-        "sent.")
+NEAR = ("Some names in this list differ only by case or by characters that don't show. The product keeps them apart: "
+        "choose the exact one you mean.")
 SPACES = "␣ marks a space that would not show."
 # The form's words for a name the upload's labels refuse (extraction/intake.py takes printable values only), and the
 # names of test_screens.PAIRS they refuse: with a no-break space, a tab, a zero-width space, an en and an em space.
-NO_RUN = {"organisation": "No run can start for this organisation yet, because its name holds a character the pipeline "
-                          "can't carry.",
-          "well": "No run can start for this well yet, because its name holds a character the pipeline can't carry.",
-          "both": "No run can start for this organisation and this well yet, because each name holds a character the "
-                  "pipeline can't carry."}
+NO_RUN = {"organisation": "No run can start for this organisation yet, because its name holds a character a run can't "
+                          "carry.",
+          "well": "No run can start for this well yet, because its name holds a character a run can't carry.",
+          "both": "No run can start for this organisation and this well yet, because each name holds a character a run "
+                  "can't carry."}
 REFUSED = sorted({name for pair in TS.PAIRS.values() for name in pair if not name.isprintable()})
-TRY_AGAIN = "The run could not be started. Try again; if it fails again, ask whoever runs the app."
+TRY_AGAIN = "The run could not be started. Try again; if it fails again, ask whoever looks after this app."
 
 
 class FakeAthena:
@@ -380,7 +380,7 @@ def test_a_failed_read_keeps_the_form_off_until_retry_and_never_falls_back_to_th
     monkeypatch.setenv(WELL_LIST_ENV, str(tmp_path / "wells.csv"))      # set, and never read
     at = app(upload="1")
     assert texts(at.error) == ["The live wells could not be read from the product, so the form is off. Retry; if it "
-                               "fails again, ask whoever runs the app."]
+                               "fails again, ask whoever looks after this app."]
     assert at.selectbox(key="new-org").disabled and at.selectbox(key="new-org").options == []
     assert at.file_uploader(key="new-pdf").disabled and next(b for b in at.button if b.label == "Start the run").disabled
     assert "RuntimeError: AccessDeniedException: an invented refusal" in technical(at)
@@ -542,7 +542,7 @@ def test_a_pdf_whose_file_name_the_labels_refuse_is_said_once_added_and_start_st
     space, as some systems put before AM or PM, is refused as soon as the file is added, in plain words that show no id
     or code, and Start stays off; nothing is labelled, copied or launched.  The same PDF under a plain name starts its
     run, labelled with exactly that name."""
-    message = "This file's name holds a character the pipeline can't carry: rename the file and add it again."
+    message = "This file's name holds a character a run can't carry: rename the file and add it again."
     misnamed = "Design report 10.41\u202fAM.pdf"
     at = app(upload="1")
     at.selectbox(key="new-org").select_index(1).run()
@@ -666,8 +666,8 @@ def test_submit_needs_a_pdf_and_the_confirmation(env, popen):
         assert any(message in e for e in texts(at.error))
         assert next(b for b in at.button if b.label == "Start the run").disabled
     at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
-    assert "This calls Opus on Bedrock in the datascience account; recent runs cost about USD 0.55–1.32 and " \
-           "take 3–8 minutes." in texts(at.warning)
+    assert ("A run takes 3 to 8 minutes. When it finishes, you check what it read against the document, and confirm "
+            "it.") in texts(at.info) and not at.warning         # how long, and neither the model, the account nor a cost
     assert next(b for b in at.button if b.label == "Start the run").disabled
     assert not popen and not (env / "intake").exists()
 
@@ -696,7 +696,7 @@ def test_a_running_duplicate_is_warned_about_but_allowed(env, popen):
     at.selectbox(key="new-org").select_index(1).run()
     at.selectbox(key="new-well").select_index(0).run()
     at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
-    assert ("A run of this PDF for this organisation and well is still running, started 2099-01-01 00:00:00 UTC. You "
+    assert ("A run of this PDF for this organisation and well is still running, started 2099-01-01 00:00 UTC. You "
             "can start another.") in texts(at.warning)
     no_id_or_code(at, "Org Alpha", "org alpha", "Beta Org", "Well  #1", "well #2", "Upload name.pdf")
     at.checkbox(key="new-confirm").check().run()
@@ -722,7 +722,7 @@ def test_a_running_duplicate_is_one_in_the_uploads_environment_only(env, popen, 
     at.selectbox(key="new-well").set_value("Well  #1").run()
     at.file_uploader(key="new-pdf").upload("Upload name.pdf", PDF, "application/pdf").run()
     assert [w for w in texts(at.warning) if "is still running" in w] == (
-        ["A run of this PDF for this organisation and well is still running, started 2099-01-01 00:00:00 UTC. You can "
+        ["A run of this PDF for this organisation and well is still running, started 2099-01-01 00:00 UTC. You can "
          "start another."] if warned else [])
 
 
@@ -736,17 +736,17 @@ def test_watch_view_moves_through_starting_running_and_final(env):
     write_run(env, launched, record(launched, status="running", deadline_at="2999-01-01T00:00:00Z",
                                     ended_at=None), {})
     at.run()
-    assert "Pipeline: running" in " ".join(texts(at.markdown)) and [m.label for m in at.metric] == ["Elapsed"]
-    assert any("Current stage: not in the record" in c for c in texts(at.caption))
+    assert "Run: running" in " ".join(texts(at.markdown)) and [m.label for m in at.metric] == ["Elapsed"]
+    assert any(c.startswith("The document is being read, which takes 3 to 8 minutes.") for c in texts(at.caption))
     (env / "runs" / launched / "run.json").write_text(json.dumps(record(launched)))
     at.run()
-    assert "Pipeline: completed" in " ".join(texts(at.markdown))
+    assert "Run: completed" in " ".join(texts(at.markdown))
     assert "Open the run" in [b.label for b in at.button]
 
 
 @pytest.mark.parametrize("age,process,reason", [
-    (intake.STARTUP_S + 5, None, "120 s have passed"),
-    (0, FakeProcess(2), "the process has exited"),
+    (intake.STARTUP_S + 5, None, "nothing was heard from it for 120 s"),
+    (0, FakeProcess(2), "it stopped as soon as it started"),
 ])
 def test_launch_failure_shows_the_last_50_lines_of_the_log(env, age, process, reason):
     launched = run_id(age)
@@ -754,7 +754,7 @@ def test_launch_failure_shows_the_last_50_lines_of_the_log(env, age, process, re
     if process:
         intake.PROCESSES[launched] = process
     at = app(watch=launched)
-    assert any("Launch failed" in e and reason in e for e in texts(at.error))
+    assert any(e.startswith(f"The run did not start: {reason}. Upload the PDF again") for e in texts(at.error))
     tail = texts(at.code)[-1].splitlines()
     assert (len(tail), tail[0], tail[-1]) == (50, "line 11", "line 60")
 
@@ -766,7 +766,7 @@ def test_the_watch_page_marks_each_name_as_every_screen_does_and_says_what_the_s
     launch_log(env, launched)
     write_run(env, launched, record(launched, organization_id="Org\u00a0Alpha ", well_id="Well\t1\u200b"), {})
     at = app(watch=launched)
-    assert any(c.startswith("Organisation Org°Alpha␣ · well Well→1¦ · started ") for c in texts(at.caption))
+    assert any(c.startswith("Organisation Org°Alpha␣ · well Well→1¦ · Live wells · started ") for c in texts(at.caption))
     assert "␣ marks a space that would not show, ° a no-break space, → a tab and ¦ a character with no width." \
            in texts(at.caption)
     no_id_or_code(at, "Org\u00a0Alpha ", "Well\t1\u200b")
@@ -778,15 +778,15 @@ def test_a_live_process_without_a_record_is_still_watched(env):
     intake.PROCESSES[launched] = FakeProcess(None)
     at = app(watch=launched)
     assert not at.error
-    waiting = re.fullmatch(r"No record yet, still running \((\d+) s\)\.", texts(at.info)[0])
+    waiting = re.match(r"Still starting, after (\d+) s\. ", texts(at.info)[0])
     assert waiting and int(waiting.group(1)) >= intake.STARTUP_S + 30
 
 def test_run_list_shows_launches_without_a_record(env):
     launched = run_id(intake.STARTUP_S + 5)
     launch_log(env, launched, "boom\n")
     df = runs(app())
-    assert df.loc[launched, "Pipeline"] == "launched, no record"
-    assert any("Launch failed" in e for e in texts(app(run=launched).error))   # opening it watches it
+    assert df.loc[launched, "Run"] == "launched, no record"
+    assert any("The run did not start" in e for e in texts(app(run=launched).error))   # opening it watches it
 
 
 # ---- no id or code on the run list, the upload page or the watch page ----
@@ -803,13 +803,14 @@ def test_the_run_list_names_runs_in_plain_words_and_keeps_the_raw_forms_technica
     launch_log(env, launched)
     at = app()
     df = runs(at)
-    assert list(df.columns) == ["Open", "Organisation", "Well", "Document", "Started (UTC)", "Pipeline",
-                                "Document review", "Latest", "Cost"]
+    assert list(df.columns) == ["Open", "Organisation", "Well", "Wells", "Document", "Run", "Document review",
+                                "Started", "For its well", "How it started", "Cost"]
     assert df.loc[[good, failed], "Cost"].tolist() == ["$0.50", "$0.50"] and df.loc[launched, "Cost"] == ""
-    assert df.loc[[good, failed, running, launched], "Pipeline"].tolist() == ["completed", "failed", "running",
-                                                                             "launched, no record"]
-    assert df.loc[good, ["Open", "Organisation", "Well", "Document", "Started (UTC)"]].tolist() == [
-        "Open", "org-test", "well-a", "Upload name.pdf", "2099-01-01 00:00:01"]
+    assert df.loc[[good, failed, running, launched], "Run"].tolist() == ["completed", "failed", "running",
+                                                                        "launched, no record"]
+    assert df.loc[good, ["Open", "Organisation", "Well", "Wells", "Document", "Started"]].tolist() == [
+        "Open", "org-test", "well-a", "Live wells", "Upload name.pdf", "2099-01-01 00:00"]   # its one start: its id's
+    assert set(df["How it started"]) == {"not recorded"}                 # no upload's labels: none started here
     raw = at.dataframe[1].value.set_index("Run id")
     assert (raw.loc[failed, "Error"], raw.loc[failed, "Pipeline, raw"]) == ("MODEL_TIMEOUT at extract",
                                                                             "failed at extract")
@@ -844,11 +845,11 @@ def test_the_upload_page_on_either_list_and_the_watch_page_in_each_state_show_no
         (env / "runs" / launched / "run.json").write_text(json.dumps(rec))
         at = app(watch=launched)
         no_id_or_code(at, *names)
-    assert "Pipeline: completed" in " ".join(texts(at.markdown)) and launched in technical(at)
+    assert "Run: completed" in " ".join(texts(at.markdown)) and launched in technical(at)
     late = run_id(intake.STARTUP_S + 5)
     launch_log(env, late, "Traceback: ExtractionError INTAKE_INVALID\n")
     at = app(watch=late)
-    assert any("Launch failed" in e for e in texts(at.error)) and "INTAKE_INVALID" in technical(at)
+    assert any("The run did not start" in e for e in texts(at.error)) and "INTAKE_INVALID" in technical(at)
     no_id_or_code(at)
 
 

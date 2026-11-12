@@ -346,11 +346,14 @@ def test_who_confirms(tmp_path):
     def broken():
         raise RuntimeError("no credentials")
     assert R.confirmer("s3", {}, caller=lambda: "analyst-1") == ("analyst-1", "")
-    assert R.confirmer("s3", {}, caller=broken) == (None, "Not signed in to AWS, so Write is off: sign in, then "
-                                                          "reload the page.")
+    off = ("Write is off: the app could not tell who is confirming. Reload the page; if Write stays off, tell whoever "
+           "looks after this app.")
+    assert R.confirmer("s3", {}, caller=broken) == (None, off)
+    assert R.confirmer("s3", {}, caller=broken, technical=True) == (                    # the AWS hint: technical only
+        None, f"{off} Not signed in to AWS: sign in, then reload the page.")
     assert R.confirmer("local", {}, tmp_path) == (None, "This copy of the app only reviews: Write is off.")
     assert R.confirmer("local", {R.OFFLINE_ENV: "tester"}, tmp_path) == (
-        "tester", "Offline: Write saves on this computer only, and nothing reaches Live wells or Test wells.")
+        "tester", "Offline: Write saves in this copy of the app only, and nothing reaches Live wells or Test wells.")
     assert R.confirmer("local", {R.OFFLINE_ENV: "tester"}, R.CLI.LAB / "store")[0] is None
 
 
@@ -481,11 +484,12 @@ def test_a_run_with_an_entry_opens_in_review_with_its_files_behind_run_details(o
     [view] = at.get("button_group")
     assert view.options == ["Review & confirm", "Run details (technical)"] and not at.tabs
     md = " ".join(texts(at.markdown))
-    for shown in ("**Live wells**", "**Endurance (ELS) report**", "**2025-06-01**", "**tester**", "#### Found: 3",
-                  "#### Not found: 2"):
+    for shown in ("**Live wells**", "**Endurance (ELS) report**", "**2025-06-01**", "#### Found: 3", "#### Not found: 2"):
         assert shown in md, shown
+    assert texts(at.text) == ["tester"] and "tester" not in md          # who confirms: as text, in no Markdown
     assert {ORG, "Well\u2423\u2423#1"} <= set(texts(at.markdown))       # the names: marked, not in emphasis
-    assert "Offline: Write saves on this computer only, and nothing reaches Live wells or Test wells." in texts(at.caption)
+    assert ("Offline: Write saves in this copy of the app only, and nothing reaches Live wells or Test wells."
+            in texts(at.caption))
     assert write_button(at).disabled and "5 values left to check" in texts(at.caption)
     assert write_button(at).label == "Write to Live wells"
     plain_words(at)
@@ -509,8 +513,8 @@ def test_a_name_with_an_edge_space_is_marked_on_the_header_and_the_write_pop_up_
     for key in NOT_FOUND:
         at.button(key=f"empty-{RUN_ID}-{key}").click().run()
     write_button(at).click().run()
-    assert ("Writes to **Live wells**, organisation \u2423org-1, well Well\u2423\u2423#1\u2423, confirming as "
-            "**tester**.") in texts(at.markdown)
+    assert ("Writes to **Live wells**, organisation \u2423org-1, well Well\u2423\u2423#1\u2423.") in texts(at.markdown)
+    assert "tester" in texts(at.text)                                    # who confirms: as text, under its label
     assert unplain(at, *exempt(run, the_entry, None, "tester")) == []
 
 
@@ -528,7 +532,7 @@ def test_the_header_and_the_write_pop_up_show_each_sign_and_one_line_says_what_t
     for key in NOT_FOUND:
         at.button(key=f"empty-{RUN_ID}-{key}").click().run()
     write_button(at).click().run()
-    assert "Writes to **Live wells**, organisation org°-1, well Well→#1¦␣, confirming as **tester**." in texts(at.markdown)
+    assert "Writes to **Live wells**, organisation org°-1, well Well→#1¦␣." in texts(at.markdown) and "tester" in texts(at.text)
     assert texts(at.caption).count(line) == 2                            # the header's, and the pop-up's
     assert unplain(at, *exempt(run, the_entry, None, "tester")) == []
 
@@ -554,7 +558,8 @@ def test_one_by_one_then_write_shows_what_was_written(offline):
     at.button(key=f"write-go-{RUN_ID}").click().run()
     assert not at.exception and texts(at.success)[0].startswith("**Written to Live wells**")
     assert at.get("button_group")[0].options == ["Confirmed entry", "Run details (technical)"]
-    assert any("Confirmed**: written to **Live wells** by **tester**" in m for m in texts(at.markdown))
+    assert any(m.startswith("**Confirmed**: written to **Live wells** on ") for m in texts(at.markdown))
+    assert texts(at.text) == ["tester"] and "Confirmed by" in texts(at.caption)
     plain_words(at)
     [row] = offline.keys(C.row_prefix("prd"))
     assert json.loads(offline.get(row))["confirmed_by"] == "tester"
@@ -578,7 +583,7 @@ def test_the_batch_pop_ups_write_and_a_pulled_out_value_is_marked(offline):
     at.button(key=f"dlg-go-{RUN_ID}-found").click().run()
     at.button(key=f"dlg-go-{RUN_ID}-not found").click().run()
     assert at.button(key=f"write-go-{RUN_ID}").disabled                          # oil_sg was pulled out
-    assert any("pulled out of batch 2" in m for m in texts(at.markdown))
+    assert any("left out of a group check" in m for m in texts(at.markdown))
     plain_words(at, to_check(entry(**BLOCKED)), "the vendor numbers from the top")
     at.button(key=f"settle-{RUN_ID}-oil_sg").click().run()
     write_button(at).click().run()
@@ -602,8 +607,8 @@ def test_a_rerun_says_what_comes_back_and_from_whose_confirmation(offline):
     at = app(run=RERUN)
     said = texts(at.caption)
     assert f"Confirmed before: 18 values come back from tester's confirmation of " \
-           f"{R.when_words(version['confirmed_at'])}." in said                     # oil_sg's correction too
-    assert any(c.startswith("The new run reads 0.81 sg; the correction above is carried") for c in said)
+           f"{R.when_words(version['confirmed_at'])}." in texts(at.text)           # oil_sg's correction too
+    assert any(c.startswith("The new run reads 0.81 sg; the correction above comes from") for c in said)
     plain_words(at, e2)
 
 
@@ -643,7 +648,7 @@ def s3_mode(tmp_path, monkeypatch):
 def test_s3_mode_writes_the_request_and_the_writer_lambda_answers(s3_mode):
     fake = s3_mode
     at = app(run=RUN_ID)
-    assert "**analyst-1**" in " ".join(texts(at.markdown))
+    assert texts(at.text) == ["analyst-1"]
     plain_words(at)
     at.button(key=f"batch-{RUN_ID}").click().run()
     at.button(key=f"dlg-go-{RUN_ID}-found").click().run()
@@ -663,7 +668,7 @@ UPLOADER = "engineer-7@example.com"
 PUSHED_FROM = "s3://esp-design-extraction-product-uploads-640168431387/dev/org-1/well-documents/Well  #1/esp_design/" \
               "current.pdf?versionId=v1"
 TO_TEST = ("This document's upload is for Test wells, so its entry can be written to Test wells only, not to Live "
-           "wells. Report it to whoever runs the app.")
+           "wells. Report it to whoever looks after this app.")
 
 
 def pushed(environment="dev") -> dict:
@@ -691,7 +696,7 @@ def test_the_writers_environment_refusal_in_plain_words():
     assert R.refusal_words("environment is 'prd'; the upload's is 'dev'") == TO_TEST
     assert R.refusal_words("environment is 'dev'; the upload's is 'prd'") == (
         "This document's upload is for Live wells, so its entry can be written to Live wells only, not to Test "
-        "wells. Report it to whoever runs the app.")
+        "wells. Report it to whoever looks after this app.")
 
 
 def test_s3_mode_says_the_product_started_the_run_writes_to_its_uploads_environment_and_never_names_the_uploader(

@@ -1,0 +1,31 @@
+{
+  "name": "esp-design-extraction",
+  "zone": "enterprise",
+  "published": true,
+  "title": "ESP Design Extraction",
+  "description": "Reads an ESP design document into a well's pump and wellbore entry, for an engineer to check against the document and confirm.",
+  "owner": "{{OWNER}}",
+  "stripPrefix": false,
+  "cpu": 512,
+  "memoryLimitMiB": 1024,
+  "environment": {
+    "ESP_APP_MODE": "s3",
+    "ESP_BUCKET": "roam-ds-assets",
+    "ESP_INTAKE_PREFIX": "esp-design-extraction/intake/",
+    "ESP_RUNS_PREFIX": "esp-design-extraction/runs/",
+    "ESP_ATHENA_OUTPUT_LOCATION": "s3://esp-athena-results-v2-{{ACCOUNT_ID}}/",
+    "ESP_ATHENA_WORKGROUP": "primary",
+    "ESP_SIGNED_IN_USER_HEADER": "X-Forwarded-User",
+    "ESP_CROSS_ACCOUNT_ROLE_ARN": "{{ROLE_ARN}}",
+    "ESP_CROSS_ACCOUNT_EXTERNAL_ID": "{{EXTERNAL_ID}}",
+    "ESP_CONTACT": "{{CONTACT}}"
+  },
+  "iam": {
+    "statements": [
+      {
+        "actions": ["sts:AssumeRole"],
+        "resources": ["{{ROLE_ARN}}"]
+      }
+    ]
+  }
+}

@@ -54,9 +54,10 @@ import json
 import math
 import re
 from collections import Counter
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from app import hosted
 from app.store import SHA256, run_status
 from extraction import confirm as CLI
 from extraction import confirm_writer as W
@@ -69,6 +70,7 @@ from extraction.well_entry import (ENTERED_BY_HAND, KEYS, MANUAL, NOT_FROM_THE_D
 
 LAB_CHECK = "lab-check"                    # the lab's own organisation: unlabelled, dev (`environment_for`)
 AUTOMATIC = "Started automatically by an upload in the product"     # a run whose upload's origin is product-upload
+STARTED_HERE = "Started here, with New run"         # a run whose upload the app's own form made
 OFFLINE_ENV = "ESP_CONFIRM_OFFLINE_AS"     # local mode: write into the local store under this name, writer in process
 WAIT_S = 180                               # the CLI's --wait
 STRING = C.PUMP_SECTIONS
@@ -144,7 +146,7 @@ REASONS = {
     "V-09": "The stage counts disagree with the housings. Check the stage counts in the document.",
     "models": "Some models are not names in the pump catalogue. Check the model names against the document.",
     "complete": "Some sections lack their order number or stage count. Check them in the document.",
-    "review": "Some sections need a check. Check each against its reason in the table.",
+    "review": "Some sections need a check. Check each against its reason, under the table.",
     "head sum": "The sections' heads do not add up to the total dynamic head printed. Check the models and stage "
                 "counts.",
 }
@@ -382,6 +384,33 @@ def groups(review, entry) -> dict[str, list[str]]:
         else:
             out["found" if proposal(entry, key) is not None else "not found"].append(key)
     return out
+
+
+def decided_by_someone(history) -> bool:
+    """Whether an engineer ever decided the value: a step that is neither the extraction's own nor the mark of a carry
+    from an earlier confirmation, whose own steps the history holds too."""
+    return any(s.get("by") != "extraction" and not (s.get("reason") or "").startswith("carried from ")
+               for s in history or [])
+
+
+def unchecked(review, key) -> bool:
+    """Whether nobody has checked the value: it stands settled as the extraction left it, here and in every earlier
+    confirmation it comes back from.  Such a value is kept as read, and never shown as settled."""
+    v = review["values"][key]
+    return v["status"] == C.SETTLED and not decided_by_someone(v["history"])
+
+
+def left_to_check(entry, run, version=None, names=None) -> int:
+    """How many values a review of the entry starts with left to check, the string among them: what the review page
+    counts when it opens (`start`, then `groups`), for the run list."""
+    review = start(entry, run, version, at=run.get("ended_at") or "unknown", names=names)
+    found = groups(review, entry)
+    return sum(len(found[g]) for g in GROUPS)
+
+
+def left_words(left: int) -> str:
+    """The count as the review page and the run list say it."""
+    return f"{left} value{'s' * (left != 1)} left to check" if left else "nothing left to check"
 
 
 def pulled_out(review, key) -> int | None:
@@ -946,6 +975,14 @@ def automatic(labels) -> bool:
     return (labels or {}).get("origin") == PRODUCT_UPLOAD
 
 
+def origin_words(labels) -> str:
+    """How a run started, for the run list: by an upload in the product; here, by the app's own form, whose uploads
+    alone carry an environment and no origin; else not recorded (a run started by a command, or with no labels kept)."""
+    if automatic(labels):
+        return AUTOMATIC
+    return STARTED_HERE if (labels or {}).get("environment") in C.ENVIRONMENTS else "not recorded"
+
+
 def environment_for(organization_id, labels=None) -> str:
     """Where the entry goes: the upload's environment label (the store's `intake_labels`) when it carries a valid one,
     the form's or the product's.  A run without one: dev for lab-check, prd for every other organisation."""
@@ -961,14 +998,48 @@ def environment_problem(organization_id, environment) -> str | None:
     return None
 
 
-def confirmer(mode, environ, store_root=None, caller=None) -> tuple[str | None, str]:
-    """(the name confirmations go out under, or None; a note on it, or "").  S3 mode: the STS caller's session
-    name, as the CLI reads it.  Local mode reviews only, unless OFFLINE_ENV names who writes into the local store."""
+def confirmer(mode, environ, store_root=None, caller=None, headers=None, technical=False) -> tuple[str | None, str]:
+    """(the name confirmations go out under, or None; a note on it, or "").
+
+    Behind a sign-in (hosted.USER_HEADER_ENV names a request header): that header's value among `headers`, the
+    session's request headers, exactly as received, and nothing else.  Missing, empty or sent more than once, Write is
+    off: no other name stands in for it.  Without the setting: with the two role settings set (the app hosted), Write
+    is off in either mode, and STS is not asked; else S3 mode: the STS caller's session name, as the CLI reads it;
+    local mode: OFFLINE_ENV's value.  Local mode reviews only unless OFFLINE_ENV is set, whoever is signed
+    in, and never writes inside its own code folder.  A note that Write is off is in plain words; why, which names a
+    setting or AWS, follows it when `technical`, and goes to the app's log otherwise."""
+    header = (environ.get(hosted.USER_HEADER_ENV) or "").strip()
+
+    def off(why, detail, error=None, key=None):
+        if technical:
+            return None, f"{why} {detail}"
+        hosted.hidden("who is confirming", error or detail, key)
+        return None, why
+
+    # Hosted through a role with no sign-in header named: no one can be told, in either mode, and STS is not asked.
+    if not header and hosted.role(environ):
+        detail = (f"{hosted.ROLE_ENV} and {hosted.EXTERNAL_ENV} are set and {hosted.USER_HEADER_ENV} is not: with a "
+                  "role, only the sign-in header that setting names says who confirms.")
+        return off(f"Write is off: this app is not set up to tell who is signed in. Tell {who()}.", detail,
+                   key=("who", detail))
+
+    def signed_in(note=""):
+        values = headers.get_all(header) if headers is not None else []
+        if len(values) == 1 and values[0].strip():
+            return values[0], note
+        found = "no" if not values else "an empty" if len(values) == 1 else f"{len(values)}"
+        return off(f"Write is off: the app was not told who is signed in. Reload the page; if Write stays off, tell "
+                   f"{who()}.", f"The request carried {found} {header} header{'s' * (len(values) > 1)}: "
+                               f"{hosted.USER_HEADER_ENV} names the header that says who is signed in.")
+
     if mode == "s3":
+        if header:
+            return signed_in()
         try:
             return (caller or CLI.caller)(), ""
         except Exception as err:  # noqa: BLE001 - no or expired credentials: say so, write nothing
-            return None, "Not signed in to AWS, so Write is off: sign in, then reload the page."
+            return off(f"Write is off: the app could not tell who is confirming. Reload the page; if Write stays off, "
+                       f"tell {who()}.", "Not signed in to AWS: sign in, then reload the page.", err)
     name = (environ.get(OFFLINE_ENV) or "").strip()
     if not name:
         return None, "This copy of the app only reviews: Write is off."
@@ -976,7 +1047,9 @@ def confirmer(mode, environ, store_root=None, caller=None) -> tuple[str | None, 
     if root == CLI.LAB or CLI.LAB in root.parents:
         return None, ("Write is off: this copy of the app keeps its runs inside its own code folder, where client "
                       "documents must not be written.")
-    return name, f"Offline: Write saves on this computer only, and nothing reaches {place('prd')} or {place('dev')}."
+    offline = (f"Offline: Write saves in this copy of the app only, and nothing reaches {place('prd')} or "
+               f"{place('dev')}.")
+    return signed_in(offline) if header else (name, offline)
 
 
 def design_dates(objects, run_id, current, *, by_hand=False) -> dict:
@@ -1075,7 +1148,7 @@ def outcome(objects, cid, environment, result, *, document=None, reasons=()) -> 
                     "note": "written; its result wasn't updated: the entry is saved, and there is nothing to redo",
                     "version_key": C.version_key(document, cid) if document else None}
         return {**out, "note": ("Write stopped without finishing and wrote nothing. Try again; if it happens again, "
-                                "report it to whoever runs the app.")}
+                                f"report it to {who()}.")}
     if result["status"] == C.RUNNING:
         return {**out, "note": f"Still writing after {WAIT_S} s: reopen this run in a few minutes."}
     return out
@@ -1120,7 +1193,7 @@ def failed_words(run, *, entry_stored) -> str:
     if entry_stored:
         return "The run stopped part-way, after reading the document. Open the run to review the values it read."
     retry = ("Uploading the document again retries the extraction." if error.get("code") in RETRY else
-             "Whoever runs the app can see why in the technical details.")
+             f"Tell {who()}, who can see why.")
     return f"Nothing was read from this document. {retry}"
 
 
@@ -1129,6 +1202,8 @@ def failed_words(run, *, entry_stored) -> str:
 # keeps all of them.
 
 PLACES = {"prd": "Live wells", "dev": "Test wells"}    # as the upload form's switch names them
+KEPT_AS_READ = "kept as read"                           # a value nobody checked: never shown as settled
+REF_WORDS = "Write fills it in"                         # design_document_ref, before Write and after
 VENDORS = {"F1": "SpyGlass", "F2": "ChampionX", "F3": "SLB", "F4": "Endurance (ELS)", "F5": "Baker Hughes ProLift",
            "F6": "XSize", "F7": "Valiant"}      # extraction/stage/stage.py's family codes, as extraction/assemble.py names them
 SOURCE_WORDS = {SOURCE: "the design document", "ops_entered": "outside the document, entered by operations"}
@@ -1143,14 +1218,25 @@ BY_HAND_HINT = "Nothing was read: type each value the document prints with Corre
 NOTHING_ENTERED = "Nothing is entered yet: type at least one value from the document, or add the pump string's sections."
 PRESSURE_HELP = ("An absolute pressure, in psia. Where the document prints a gauge reading (psig), add 14.7, and give the "
                  "printed value in the note, for instance printed 1,500 psig.")
-APP_FAULT = ("The app put together something Write cannot take: a fault in the app, not in the review. Report it to "
-             "whoever runs the app.")
-FILES = "Ask whoever runs the app to check this run's files."
+APP_FAULT = "The app put together something Write cannot take: a fault in the app, not in the review."
 DEPTH_BASIS = {"intake": "the intake", "pump_setting": "the pump setting depth", "pump_discharge": "the pump discharge"}
 VENDOR_SAID = {"assumption": "the vendor assumed it", "derived": "the vendor worked it out",
                "input": "the vendor's input"}
 YES = ("yes", "true")
 ID_LIKE = re.compile(r"\d{8}T\d{6}Z|[0-9a-f]{16,}", re.I)
+
+
+def who() -> str:
+    """Whom the engineer is told to tell or ask, when something goes wrong: the app's contact (hosted.contact)."""
+    return hosted.contact()
+
+
+def app_fault() -> str:
+    return f"{APP_FAULT} Report it to {who()}."
+
+
+def files() -> str:
+    return f"Ask {who()} to check this run's files."
 
 
 def place(environment) -> str:
@@ -1194,14 +1280,40 @@ def scan_words(scan) -> str:
             f"the original scan beside the review. {unsure}")
 
 
-def when_words(at) -> str:
-    """A recorded UTC time, `2026-10-31T20:19:21.134313`, as `2026-10-31 20:19 UTC`."""
-    return f"{str(at).replace('T', ' ')[:16]} UTC" if at else "an unknown time"
+def moment(at) -> datetime | None:
+    """A time as recorded, in UTC (`2026-10-31T20:19:21.134313`, `2026-10-31T20:19:21Z`, or a datetime), as a moment;
+    None for anything else."""
+    if isinstance(at, str):
+        try:
+            at = datetime.fromisoformat(at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(at, datetime):
+        return None
+    return at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at
 
 
-def confirmation_words(version) -> str:
+def zone_name(zone=None) -> str:
+    """The time zone's name as every time shown carries it: the browser's, as Streamlit reports it, else UTC."""
+    return getattr(zone, "key", None) or "UTC"
+
+
+def when_words(at, zone=None, *, date=False, name=True) -> str:
+    """A recorded time as the engineer reads it: in `zone` (a zoneinfo zone: the browser's) and named by it, or in UTC
+    when there is none: `2026-10-31 15:19 America/Chicago`, `2026-10-31 20:19 UTC`.  `date`: its day alone, there."""
+    at = moment(at)
+    if at is None:
+        return "an unknown time"
+    there = at.astimezone(zone or timezone.utc)
+    if date:
+        return f"{there:%Y-%m-%d}"
+    return f"{there:%Y-%m-%d %H:%M}" + (f" {zone_name(zone)}" if name else "")
+
+
+def confirmation_words(version, zone=None) -> str:
     """A confirmation as the engineer knows it: who confirmed, and when."""
-    return f"{version.get('confirmed_by') or 'someone'}'s confirmation of {when_words(version.get('confirmed_at'))}"
+    return (f"{version.get('confirmed_by') or 'someone'}'s confirmation of "
+            f"{when_words(version.get('confirmed_at'), zone)}")
 
 
 def run_problem_words(run) -> str | None:
@@ -1278,7 +1390,7 @@ def product_words(detail: str, key: str, position=None) -> str:
     for pattern, words in PRODUCT:
         if m := re.fullmatch(pattern, detail):
             return words.format(*("empty" if g == "None" else g for g in m.groups()), what=what)
-    return APP_FAULT if re.match(r"expected |unknown key|missing |'\w+' belongs to", detail) else (
+    return app_fault() if re.match(r"expected |unknown key|missing |'\w+' belongs to", detail) else (
         f"The product does not take this value for {label(key)}. Check the value and its unit.")
 
 
@@ -1286,9 +1398,9 @@ REFUSALS = (
     (r"contract: .*|entry_method .*|environment .* is not dev or prd|values missing: .*|values not in the entry: .*"
      r"|changed from the proposal but not marked manually corrected: .*|pump string: its final value is not its final "
      r"sections|design_document_ref is the writer's to set.*|row: .*|.* is not .*confirmations/<id>/request\.json",
-     lambda m: APP_FAULT),
+     lambda m: app_fault()),
     (re.escape(LAB_CHECK) + r" writes to " + re.escape(PLACES["dev"]) + r" only.*", lambda m: m[0]),
-    (r"runs/[^/]+/run\.json is not there.*", lambda m: f"This run's own record is missing, so it cannot be written. {FILES}"),
+    (r"runs/[^/]+/run\.json is not there.*", lambda m: f"This run's own record is missing, so it cannot be written. {files()}"),
     (r"runs/[^/]+/run\.json says .*: the run has not ended.*",
      lambda m: "This run has not ended yet, so it cannot be entered by hand. Reopen it once it has ended."),
     (r"runs/[^/]+/well_entry\.json is there: this run has an extraction to review",
@@ -1296,16 +1408,16 @@ REFUSALS = (
                "them."),
     (r"nothing was entered: .*", lambda m: NOTHING_ENTERED),
     (r"runs/[^/]+/well_entry\.json is not there.*",
-     lambda m: f"This run's proposed entry is missing, so it cannot be written. {FILES}"),
+     lambda m: f"This run's proposed entry is missing, so it cannot be written. {files()}"),
     (r"runs/[^/]+/report\.md is not there.*",
-     lambda m: f"This run's report is missing, so its design date cannot be read. {FILES}"),
+     lambda m: f"This run's report is missing, so its design date cannot be read. {files()}"),
     (r"intake/[^/]+\.pdf is not there.*", lambda m: "The document's PDF is not where Write keeps it, so it cannot be "
-                                                     "written. Ask whoever runs the app to put the PDF back."),
+                                                     f"written. Ask {who()} to put the PDF back."),
     (r"intake/[^/]+\.pdf is not the document.*", lambda m: "The PDF kept for this run is not the document it read. "
-                                                            "Ask whoever runs the app to put the right PDF back."),
+                                                            f"Ask {who()} to put the right PDF back."),
     (r"environment is '(\w+)'; the upload's is '(\w+)'",
      lambda m: f"This document's upload is for {place(m[2])}, so its entry can be written to {place(m[2])} only, not "
-               f"to {place(m[1])}. Report it to whoever runs the app."),
+               f"to {place(m[1])}. Report it to {who()}."),
     (r"(organization_id|well_id) is (.+); the run's is (.+)",
      lambda m: f"The {'organisation' if m[1] == 'organization_id' else 'well'} is {m[2]} here but {m[3]} in the run. "
                "Reopen the run and try again."),
@@ -1324,7 +1436,7 @@ REFUSALS = (
                f"{f' ({m[2]})' if m[2] else ''}. Check the model against the document."),
     (r"#1218: (?:\w+\.)?(\w+)(?:\[(\d+)\])?: (.*)", lambda m: product_words(m[3], m[1], m[2])),
     (r"[A-Z_]+ at \w+: .*", lambda m: "Write failed part-way and wrote nothing. Try again; if it fails again, report it "
-                                      "to whoever runs the app."),
+                                      f"to {who()}."),
     (r"a request .* is already there", lambda m: "A request of the same name is already there. Try Write again."),
 )
 
@@ -1335,27 +1447,28 @@ def refusal_words(reason: str) -> str:
     for pattern, words in REFUSALS:
         if m := re.fullmatch(pattern, reason, re.S):
             return words(m)
-    return "Write refused it for a reason the app cannot put in plain words. Report it to whoever runs the app."
+    return f"Write refused it for a reason the app cannot put in plain words. Report it to {who()}."
 
 
-def step_words(step, earlier=None) -> str:
+def step_words(step, earlier=None, zone=None) -> str:
     """One history step as the confirmed view shows it.  `earlier`: the confirmation a carried step came from, in
-    words (`confirmation_words`)."""
+    words (`confirmation_words`).  `zone`: the time zone its time shows in (`when_words`)."""
     reason, by = step.get("reason"), step.get("by")
     if by == "extraction":
-        return "as read"
+        return KEPT_AS_READ
     if m := BATCH.fullmatch(reason or ""):
-        what = (f"settled in batch {m[1]} ({GROUP_WORDS[m[2]]}): “{m[3]}”" if m[3] is not None
-                else f"pulled out of batch {m[1]} ({GROUP_WORDS[m[2]]})")
+        what = (f"settled in a group check ({GROUP_WORDS[m[2]]}): “{m[3]}”" if m[3] is not None
+                else f"left out of a group check ({GROUP_WORDS[m[2]]})")
     elif (reason or "").startswith("carried from "):
-        return f"carried from {earlier or 'an earlier confirmation'}"
+        return f"kept from {earlier or 'an earlier confirmation'}"
     elif m := EDITED.fullmatch(reason or ""):
         parts = [f"{n} {what}" for n, what in ((m[1], "added"), (m[2], "removed"), (m[3], "moved")) if n]
         parts += [f"{join([FIELD_WORDS[f] for f in m[4].split(', ')])} changed"] if m[4] else []
         k = len(re.findall(QUOTED, m[5] or ""))
-        parts += [f"not written, {k} section{'s' * (k != 1)} not in the catalogue" if k else "not written"] if m[6] else []
+        parts += [f"kept on record only, {k} section{'s' * (k != 1)} not in the catalogue" if k else
+                  "kept on record only"] if m[6] else []         # under a banner that says written: never not written
         what = "sections edited" + (f" ({'; '.join(parts)})" if parts else "")
     else:
         what = {C.SETTLED: "settled one by one", C.CORRECTED: "corrected", C.TO_CHECK: "left to check"}.get(
             step.get("status"), "decided") + (" against the original scan" if reason == CHECKED else "")
-    return f"{what}, by {by}, {when_words(step.get('at'))}"
+    return f"{what}, by {by}, {when_words(step.get('at'), zone)}"
