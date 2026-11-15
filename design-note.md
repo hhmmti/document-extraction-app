@@ -3,6 +3,11 @@
 **Task:** B1, make design-document extraction a pipeline rather than a one-off. GitHub issue `roam-datascience-esp #98`.
 **Status:** approved by Keith; restructured into two rounds on 2026-10-05; updated at the close of Step 2 (2026-10-06), Steps 3 and 4 (2026-10-13), Steps 4.5 to 4.7 (2026-10-15) and Step 5 (2026-10-19). Owner: Hamed.
 
+> **At B1's close (2026-11-15).** This note records round 1 as built, and round 2 as first proposed. Round 2 then changed course, so the *Round 2, product* bullet below, §7 to §9 and the round-2 rows of *Build steps* are superseded. As built:
+> - **Round 2 runs in the datascience account.** An engineer reviews, corrects and confirms each document's values in the app, now hosted on the container platform. Each confirmation appends a row to the Athena table `esp_design_extraction.well_entries`, and the document's design record goes to `roam-ds-assets`. Nothing is written to the product's well items; that copy is a separate issue.
+> - **How it runs,** for both rounds, is in `RUNBOOK.md`: both intakes, confirming, manual entry, image-only documents by transcription, and the hosted app.
+> - **The catalogue's curve form is documented,** which corrects *No catalogue overlay* under *Viewer (app)*. Head per stage, in ft, at 60 Hz, is `c1 + c2·Q + … + c6·Q⁵`, with Q in bpd and the coefficients in ascending order. The detail is in `pump-catalogues.md`, under `DataScience_ControlCenter/output/` in this repository.
+
 A design document from a known vendor template is uploaded through a Streamlit app. Template detection runs first, then Opus on Bedrock extracts the numbers. The run is logged and every failure is reported. B1 is built in two rounds, and is done when round 2 is done:
 
 - **Round 1, datascience account.** A PDF goes in through the app; the numbers are stored by code in datascience and are visible in the app, with a run log. The tapered ideal calculator does not read them this round.
@@ -323,6 +328,7 @@ The guards set a minimum status; they carry no validator-specification severity.
   - Whole-string, per-section and unstated rows are drawn apart.
   - A curve with no drawable point is listed with the reason.
   - **No catalogue overlay.** The catalogue stores head only as unlabelled fifth-order coefficients, at 60 Hz and per stage, with no documented form. Nothing is fitted, scaled or interpolated.
+    - *Corrected at B1's close:* the form is documented; see the note at the top.
 
 **Changed in Step 4.7: status wording.** Engineers may read "run succeeded" next to "document checks failed" as a contradiction, so the wording was changed:
 - **The list and the run header** now read "**Pipeline: completed**" (or "failed at <stage>") and "**Document review: N items to check**".
