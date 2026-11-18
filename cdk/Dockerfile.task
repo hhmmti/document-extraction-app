@@ -1,0 +1,15 @@
+FROM public.ecr.aws/lambda/python:3.12.2026.10.03.13-x86_64
+
+# The image route's task, on the Lambda's own base and packages.  Into the function directory, which is the working
+# directory the task runs in: the pinned boto3, botocore and urllib3 are the copies it imports.
+COPY requirements-lambda.txt requirements-task.txt ./
+RUN pip install --no-cache-dir --target "${LAMBDA_TASK_ROOT}" -r requirements-task.txt && rm requirements-lambda.txt requirements-task.txt
+
+COPY lambda_function.py ${LAMBDA_TASK_ROOT}/
+COPY extraction/ ${LAMBDA_TASK_ROOT}/extraction/
+COPY image_route/ ${LAMBDA_TASK_ROOT}/image_route/
+COPY skills/ ${LAMBDA_TASK_ROOT}/skills/
+COPY app/ ${LAMBDA_TASK_ROOT}/app/
+
+# In place of the base image's Lambda entrypoint: the task is a plain process on Fargate.
+ENTRYPOINT ["python", "-m", "image_route.task"]

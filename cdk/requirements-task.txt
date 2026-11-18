@@ -1,0 +1,8 @@
+# The transcription task's dependencies: the Lambda's, and the two the transcribe-design-scan skill's
+# scripts and the hand-back's check import, at the lab venv's versions.
+-r requirements-lambda.txt
+
+pypdf==6.12.1
+reportlab==5.1.0
+
+# Their dependencies, pillow and charset-normalizer, are pinned in requirements-lambda.txt.
