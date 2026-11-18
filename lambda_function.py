@@ -1,6 +1,8 @@
 """The Lambda's entry point, `lambda_function.lambda_handler`: an intake PDF in, a run folder out.  The same image's
 second entry point, `confirm_handler`, is the confirmation writer, and its third, `product_upload_handler`, the starter
-that turns a design PDF pushed by the ESP product into an intake upload (both at the end of this file).
+that turns a design PDF pushed by the ESP product into an intake upload.  Its fourth and fifth,
+`transcription_start_handler` and `transcription_watch_handler`, start and watch the image route's task, which
+transcribes a scan (all at the end of this file).
 
 S3 calls it for each `.pdf` created under ESP_INTAKE_PREFIX in ESP_BUCKET (the stack sets these and
 the other ESP_* variables).  For each record of the event (S3 sends one):
@@ -24,6 +26,8 @@ the other ESP_* variables).  For each record of the event (S3 sends one):
    Local paths in `run.json` and `source.json` become S3 locations, so the source is the intake
    object; `started_at` and `deadline_at` stay the invocation's.
 9. The row, updated to `SUCCEEDED` or `FAILED`.
+10. For a run that failed IMAGE_ONLY, a request for its transcription (`request_transcription`), when the stack names
+    where requests go (ESP_TRANSCRIPTIONS_PREFIX).
 
 The run log has one row per run, in the layout of the ESP product's `esp_logging_v2` and shaped as
 its file-upload pipeline's `PIPELINE_EXECUTION` row (`log_row`).  A failure before step 4 (a bad
@@ -41,19 +45,21 @@ import json
 import os
 import re
 import shutil
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote_plus
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from extraction.assemble import ASSETS, INVENTORY
 from extraction.assets_dir import ASSETS_ENV, asset
 from extraction.bedrock import make_client
 from extraction.confirm_writer import confirm
-from extraction.confirmation import ASSETS_PREFIX, BUCKET, WRITTEN, S3Objects, request_id
+from extraction.confirmation import ASSETS_PREFIX, BUCKET, WRITTEN, Exists, S3Objects, request_id
 from extraction.confirmation import ROOT as CONFIRMATION_ROOT
 from extraction.errors import ExtractionError
 from extraction.intake import (LABELS, PRODUCT_UPLOAD, RUN_ID, decode_label, decode_labels, encode_labels, intake_key,
@@ -318,6 +324,8 @@ def handle(s3_record, context, s3, table, bedrock) -> dict:
                                       "data_json": json.dumps({**row_data, **outcome}, default=str, sort_keys=True)},
                       update=True)
         log(run_id, "end", status=record["status"], error=(record["error"] or {}).get("code"))
+        if (record["error"] or {}).get("code") == "IMAGE_ONLY":
+            request_transcription(s3, table, bucket, record, metadata, row_data)
         return {"run_id": run_id, "status": record["status"]}
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -510,3 +518,257 @@ def start_run(s3_record, context, s3, table) -> dict:
         raise
     log(run_id, "intake", key=target)
     return {"run_id": run_id, "status": "started"}
+
+
+# ---- the image route: a scan's transcription asked for, started and watched ----
+#
+# A run that fails IMAGE_ONLY asks for its transcription (`request_transcription`, called by `handle`).  The request
+# starts the route's task on Fargate (`transcription_start_handler`); the task reads the scan page by page, builds the
+# transcription and puts it at intake as an upload of its own (image_route/task.py); and ECS's "task stopped" events
+# end a request whose task died without ending it (`transcription_watch_handler`).  Everything of one request sits
+# under `<ESP_TRANSCRIPTIONS_PREFIX><run_id>/<request_id>/`: `request.json`, then `result.json`.
+
+TRANSCRIPTIONS_ENV = "ESP_TRANSCRIPTIONS_PREFIX"
+TASK_ENV = "ESP_TRANSCRIPTION_"              # the task's variables; the starter passes PASSED as overrides
+PASSED = ("RUN_ID", "REQUEST_ID", "ROW_KEY", "DEADLINE_AT")
+REQUEST_ID = re.compile(r"\d{8}T\d{6}Z")     # the UTC second the request was made, as a run id writes its own
+TRANSCRIBED_FROM = "transcribed-from"        # a transcription's intake label: the run whose scan it was typed from
+CAP_S = 3600                                 # from the starter's start to the task's deadline
+START_TRIES = 3
+
+
+def conflict(err) -> bool:
+    """Whether a create-only put was refused because its key is there (412) or being created (409)."""
+    response = getattr(err, "response", None) or {}
+    status, code = response.get("ResponseMetadata", {}).get("HTTPStatusCode"), response.get("Error", {}).get("Code")
+    return status == 412 or (status == 409 and code == "ConditionalRequestConflict")
+
+
+def transcription_key(run_id: str, request_id: str, name: str = "request.json") -> str:
+    return f"{os.environ[TRANSCRIPTIONS_ENV]}{run_id}/{request_id}/{name}"
+
+
+def transcription_row_at(run_id: str, request_id: str) -> datetime:
+    """When a request's row is dated, from the request alone: the second its id names, with microseconds taken from
+    the SHA-256 of `<run_id>/<request_id>`, from 1 to 999999, so `standard_timestamp` always writes the fraction.
+    ponytail: two requests of one organisation made in the same second share a key once in a million; the second
+    is then taken for a repeat and never starts.  Give the row a longer sort key if requests ever come that fast."""
+    made = datetime.strptime(request_id, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    return made.replace(microsecond=1 + int(sha256(f"{run_id}/{request_id}".encode())[:8], 16) % 999_999)
+
+
+def transcription_row_key(organization_id, run_id: str, request_id: str) -> dict:
+    """The key of a request's row, as `log_row` writes it from `transcription_row_at`."""
+    return {"organization_id": organization_id or UNKNOWN_ORGANIZATION,
+            "timestamp": standard_timestamp(transcription_row_at(run_id, request_id))}
+
+
+def transcription_ids(key: str):
+    """(run id, request id) when `key` is a request's, else None."""
+    match = re.fullmatch(f"{re.escape(os.environ[TRANSCRIPTIONS_ENV])}({RUN_ID.pattern})/({REQUEST_ID.pattern})"
+                         r"/request\.json", key)
+    try:
+        return match and transcription_row_at(*match.groups()) and match.groups()
+    except ValueError:                       # shaped as a second, and not one
+        return None
+
+
+def request_transcription(s3, table, bucket, record, metadata, row_data) -> None:
+    """Asks for the transcription of a run that failed IMAGE_ONLY: `request.json`, create-only, naming the run, the
+    request (its id the UTC second it is made), when and by whom (here `extraction`), and the run's organisation and
+    well.  Nothing is asked while ESP_TRANSCRIPTIONS_PREFIX is unset, nor for an upload labelled `transcribed-from`:
+    a transcription is never transcribed.  A put that fails gets a FAILED row of its own
+    (TRANSCRIPTION_REQUEST_FAILED); the run's own row and files are never written here."""
+    if not os.environ.get(TRANSCRIPTIONS_ENV) or TRANSCRIBED_FROM in (metadata or {}):
+        return
+    run_id, made = record["run_id"], now()
+    request = {"run_id": run_id, "request_id": f"{made:%Y%m%dT%H%M%SZ}", "made_at": utc(made), "made_by": "extraction",
+               "organization_id": record["organization_id"], "well_id": record["well_id"]}
+    key = transcription_key(run_id, request["request_id"])
+    try:
+        S3Objects(s3, bucket).put(key, dump(request), create=True)
+        log(run_id, "transcription_request", key=key)
+    except Exists:
+        log(run_id, "transcription_request", key=key, duplicate=True)
+    except Exception as err:
+        trace = traceback.format_exc()
+        log(run_id, "transcription_request", key=key, error="TRANSCRIPTION_REQUEST_FAILED", trace=trace)
+        write_row(table, run_id, failed_row(record["organization_id"], run_id, record["well_id"], {
+            **row_data, "request_key": key,
+            **failure("TRANSCRIPTION_REQUEST_FAILED", "request", f"putting {key}: {err}", trace)}))
+
+
+def end_transcription(s3, table, run_id, request_id, row, by, data, error=None, **outcome) -> bool:
+    """Ends a request, once.  `result.json` goes beside the request, create-only: the run, the request, SUCCEEDED or
+    FAILED, when and by which part, the failure's fields (None on a success) and `outcome`.  Whoever puts it then
+    updates the request's row by its key: the status, the end, itself as `resource_name`, and `data` with the failure
+    and the outcome as `data_json`.  `row` is that key, or the whole row when its RUNNING put may not have landed.
+    False, and nothing written, when the request had ended already."""
+    at, status = now(), "FAILED" if error else "SUCCEEDED"
+    result = {"run_id": run_id, "request_id": request_id, "status": status, "ended_at": utc(at), "ended_by": by,
+              "new_run_id": None, **(error or failure(None, None, None, None)), **outcome}
+    try:
+        S3Objects(s3, os.environ["ESP_BUCKET"]).put(transcription_key(run_id, request_id, "result.json"), dump(result),
+                                                    create=True)
+    except Exists:
+        log(run_id, "transcription_ended_already", request_id=request_id, by=by, status=status)
+        return False
+    data_json = json.dumps({**data, **(error or {}), **outcome}, default=str, sort_keys=True)
+    write_row(table, run_id, {**row, "status": status, "success": not error, "resource_name": by,
+                              "end_timestamp": standard_timestamp(at), "data_json": data_json}, update=True)
+    log(run_id, "transcription_end", request_id=request_id, status=status, error=(error or {}).get("error_code"))
+    return True
+
+
+def transcription_start_handler(event, context, *, s3=None, table=None, ecs=None, sleep=time.sleep):
+    """The image route's starter, `lambda_function.transcription_start_handler`.  S3 calls it for each `request.json`
+    created under ESP_TRANSCRIPTIONS_PREFIX in ESP_BUCKET, and each record starts at most one task.
+
+    1. The key, decoded as the extraction decodes its own, must be `<prefix><run_id>/<request_id>/request.json`.
+       Any other key gets one FAILED row under `ADHOC#<request id>`, and nothing else.
+    2. The request must name that run and request, with an organisation and a well.
+    3. The request's row is put RUNNING, on condition that it is not there.  Its key follows from the request alone
+       (`transcription_row_key`), so a repeated event finds the row, is logged as a duplicate and starts nothing.
+    4. The task is run on Fargate: ESP_TRANSCRIPTION_TASK_DEFINITION in ESP_TRANSCRIPTION_CLUSTER, in
+       ESP_TRANSCRIPTION_SUBNETS and ESP_TRANSCRIPTION_SECURITY_GROUPS (comma-separated; the second may be unset), with
+       a public address only when ESP_TRANSCRIPTION_ASSIGN_PUBLIC_IP is ENABLED.  The container
+       ESP_TRANSCRIPTION_CONTAINER gets four variables: ESP_TRANSCRIPTION_RUN_ID, _REQUEST_ID, _ROW_KEY (the row's key,
+       as JSON) and _DEADLINE_AT (this start plus ESP_TRANSCRIPTION_CAP_S, 3600 unless set).  `startedBy` and the
+       client token are `<run_id>/<request_id>`, so a try repeated after a lost answer is the same task.
+    5. A try that fails is made again, ESP_TRANSCRIPTION_START_TRIES times in all (3 unless set), 2 s and then 4 s
+       apart.
+
+    A request that cannot be read (stage request), a row that cannot be put (row) and a task that cannot be started
+    (start) end the request here, TRANSCRIPTION_START_FAILED, through `end_transcription`.  A setting that is missing
+    raises before anything is written.  Each step prints one JSON line with the run id; the keywords stand in for AWS
+    in tests."""
+    s3 = s3 or boto3.client("s3")
+    table = table or boto3.resource("dynamodb").Table(os.environ["ESP_RUN_LOG_TABLE"])
+    # One attempt a call, and short timeouts: the tries are made, and counted, in `start_transcription`.
+    ecs = ecs or boto3.client("ecs", config=Config(connect_timeout=5, read_timeout=20,
+                                                   retries={"total_max_attempts": 1, "mode": "standard"}))
+    return [start_transcription(s3_record, context, s3, table, ecs, sleep) for s3_record in event.get("Records", [])]
+
+
+def start_transcription(s3_record, context, s3, table, ecs, sleep) -> dict:
+    started, bucket, by = now(), os.environ["ESP_BUCKET"], os.environ["AWS_LAMBDA_FUNCTION_NAME"]
+    setting = {name: os.environ[TASK_ENV + name] for name in ("CLUSTER", "TASK_DEFINITION", "CONTAINER", "SUBNETS")}
+    groups = os.environ.get(TASK_ENV + "SECURITY_GROUPS", "")
+    network = {"subnets": [part.strip() for part in setting["SUBNETS"].split(",") if part.strip()],
+               **({"securityGroups": [part.strip() for part in groups.split(",") if part.strip()]} if groups.strip()
+                  else {}),
+               "assignPublicIp": os.environ.get(TASK_ENV + "ASSIGN_PUBLIC_IP") or "DISABLED"}
+    deadline = started + timedelta(seconds=float(os.environ.get(TASK_ENV + "CAP_S") or CAP_S))
+    tries = int(os.environ.get(TASK_ENV + "START_TRIES") or START_TRIES)
+    key = unquote_plus(s3_record["s3"]["object"]["key"])
+    data = {"request_id": context.aws_request_id, "request_key": key}
+    ids = transcription_ids(key)
+    if not ids:
+        message = f"the key is not {os.environ[TRANSCRIPTIONS_ENV]}<run id>/<request id>/request.json"
+        log(None, "key", key=key, error="TRANSCRIPTION_START_FAILED", message=message)
+        write_row(table, None, failed_row(None, f"ADHOC#{context.aws_request_id}", None, {
+            **data, **failure("TRANSCRIPTION_START_FAILED", "key", message, None)}))
+        return {"key": key, "status": "rejected"}
+    run_id, request_id = ids
+    data["deadline_at"] = utc(deadline)
+    row = log_row(None, run_id, None, "RUNNING", data, transcription_row_at(run_id, request_id))
+
+    def failed(stage, message, trace=None) -> dict:
+        log(run_id, stage, request_id=request_id, error="TRANSCRIPTION_START_FAILED", message=message, trace=trace)
+        end_transcription(s3, table, run_id, request_id, row, by, data,
+                          failure("TRANSCRIPTION_START_FAILED", stage, message, trace))
+        return {"run_id": run_id, "request_id": request_id, "status": "failed"}
+
+    try:
+        request = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        if not (isinstance(request, dict) and (request.get("run_id"), request.get("request_id")) == ids
+                and all(isinstance(request.get(name), str) and request[name].strip()
+                        for name in ("organization_id", "well_id"))):
+            raise ValueError("it does not name this run and this request, with an organisation and a well")
+    except Exception as err:
+        return failed("request", f"reading {key}: {type(err).__name__}: {err}", traceback.format_exc())
+    data["made_by"] = request.get("made_by")
+    row = log_row(request["organization_id"], run_id, request["well_id"], "RUNNING", data,
+                  transcription_row_at(run_id, request_id))
+    try:
+        table.put_item(Item=row, ConditionExpression="attribute_not_exists(organization_id)")
+    except Exception as err:
+        if (getattr(err, "response", None) or {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            log(run_id, "duplicate", request_id=request_id)
+            return {"run_id": run_id, "request_id": request_id, "status": "duplicate"}
+        return failed("row", f"putting the request's row: {type(err).__name__}: {err}", traceback.format_exc())
+    log(run_id, "run_log", write="put", status="RUNNING")
+
+    token = f"{run_id}/{request_id}"
+    passed = dict(zip(PASSED, (run_id, request_id, json.dumps({name: row[name] for name in ROW_KEY}), utc(deadline))))
+    why = None
+    for attempt in range(1, tries + 1):
+        if attempt > 1:
+            sleep(2 ** (attempt - 1))
+        try:
+            answer = ecs.run_task(
+                cluster=setting["CLUSTER"], taskDefinition=setting["TASK_DEFINITION"], launchType="FARGATE", count=1,
+                startedBy=token, clientToken=token, networkConfiguration={"awsvpcConfiguration": network},
+                overrides={"containerOverrides": [{"name": setting["CONTAINER"], "environment": [
+                    {"name": TASK_ENV + name, "value": value} for name, value in passed.items()]}]})
+            if answer.get("tasks"):
+                arn = answer["tasks"][0].get("taskArn")
+                log(run_id, "start", request_id=request_id, task_arn=arn, attempt=attempt, deadline_at=utc(deadline))
+                return {"run_id": run_id, "request_id": request_id, "status": "started", "task_arn": arn}
+            why = "; ".join(f"{f.get('reason')}" + (f" ({f['detail']})" if f.get("detail") else "")
+                            for f in answer.get("failures") or []) or "ECS gave neither a task nor a reason"
+        except Exception as err:
+            why = f"{type(err).__name__}: {err}"
+        log(run_id, "start", request_id=request_id, attempt=attempt, error=why)
+    return failed("start", f"the task could not be started in {tries} tries; the last: {why}")
+
+
+def transcription_watch_handler(event, context, *, s3=None, table=None):
+    """The image route's watcher, `lambda_function.transcription_watch_handler`.  EventBridge calls it with each ECS
+    "Task State Change" of the route's tasks; it acts on a task that has STOPPED and ignores any other state.
+
+    The request and its row come from the task's overrides, as the event carries them (ESP_TRANSCRIPTION_RUN_ID,
+    _REQUEST_ID and _ROW_KEY).  When they are not all there and well formed, the request is the event's `startedBy`,
+    `<run_id>/<request_id>`, and the row's key follows from that request's organisation, read from `request.json`.  An
+    event that names no request either way is logged, and nothing is written.
+
+    The request is then ended as TRANSCRIPTION_TASK_STOPPED, with ECS's stop code and reason and each container's exit
+    code, through `end_transcription`: a request that has its `result.json` ended already, and nothing changes.  The
+    keywords stand in for AWS in tests."""
+    s3 = s3 or boto3.client("s3")
+    table = table or boto3.resource("dynamodb").Table(os.environ["ESP_RUN_LOG_TABLE"])
+    detail = event.get("detail") or {}
+    if detail.get("lastStatus") != "STOPPED":
+        return {"status": "ignored"}
+    given = {variable.get("name"): variable.get("value")
+             for override in (detail.get("overrides") or {}).get("containerOverrides") or []
+             for variable in override.get("environment") or []}
+    run_id, request_id = given.get(TASK_ENV + "RUN_ID"), given.get(TASK_ENV + "REQUEST_ID")
+    try:
+        row = json.loads(given[TASK_ENV + "ROW_KEY"])
+        carried = (set(row) == set(ROW_KEY) and all(isinstance(value, str) for value in row.values())
+                   and transcription_ids(transcription_key(run_id, request_id)) is not None)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        carried = False
+    if not carried:
+        parts = str(detail.get("startedBy") or "").split("/")
+        ids = len(parts) == 2 and transcription_ids(transcription_key(*parts))
+        if not ids:
+            log(None, "watch", task_arn=detail.get("taskArn"), error="the event names no request")
+            return {"status": "ignored"}
+        run_id, request_id = ids
+        request = json.loads(s3.get_object(Bucket=os.environ["ESP_BUCKET"],
+                                           Key=transcription_key(run_id, request_id))["Body"].read())
+        row = transcription_row_key(request["organization_id"], run_id, request_id)
+    stopped = {"task_arn": detail.get("taskArn"), "stop_code": detail.get("stopCode"),
+               "stopped_reason": detail.get("stoppedReason"),
+               "containers": [{"name": c.get("name"), "exit_code": c.get("exitCode"), "reason": c.get("reason")}
+                              for c in detail.get("containers") or []]}
+    codes = ", ".join(f"{c['name']} exit code {c['exit_code']}" for c in stopped["containers"]) or "no container"
+    message = (f"the task stopped without ending the request: {stopped['stopped_reason'] or stopped['stop_code']} "
+               f"({codes})")
+    data = {"request_id": context.aws_request_id, "request_key": transcription_key(run_id, request_id),
+            **({"deadline_at": given[TASK_ENV + "DEADLINE_AT"]} if given.get(TASK_ENV + "DEADLINE_AT") else {})}
+    ended = end_transcription(s3, table, run_id, request_id, row, os.environ["AWS_LAMBDA_FUNCTION_NAME"], data,
+                              failure("TRANSCRIPTION_TASK_STOPPED", "task", message, None), **stopped)
+    return {"run_id": run_id, "request_id": request_id, "status": "ended" if ended else "ended already"}
