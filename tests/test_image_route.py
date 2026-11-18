@@ -467,7 +467,10 @@ def test_cache_points_follow_the_system_prompt_and_the_page_image_when_on(tmp_pa
     page, = result["pages"]
     assert (page["cache_read_tokens"], page["cache_write_tokens"]) == (5000, 5000)
     assert page["cost_usd"] == pytest.approx(2000 / 1000 * PRICES["input_usd_per_1k_tokens"]
-                                             + 400 / 1000 * PRICES["output_usd_per_1k_tokens"])   # reported, not priced
+                                             + 400 / 1000 * PRICES["output_usd_per_1k_tokens"]
+                                             + 5000 / 1000 * PRICES["cache_read_usd_per_1k_tokens"]
+                                             + 5000 / 1000 * PRICES["cache_write_usd_per_1k_tokens"])     # and priced
+    assert page["cost_usd"] == result["total"]["cost_usd"] == 0.042
 
 
 def events(*blocks, stop="tool_use"):
@@ -544,9 +547,10 @@ def test_the_client_is_made_in_the_extraction_region_from_a_given_session():
 def test_cost_is_priced_from_pricing_json_and_null_where_a_price_is_unknown(tmp_path):
     answer = lambda page, turn, attempt: reply(write(), tokens=(123_456, 7_890), cache=(1_000, 2_000))   # noqa: E731
     result, _ = read(tmp_path, answer, pages=2)
-    one = 123_456 / 1000 * PRICES["input_usd_per_1k_tokens"] + 7_890 / 1000 * PRICES["output_usd_per_1k_tokens"]
+    one = 123_456 / 1000 * PRICES["input_usd_per_1k_tokens"] + 7_890 / 1000 * PRICES["output_usd_per_1k_tokens"] \
+        + 1_000 / 1000 * PRICES["cache_read_usd_per_1k_tokens"] + 2_000 / 1000 * PRICES["cache_write_usd_per_1k_tokens"]
     assert (PRICES["input_usd_per_1k_tokens"], PRICES["output_usd_per_1k_tokens"]) == (0.004, 0.02)
-    assert [p["cost_usd"] for p in result["pages"]] == [round(one, 6)] * 2 == [0.651624] * 2
+    assert [p["cost_usd"] for p in result["pages"]] == [round(one, 6)] * 2 == [0.661824] * 2
     assert result["total"]["cost_usd"] == round(2 * one, 6)
     assert (result["total"]["input_tokens"], result["total"]["output_tokens"]) == (246_912, 15_780)
     assert (result["total"]["cache_read_tokens"], result["total"]["cache_write_tokens"]) == (2_000, 4_000)
@@ -558,6 +562,24 @@ def test_cost_is_priced_from_pricing_json_and_null_where_a_price_is_unknown(tmp_
     (tmp_path / "unlisted").mkdir()
     result, _ = read(tmp_path / "unlisted", answer, model_id="us.anthropic.not-in-the-file")
     assert result["total"]["cost_usd"] is None
+
+
+def test_cache_reads_and_writes_are_priced_from_pricing_jsons_own_lines():
+    assert (PRICES["cache_read_usd_per_1k_tokens"], PRICES["cache_write_usd_per_1k_tokens"]) == (0.0002, 0.005)
+    # The first trial's cached run, as Bedrock counted it: cached tokens are not among the input tokens.
+    cached = {"input_tokens": 4_073, "output_tokens": 520, "cache_read_tokens": 7_880, "cache_write_tokens": 7_880}
+    assert reader.price(cached, PRICES) == 0.067668 == round(
+        4.073 * 0.004 + 0.52 * 0.02 + 7.88 * 0.0002 + 7.88 * 0.005, 6)
+    uncached = dict(cached, cache_read_tokens=0, cache_write_tokens=0)
+    assert reader.price(uncached, PRICES) == 0.026692                # what input and output alone come to
+
+    bare = {"input_usd_per_1k_tokens": 0.004, "output_usd_per_1k_tokens": 0.02}       # no lines for the cache
+    assert reader.price(uncached, bare) == 0.026692                  # none used: none needed
+    assert reader.price(cached, bare) is None                        # used, and their price is unknown
+    assert reader.price(cached, dict(PRICES, cache_write_usd_per_1k_tokens=None)) is None
+    assert reader.price(dict(cached, cache_write_tokens=0), dict(PRICES, cache_write_usd_per_1k_tokens=None)) == \
+        round(4.073 * 0.004 + 0.52 * 0.02 + 7.88 * 0.0002, 6)
+    assert reader.price(cached, {}) is None
 
 
 # ---- the trial command, end to end ----
@@ -604,7 +626,7 @@ def test_the_trial_reads_the_pages_it_is_given_and_builds_the_transcription(tmp_
     assert (total["pages"], total["pages_failed"], total["calls"], total["crops"], total["retries"]) == (2, 0, 3, 1, 0)
     assert (total["input_tokens"], total["output_tokens"]) == (3000, 600)
     assert (total["cache_read_tokens"], total["cache_write_tokens"]) == (8000, 4000) and total["images"] == 3
-    assert total["cost_usd"] == pytest.approx(3 * 0.004 + 0.6 * 0.02)
+    assert total["cost_usd"] == pytest.approx(3 * 0.004 + 0.6 * 0.02 + 8 * 0.0002 + 4 * 0.005)     # cache priced
 
     logged = (out / "calls.jsonl").read_text(encoding="utf-8")
     lines = [json.loads(line) for line in logged.splitlines()]
@@ -618,7 +640,7 @@ def test_the_trial_reads_the_pages_it_is_given_and_builds_the_transcription(tmp_
 
     said = capsys.readouterr().out
     assert "pages: 2 of 2 read" in said and "calls: 3, crops: 1, retries: 0, images sent: 3" in said
-    assert "tokens: 3,000 in, 600 out; cache: 8,000 read, 4,000 written" in said and "cost: $0.0240" in said
+    assert "tokens: 3,000 in, 600 out; cache: 8,000 read, 4,000 written" in said and "cost: $0.0456\n" in said
     assert f"transcription: {built}" in said
 
     assert trial.main([str(pdf), "--out", str(out)], client=stub) == 2            # not empty any more

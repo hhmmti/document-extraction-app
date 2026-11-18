@@ -16,9 +16,10 @@ script reads, and, when every page was read, builds the transcription with the s
 model.  One failed page fails the transcription: the other pages are still read, and nothing is built.
 
 Every call is counted: per page and in total, wall time, calls, crops, tokens (input, output, cache read and write),
-each image sent, stop reasons, retries and cost.  Cost is priced as extraction/run.py prices a run, from
-extraction/compare/pricing.json: input and output tokens only, None where a price is unknown.  Cache tokens are
-reported and not priced.
+each image sent, stop reasons, retries and cost.  Cost is priced from extraction/compare/pricing.json: input and
+output tokens as extraction/run.py prices a run, and cache reads and writes at that file's own prices for them.
+Bedrock counts cached tokens apart from input tokens, so the four are added.  Cost is None where a price it needs is
+unknown.
 """
 
 from __future__ import annotations
@@ -43,6 +44,8 @@ PRICING = Path(extraction.compare.__file__).with_name("pricing.json")
 CACHE_POINT = {"cachePoint": {"type": "default"}}
 TOKENS = {"input_tokens": "inputTokens", "output_tokens": "outputTokens",
           "cache_read_tokens": "cacheReadInputTokens", "cache_write_tokens": "cacheWriteInputTokens"}
+CACHE_PRICES = {"cache_read_tokens": "cache_read_usd_per_1k_tokens",       # pricing.json's lines for them
+                "cache_write_tokens": "cache_write_usd_per_1k_tokens"}
 BOX = ("left", "top", "right", "bottom")
 
 CROP = """\
@@ -221,7 +224,12 @@ def read_page(pdf: Path, n: int, m: int, *, pages: Path, prices: dict, build, **
 # ---- the document ----
 
 def price(counts: dict, prices: dict) -> float | None:
+    """What the counted tokens cost: input, output, cache reads and cache writes, each at its own price.  None when
+    a price is unknown for tokens that were used."""
     cost = cost_usd(counts["input_tokens"], counts["output_tokens"], prices)
+    for tokens, rate in CACHE_PRICES.items():
+        if cost is not None and counts[tokens]:
+            cost = None if prices.get(rate) is None else cost + counts[tokens] / 1000 * prices[rate]
     return None if cost is None else round(cost, 6)
 
 

@@ -67,7 +67,7 @@ def totals(result: dict) -> str:
         f"({t['image_bytes']:,} bytes)",
         f"tokens: {t['input_tokens']:,} in, {t['output_tokens']:,} out; cache: {t['cache_read_tokens']:,} read, "
         f"{t['cache_write_tokens']:,} written",
-        f"cost: {cost}, input and output tokens only",
+        f"cost: {cost}",
         f"transcription: {result['transcription'] or 'not built'}",
     ]
     if result["error"]:
