@@ -113,7 +113,8 @@ def test_writer(template):
     assert p["ImageConfig"] == {"Command": ["lambda_function.confirm_handler"]}
     assert (p["Timeout"], p["MemorySize"], p["ReservedConcurrentExecutions"]) == (120, 2048, 1)
     assert p["LoggingConfig"] == {"LogGroup": {"Ref": log_id}}
-    assert p["Environment"]["Variables"] == {"ESP_RUN_LOG_TABLE": "esp_design_extraction_logging"}
+    assert p["Environment"]["Variables"] == {"ESP_RUN_LOG_TABLE": "esp_design_extraction_logging",
+                                             "ESP_WRITEBACK_SECRET": "esp-api/ds-writeback-credentials"}
     _, invoke = only(template, "AWS::Lambda::EventInvokeConfig", FunctionName={"Ref": fn_id})
     assert invoke["Properties"]["MaximumRetryAttempts"] == 0
 
@@ -220,6 +221,9 @@ def test_writer_role_has_only_these_statements(template):
          "Resource": {"Fn::GetAtt": [table_id, "Arn"]}},
         {"Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
          "Resource": {"Fn::GetAtt": [log_id, "Arn"]}},
+        # The write-back's login: this one secret, whatever six characters Secrets Manager ended its ARN with.
+        {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue",
+         "Resource": "arn:aws:secretsmanager:us-east-1:640168431387:secret:esp-api/ds-writeback-credentials-??????"},
     ]
     assert sorted(map(canonical, statements)) == sorted(map(canonical, expected))
     actions = [a for s in map(json.loads, map(canonical, statements)) for a in s["Action"]]

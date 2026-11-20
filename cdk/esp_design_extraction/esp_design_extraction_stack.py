@@ -48,6 +48,10 @@ PUSH_BUCKET = "esp-design-extraction-product-uploads-640168431387"
 # The ESP product's accounts, each putting only under its own prefix: products dev and products prd.
 PUSHERS = {"dev/": "411237692998", "prd/": "826771500263"}
 TABLE_NAME = "esp_design_extraction_logging"         # in the layout of the ESP product's esp_logging_v2
+# The write-back's login to the ESP product (extraction/write_back.py reads its dev block only).  Secrets Manager ends
+# a secret's ARN with six characters of its own, so the grant names them as six wildcards.
+WRITEBACK_SECRET = "esp-api/ds-writeback-credentials"
+WRITEBACK_SECRET_ARN = f"arn:aws:secretsmanager:us-east-1:640168431387:secret:{WRITEBACK_SECRET}-??????"
 PROFILE_ID = "us.anthropic.claude-opus-5-5"
 PROFILE_ARN = f"arn:aws:bedrock:us-east-1:640168431387:inference-profile/{PROFILE_ID}"
 # The regions the US profile routes to; a request may land in any of them.
@@ -182,7 +186,9 @@ class EspDesignExtractionStack(Stack):
         )
 
         # The confirmation writer.  Its role has no s3:ListBucket, so S3 answers 403, not 404, for a key that is not
-        # there, and the writer reads that as not there; it has no Glue, Athena or Bedrock permission.
+        # there, and the writer reads that as not there; it has no Glue, Athena or Bedrock permission.  It may read the
+        # write-back's secret, which is on AWS's own key, so it needs no key statement.  Naming the secret in the
+        # writer's environment turns the write-back on.
         writer_log_group = logs.LogGroup(
             self, "WriterLogGroup", log_group_name=f"/aws/lambda/{WRITER_NAME}",
             retention=logs.RetentionDays.THREE_MONTHS, removal_policy=RemovalPolicy.RETAIN_ON_UPDATE_OR_DELETE,
@@ -199,13 +205,15 @@ class EspDesignExtractionStack(Stack):
                 iam.PolicyStatement(actions=["dynamodb:PutItem", "dynamodb:UpdateItem"], resources=[table.table_arn]),
                 iam.PolicyStatement(actions=["logs:CreateLogStream", "logs:PutLogEvents"],
                                     resources=[writer_log_group.log_group_arn]),
+                iam.PolicyStatement(actions=["secretsmanager:GetSecretValue"], resources=[WRITEBACK_SECRET_ARN]),
             ])},
         )
         writer = lambda_.DockerImageFunction(
             self, "Writer", function_name=WRITER_NAME, architecture=lambda_.Architecture.X86_64,
             code=image("lambda_function.confirm_handler"),
             timeout=Duration.seconds(120), memory_size=2048, reserved_concurrent_executions=1, retry_attempts=0,
-            role=writer_role, log_group=writer_log_group, environment={"ESP_RUN_LOG_TABLE": TABLE_NAME},
+            role=writer_role, log_group=writer_log_group,
+            environment={"ESP_RUN_LOG_TABLE": TABLE_NAME, "ESP_WRITEBACK_SECRET": WRITEBACK_SECRET},
         )
 
         # No function's output can trigger itself: the extraction writes only under runs/ and a transcription's

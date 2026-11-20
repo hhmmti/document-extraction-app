@@ -4,7 +4,7 @@
 
 The pipeline reads an ESP design document (a PDF) into a proposed pump and wellbore entry for one well. An engineer checks it against the document in the app and confirms it. Confirming writes the well's entry to a well table and keeps a design record of the document, both in data science.
 A run starts from the app's upload form, or on its own from an ESP-design upload in the ESP product.
-Nothing is written back to the product. Confirmed values stay in data science, in the well table and the design record, and nothing in the product reads them. Copying them into the product is separate, later work.
+A confirmation on Test wells is also written back to the product's test system: the entry's values go into the well's settings there, merged with what the well already holds (the write-back; sections 9, 10 and 12). A confirmation on Live wells is not written back. Its values stay in data science, in the well table and the design record, and nothing in the production product reads them.
 
 ## 2. For engineers
 
@@ -18,7 +18,7 @@ Nothing is written back to the product. Confirmed values stay in data science, i
 
 **The pump string.** Settle it as proposed, accept it anyway, or press **Edit sections**: one row per section, 1 the deepest. Each section takes a model from the pump catalogue, or is marked **Not in the catalogue** with every name the document prints for it. **Save**, **Cancel** and **Back to the string as read** do what they say. A string with a section not in the catalogue, or with no stage count, is recorded but not written to the well's entry, and Save asks why.
 
-**Confirm with Write.** Confirming is the **Write to Live wells** (or **Write to Test wells**) button. It opens a pop-up that shows where the entry goes, who is confirming, the document and its design date, and what will be recorded; its own Write button confirms. Write stays off until nothing is left to check and its checks pass, and the line beside it says why. Writing saves the well's entry and the design record in data science, and the run then opens read-only. Nothing goes to the product. **Older-design warning:** when this document's printed design date is older than the date on the well's current entry in the same wells, the header and the Write pop-up warn you: writing makes the older design the current entry. If either date is missing they say *can't compare*.
+**Confirm with Write.** Confirming is the **Write to Live wells** (or **Write to Test wells**) button. It opens a pop-up that shows where the entry goes, who is confirming, the document and its design date, and what will be recorded; its own Write button confirms. Write stays off until nothing is left to check and its checks pass, and the line beside it says why. Writing saves the well's entry and the design record in data science, and the run then opens read-only. On Test wells the entry's values then go to the well's settings in the product's test system; the app does not say whether that went through, and data science reads it in the run log (section 9). On Live wells nothing goes to the product. **Older-design warning:** when this document's printed design date is older than the date on the well's current entry in the same wells, the header and the Write pop-up warn you: writing makes the older design the current entry. If either date is missing they say *can't compare*.
 
 **Enter by hand.** A run that ended with nothing read offers **Enter by hand**. Every value from the document starts empty and to check. Type each value the document prints with **Correct**, build the string with **Edit sections**, and settle the rest as empty. Pressures are absolute (psia): add 14.7 to a gauge reading and put the printed value in the note. Write stays off until something is typed.
 
@@ -38,7 +38,7 @@ Nothing is written back to the product. Confirmed values stay in data science, i
 | Push bucket | `s3://esp-design-extraction-product-uploads-640168431387/`, under `dev/` and `prd/`: versioned, SSE-S3, public access blocked, kept if the stack is deleted |
 | Functions (Lambda, one image, stack `EspDesignExtractionStack`) | `esp-design-extraction`, the extraction; `esp-design-extraction-writer`, the writer; `esp-design-extraction-product-intake`, the starter |
 | Logs (CloudWatch, 90 days) | `/aws/lambda/esp-design-extraction`, `…-writer`, `…-product-intake` |
-| Run log (DynamoDB) | `esp_design_extraction_logging`: one row per run, per confirmation request, and per push the starter refuses or fails to start |
+| Run log (DynamoDB) | `esp_design_extraction_logging`: one row per run, per confirmation request, per write-back of a written confirmation, and per push the starter refuses or fails to start |
 | Well table (Athena) | `esp_design_extraction.well_entries`, and the view `esp_design_extraction.well_entries_current`, each well's current entry |
 | Well lists (Athena) | `roam_prd_ddb` (Live) and `roam_dev_ddb` (Test), `default.esp_well_configuration_v2`; results in `s3://esp-athena-results-v2-640168431387/` when hosted, `s3://aws-athena-query-results-640168431387-us-east-1/` on a laptop; workgroup `primary` |
 | Deploys | backend: GitHub Actions workflow `ds-deploy-esp-design-extraction.yaml` (source `cdk/workflows/`); app: `container/build.py` into the platform repo's `apps/enterprise/esp-design-extraction/` |
@@ -131,8 +131,13 @@ A pushed PDF exists as four distinct copies: the product's stored PDF (its own, 
 Nothing alerts anyone. Where to look:
 - **The app.** The list's **Run** column, and the watch page's plain words. With `ESP_SHOW_TECHNICAL=1`, the run id, stage and error code show under *Details (technical)* and *Run details (technical)*. Without it they go to the app's log: on a laptop, standard error; hosted, the container's log on the platform side (its location is not recorded).
 - **The run's files.** `runs/<run_id>/run.json` holds `status`, and `error` with `code`, `message`, `details` and `stage`.
-- **The run log.** The `pipeline_execution_id` is the run id or the confirmation id, and `status` is `RUNNING`, `SUCCEEDED` or `FAILED`. On failure, `data_json` holds `error_code`, `stage`, `message` and `stack_trace`. A row whose labels were not read has the organisation `_unknown`; a row whose key names no id has the id `ADHOC#<request id>`. The app never reads this table.
+- **The run log.** The `pipeline_execution_id` is the run id or the confirmation id, and `status` is `RUNNING`, `SUCCEEDED` or `FAILED`. A written confirmation has two rows under its id: its own, with `type` `PIPELINE_EXECUTION`, and its write-back's, with `type` `WRITE_BACK`, which is described below. On failure, a run's or a confirmation's `data_json` holds `error_code`, `stage`, `message` and `stack_trace`. A row whose labels were not read has the organisation `_unknown`; a row whose key names no id has the id `ADHOC#<request id>`. The app never reads this table.
 - **CloudWatch.** One JSON line per step, each with its run or confirmation id.
+- **A write-back.** Each written confirmation has a second row in the run log, under the same confirmation id, with `type` `WRITE_BACK`. It is written once, when the write-back ends, and the confirmation stands whatever it says.
+  - `SUCCEEDED` is written or skipped; `data_json` says which in `outcome`, with the `reason` for a skip: a confirmation on Live wells, a `lab-check` well, or a well the product does not hold.
+  - For a write, `maps` lists the keys written to each map and the stored keys kept, and `pump_string` says whether the stored string was `replaced`, `added` or `kept`. Kept means the entry had no string, so an older design's string may now sit beside a newer design's values.
+  - `FAILED` gives the `stage` (`secret`, `auth`, `get` or `update`), the product's `status_code` when it answered, and its `message`.
+  - The row holds keys, never values: the values are in the entry's own file, which `row_key` names. The writer's log has one line per call, with `stage` `write_back`.
 
 ```bash
 aws sso login --profile roam-ai
@@ -146,6 +151,9 @@ aws s3 cp s3://roam-ds-assets/esp-design-extraction/confirmations/<confirmation_
 # the current entry of one lab-check well on Test wells (a SELECT; Athena keeps its result file), then its rows
 aws athena start-query-execution --work-group primary --result-configuration OutputLocation=s3://aws-athena-query-results-640168431387-us-east-1/ --query-string "SELECT * FROM esp_design_extraction.well_entries_current WHERE environment = 'dev' AND organization_id = 'lab-check' AND well_id = '<well>'" --profile roam-ai
 aws athena get-query-results --query-execution-id <QueryExecutionId> --profile roam-ai
+# one confirmation's write-back row, then every write-back for one organisation
+aws dynamodb query --table-name esp_design_extraction_logging --index-name pipeline_execution_id_timestamp --key-condition-expression "pipeline_execution_id = :id" --filter-expression "#t = :t" --expression-attribute-names '{"#t":"type"}' --expression-attribute-values '{":id":{"S":"<confirmation_id>"},":t":{"S":"WRITE_BACK"}}' --profile roam-ai
+aws dynamodb query --table-name esp_design_extraction_logging --index-name organization_id_type_timestamp --key-condition-expression "organization_id_type = :k" --expression-attribute-values '{":k":{"S":"<organization_id>#WRITE_BACK"}}' --profile roam-ai
 ```
 
 | Where, code or state | Meaning | What to do |
@@ -166,6 +174,10 @@ aws athena get-query-results --query-execution-id <QueryExecutionId> --profile r
 | Writer: *refused* | `result.json` lists the reasons, and the app shows them in words | Fix what it says; Write again |
 | Writer: *failed* | An error at a stage, such as `ASSET_INVALID` or `INTERNAL_ERROR`, with the trace in the writer's log | Write again; data science if it repeats |
 | Writer: *stale*, *no answer yet* | No final result within its time. If the row is there it is written | Reopen the run later; do not redo a written one |
+| Write-back: *skipped* | Not a failure: Live wells, a `lab-check` well, or a well the product does not hold | Nothing. For a well the product should hold, check its organisation and name there |
+| Write-back: *failed*, 403 at `get` | The product's login does not reach the well's organisation | Data science: the login's access in the product, then rerun the write (section 10) |
+| Write-back: *failed*, other | 401: the login or its token was refused. 422: the product refused a value. 429, 500 or a timeout: the product did not take the call. `secret`: the secret could not be read. *not started*: too little of the writer's 120 s was left | Rerun the write (section 10); data science if it repeats |
+| Write-back: no row | The writer stopped before the row was written, or the row's write failed; the writer's log says | Run the dry run (section 10), which shows what the well holds |
 | App: *Write is off* | Not sent: the line beside Write says why. On a laptop, the catalogue or credentials may be missing | Follow the line; tell the contact |
 | Starter: `INTAKE_INVALID` | A key of another shape, no run id in the event, an object that is not there (403, 404), or a label refused. One `FAILED` row, nothing put | Data science checks the key and the product's push |
 | Starter: `INTERNAL_ERROR` (read), `STORE_FAILED` (intake) | A read or put failed for a reason that may pass. A `FAILED` row is written, then Lambda retries twice, as the same run | Read the starter's log. If both retries fail, there is no dead-letter queue: data science |
@@ -179,6 +191,13 @@ aws athena get-query-results --query-execution-id <QueryExecutionId> --profile r
   - Ask data science first for the other codes.
 - **The product's push.** The starter retries a failed read or put twice, as the same run. After that, upload the design again in the product, which makes a new version and so a new run. Or start a form run on the same side.
 - **A confirmation.** The writer never retries. Refused: fix the reasons and press Write again, which makes a new confirmation id; failed: Write again; with the CLI, run it again. A written one cannot be redone: to change a well's entry, start a new run of the same document and confirm that one, and its corrections come back.
+- **A write-back.** The writer never retries it. Rerun it from a laptop, in this folder, as data science. Without `--go` it is a dry run: it logs in to the product's test system, reads the well, and prints whether the product holds it and the login reaches it, each key's stored and new value, and what happens to the pump string. It sends nothing and writes no row.
+  ```bash
+  ESP_WRITEBACK_SECRET=esp-api/ds-writeback-credentials .venv/bin/python -m extraction.write_back --confirmation <confirmation_id> --profile roam-ai
+  ESP_WRITEBACK_SECRET=esp-api/ds-writeback-credentials ESP_RUN_LOG_TABLE=esp_design_extraction_logging .venv/bin/python -m extraction.write_back --confirmation <confirmation_id> --go --well "<organization_id>" "<well_id>" --profile roam-ai
+  ```
+  `--go` writes only the wells named with `--well`, and leaves a `WRITE_BACK` row as the writer's does. A rerun lays that confirmation's values over what the well holds now, so rerunning an older confirmation overwrites a newer one's keys: read the dry run first.
+- **The one-time pass.** `--pass` in place of `--confirmation <confirmation_id>` takes every well's current entry on Test wells, each read from its own file under `well-entries/environment=dev/`. Without `--go` it is the dry run of them all. With `--go` it writes only the wells named, one `--well` for each, and refuses to run with none named.
 - Each run that reaches the model is a paid call. Its cost is in `run.json` (`cost_usd`), and in the list's **Cost** column with the technical views on.
 
 ## 11. Changing things
@@ -196,7 +215,9 @@ aws athena get-query-results --query-execution-id <QueryExecutionId> --profile r
 
 - One run at a time; other uploads wait up to 6 hours, then expire. One run has 15 minutes, of which the model gets at most 780 s. The writer handles one request at a time and the app waits 180 s for it.
 - No alerting: no alarm, no email. The run log's `status_timestamp` index can list failures, but nothing watches it.
-- **No write-back to the product.**
+- **The write-back reaches the product's test system only.** Production gets nothing until that is agreed.
+- **The `demo` organisation.** The write-back cannot tell a synthetic document from a client's. So on `demo` wells, the rule that only synthetic documents go there stays a practice: nothing enforces it.
+- **An edit made in the product between the write-back's read and its write is lost.** They are two calls, with no lock.
 - The prd push is not yet exercised. The push grant is account-wide until it is narrowed. Photo and other-document pushes are unchecked. A failed push is lost on the product side, and the starter has no dead-letter queue.
 - Image-only documents have no automatic route: use the skill or enter by hand.
 - Both addresses write to one store, so a confirmation made on the dev address is as real as one made on prod.

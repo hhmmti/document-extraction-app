@@ -55,6 +55,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from extraction import write_back
 from extraction.assemble import ASSETS, INVENTORY
 from extraction.assets_dir import ASSETS_ENV, asset
 from extraction.bedrock import make_client
@@ -348,10 +349,47 @@ def confirm_handler(event, context, *, s3=None, table=None, catalogue=None):
     organisation and well, then updated to SUCCEEDED (written) or FAILED (refused or failed).  A request that cannot
     be read gets one FAILED row instead, a duplicate none, and a key that is not a request one FAILED row under
     `ADHOC#<request id>`.  Each step prints one JSON line whose `run_id` is the confirmation id; a failure's trace goes
-    there too.  The keywords stand in for AWS in tests; `catalogue()` replaces fetching the snapshot."""
+    there too.  The keywords stand in for AWS in tests; `catalogue()` replaces fetching the snapshot.
+
+    The write-back follows a written confirmation, once its result and its row are final (`write_back_one`), when
+    the stack names the product login's secret (ESP_WRITEBACK_SECRET).  A refused, failed or duplicate confirmation
+    gets none."""
     s3 = s3 or boto3.client("s3")
     table = table or boto3.resource("dynamodb").Table(os.environ["ESP_RUN_LOG_TABLE"])
     return [confirm_one(s3_record, context, s3, table, catalogue) for s3_record in event.get("Records", [])]
+
+
+class Kept(S3Objects):
+    """The bucket, keeping each body it puts.  The write-back sends the row as its file holds it, and the writer's
+    role cannot read well-entries/ back."""
+
+    def __init__(self, client):
+        super().__init__(client)
+        self.bodies = {}
+
+    def put(self, key, body, *, create=False):
+        super().put(key, body, create=create)
+        self.bodies[key] = body
+
+
+def write_back_one(cid, row_body, context, table, row_data) -> None:
+    """The write-back of a written confirmation (extraction/write_back.py): the row's values to the well's settings
+    in the ESP product's test system, for a confirmation on Test wells; a skip, with no call, for one on Live wells.
+    It runs after the confirmation's result and run-log row are final and changes neither, whatever happens.
+
+    The run log gets a second row under the confirmation id, of type WRITE_BACK, written once: SUCCEEDED (written or
+    skipped) or FAILED, its `data_json` the request's ids, the row key and the outcome.  No call starts with less of
+    the invocation's time left than write_back gives it, which is recorded FAILED.  Each call prints one JSON line."""
+    started = now()
+    try:
+        row = json.loads(row_body)
+        outcome = write_back.write(row, time_left=lambda: context.get_remaining_time_in_millis() / 1000,
+                                   log=lambda call, **fields: log(cid, "write_back", call=call, **fields))
+        write_row(table, cid, write_back.log_row(row, outcome, resource_name=os.environ["AWS_LAMBDA_FUNCTION_NAME"],
+                                                 started=started, ended=now(), data=row_data))
+        log(cid, "write_back", result={name: outcome[name] for name in write_back.RECORDED})
+    except Exception as err:            # noqa: BLE001 - the confirmation stands
+        log(cid, "write_back", error=f"{type(err).__name__}: {err}", trace=traceback.format_exc())
 
 
 def confirm_one(s3_record, context, s3, table, catalogue) -> dict:
@@ -378,8 +416,9 @@ def confirm_one(s3_record, context, s3, table, catalogue) -> dict:
         write_row(table, cid, start["row"])
 
     shutil.rmtree(CONFIRM_WORK, ignore_errors=True)
+    objects = Kept(s3)
     try:
-        outcome = confirm(S3Objects(s3), key, deadline=deadline, catalogue=catalogue or fetched, started=started)
+        outcome = confirm(objects, key, deadline=deadline, catalogue=catalogue or fetched, started=started)
     finally:
         shutil.rmtree(CONFIRM_WORK, ignore_errors=True)
     failure_ = outcome["error"]
@@ -399,6 +438,9 @@ def confirm_one(s3_record, context, s3, table, catalogue) -> dict:
     else:
         write_row(table, cid, failed_row(outcome["organization_id"], cid, outcome["well_id"], data))
     log(cid, "end", status=outcome["status"], run=outcome["run_id"], reasons=len(outcome["reasons"]))
+    if outcome["status"] == WRITTEN and os.environ.get(write_back.SECRET_ENV):
+        write_back_one(cid, objects.bodies.get(outcome["row_key"]), context, table,
+                       {**row_data, "row_key": outcome["row_key"]})
     return {"confirmation_id": cid, "status": outcome["status"]}
 
 
