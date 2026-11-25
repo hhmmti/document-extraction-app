@@ -23,13 +23,15 @@ import app.review as R
 import app.store as S
 import app.transcription as T
 import extraction.confirmation as C
+from app import hosted
 from extraction.well_entry import KEYS, NOT_FROM_THE_DOCUMENT
+from image_route.handback import labels as handed_back
 from test_confirm import BLOCKED, CATALOGUE, ORG, PDF, RUN_ID, WELL, entry, put_run, run_record
 from test_intake import env, popen  # noqa: F401 - the upload form's fixtures
-from test_review import VALIDATE, app, to_check
+from test_review import SENDS, VALIDATE, app, header_says, pushed, s3_mode, to_check  # noqa: F401 - s3_mode: a fixture
 from test_screens import exempt, ids, unplain
 from test_transcription_skill import transcribe
-from test_viewer import texts, write_run
+from test_viewer import runs, texts, write_run
 from test_viewer import record as viewer_record
 
 PAGES = ["PUMP DATA\n  Model   SF2700\n  Stages  120", "Setting depth  9,850 [?] ft", "[Blank page]"]
@@ -250,6 +252,20 @@ def test_an_ordinary_run_is_reviewed_as_before(tmp_path):
     assert q["entry_method"] == "extracted"
 
 
+def test_a_transcriptions_run_says_where_its_original_came_from_as_the_run_list_does(s3_mode, made):
+    """The image route hands the transcription back with the original's labels: its run came from where the original
+    did, and Write sends its values where the original's would go."""
+    put_transcription(C.S3Objects(s3_mode), made[1])
+    s3_mode.metadata[C.pdf_key(RUN_ID)] = handed_back(pushed("dev"), "Design scan - transcription.pdf", sha(made[1]),
+                                                      "20261028T110000Z-0123abce")
+    at = app(run=RUN_ID)
+    assert R.scan_words(T.recognise(made[1])) in texts(at.warning)        # reviewed as a transcription
+    header_says(at, "dev", R.AUTOMATIC)
+    assert SENDS["dev"] in texts(at.caption)
+    header_says(app(watch=RUN_ID), "dev", R.AUTOMATIC)
+    assert runs(app()).loc[RUN_ID, "How it started"] == R.AUTOMATIC
+
+
 def test_a_broken_transcription_opens_with_a_warning_and_write_stays_off(reviewing, made):
     put_transcription(reviewing, variant(made[1], attachments=[]))
     at = app(run=RUN_ID)
@@ -357,17 +373,18 @@ def test_the_readme_states_the_one_by_one_reason_and_the_guard():
 
 # ---- the image-only failure ----
 
-def test_an_image_only_failure_says_to_transcribe_the_scan(tmp_path, monkeypatch):
+def test_an_image_only_failure_says_the_scan_is_being_transcribed_and_whom_to_tell(tmp_path, monkeypatch):
     root, rid = tmp_path / "store", "20991231T000000Z-0000abcd"
     error = {"code": "IMAGE_ONLY", "stage": "detect", "details": {"page": 1, "n_chars": 0, "floor": 20},
              "message": "page 1 has no usable text layer (0 non-whitespace characters, floor 20); the document "
                         "cannot be extracted"}
     write_run(root, rid, viewer_record(rid, status="failed", error=error, rows=None, review=None), {})
     monkeypatch.setenv(S.STORE_ENV, str(root))
-    words = ("This document is a scan: its pages are pictures, with no text to read, so it cannot be read here. "
-             "Transcribe the scan with the transcribe-design-scan skill, then upload the transcription it makes as a "
-             "new run.")
+    monkeypatch.setenv(hosted.CONTACT_ENV, "the well-data team (wells_1@example.com)")
+    words = ("This document is a scan, so it has no text to read. The pipeline is transcribing it: the transcription "
+             "arrives as a new run in the list, usually within a few minutes, and you review that one. If no "
+             "transcription has arrived within the hour, tell the well-data team (wells_1@example.com).")
     for view in ({"run": rid}, {"watch": rid}):
         at = app(**view)
         assert words in texts(at.info), view
-    assert ids([words]) == []
+    assert ids([words], ["wells_1@example.com"]) == []

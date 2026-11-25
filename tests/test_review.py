@@ -29,6 +29,7 @@ import test_lambda as TL
 from extraction.intake import decode_labels, encode_labels
 from extraction.well_entry import KEYS
 from test_confirm import BLOCKED, CATALOGUE, ORG, PDF, RUN_ID, SHA, WELL, entry, put_run, run_record
+from test_intake import no_id_or_code
 from test_screens import exempt, screen, unplain
 from test_validate import report_text
 from test_viewer import APP, texts
@@ -773,3 +774,73 @@ def test_the_gate_keeps_a_lab_check_run_out_of_production_from_the_start_in_s3_m
         go.click().run()
         assert texts(at.success)[0].startswith("**Written to Test wells**")
         assert [k for k in s3_mode.objects if k.startswith(C.row_prefix("dev"))]
+
+
+# ---- where a run came from, and where Write sends its values ----
+
+CAME_FROM = {"dev": "**Test wells**, the product's dev system.",
+             "prd": "**Live wells**, the product's production system."}
+SENDS = {"dev": ("Write saves the entry in data science and sends its values to this well's settings in the product's "
+                 "dev system."),
+         R.LAB_CHECK: ("Write saves the entry in data science. Nothing goes to the product: lab-check is data "
+                       "science's own test organisation."),
+         "prd": "Write saves the entry in data science. Nothing goes to the product."}
+
+
+def form_labels(org=ORG, environment=None) -> dict:
+    """The run's PDF's metadata as the app's form writes it: the four labels and the environment; with none, the four
+    alone, as an upload made before the form carried one."""
+    four = encode_labels(org, WELL, "design.pdf", SHA)
+    return {**four, "environment": environment} if environment else four
+
+
+def header_says(at, environment, how):
+    """The header's line on where the run came from, followed by how it started in the run list's words, or by nothing
+    when that is not recorded."""
+    md = texts(at.markdown)
+    assert CAME_FROM[environment] in md
+    assert [w for w in (R.AUTOMATIC, R.STARTED_HERE) if any(w in m for m in md)] == ([how] if how else [])
+
+
+@pytest.mark.parametrize("org,labels,environment,how", [
+    (ORG, pushed("dev"), "dev", R.AUTOMATIC),
+    (ORG, pushed("prd"), "prd", R.AUTOMATIC),
+    (ORG, form_labels(ORG, "dev"), "dev", R.STARTED_HERE),
+    (R.LAB_CHECK, form_labels(R.LAB_CHECK, "dev"), "dev", R.STARTED_HERE),
+    (ORG, form_labels(ORG, "prd"), "prd", R.STARTED_HERE),
+    (ORG, form_labels(ORG), "prd", None),
+    (R.LAB_CHECK, form_labels(R.LAB_CHECK), "dev", None),
+], ids=["pushed-test", "pushed-live", "form-test", "form-test-lab-check", "form-live", "unlabelled",
+        "unlabelled-lab-check"])
+def test_each_page_of_a_run_says_where_it_came_from_and_the_review_where_write_sends_its_values(
+        s3_mode, org, labels, environment, how):
+    the_entry = {**to_check(), "organization_id": org}
+    put_run(C.S3Objects(s3_mode), the_entry, run=run_record(organization_id=org))
+    s3_mode.metadata[C.pdf_key(RUN_ID)] = labels
+    sends = SENDS[R.LAB_CHECK if org == R.LAB_CHECK else environment]
+    at = app(run=RUN_ID)                                                    # the review
+    header_says(at, environment, how)
+    assert sends in texts(at.caption) and write_button(at).label == f"Write to {R.place(environment)}"
+    plain_words(at, the_entry)
+    at.button(key=f"batch-{RUN_ID}").click().run()                          # the group checks, then Write's pop-up
+    at.button(key=f"dlg-go-{RUN_ID}-found").click().run()
+    at.button(key=f"dlg-go-{RUN_ID}-not found").click().run()
+    assert (f"Writes to **{R.place(environment)}**, organisation {org}, well Well␣␣#1. {sends}"
+            in texts(at.markdown))
+    plain_words(at, the_entry)
+    at.button(key=f"write-go-{RUN_ID}").click().run()                       # written: its confirmed view
+    assert texts(at.success)[0].startswith(f"**Written to {R.place(environment)}**")
+    header_says(at, environment, how)
+    plain_words(at, the_entry)
+    at.get("button_group")[0].set_value("Run details (technical)").run()    # its technical page
+    header_says(at, environment, how)
+    watch = app(watch=RUN_ID)                                               # its watch page
+    header_says(watch, environment, how)
+    no_id_or_code(watch, org, WELL, "design.pdf")                         # outside its technical sections
+
+
+def test_local_mode_says_where_the_run_came_from_and_its_own_line_says_what_write_does(offline):
+    at = app(run=RUN_ID)                                    # no labels kept: Live wells, and its start not recorded
+    header_says(at, "prd", None)
+    assert not [c for c in texts(at.caption) if c.startswith("Write saves the entry")]
+    assert any(c.startswith("Offline: Write saves in this copy of the app only") for c in texts(at.caption))

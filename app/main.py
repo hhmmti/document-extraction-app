@@ -98,16 +98,13 @@ DURATION = ("A run takes 3 to 8 minutes. When it finishes, you check what it rea
             "it.")
 FOLLOWS = "This page follows the run; you can leave it and find the run again in the run list."
 POLL_S = 3
-IMAGE_ONLY = ("This document is a scan: its pages are pictures, with no text to read, so it cannot be read here. "
-              "Transcribe the scan with the transcribe-design-scan skill, then upload the transcription it makes as a "
-              "new run.")
 FINAL = {"launch failed", "succeeded", "failed", "stale", "expired"}
 WAITING = ("queued", "not picked up", "expired")        # S3 mode: an upload with no run record yet
 ORIGIN = "How it started"                              # the run list's column: an upload in the product, or the form here
 SIDE = "Wells"                                         # the run list's column for where a run writes: Live or Test wells
 RUN, NEWEST = "Run", "For its well"                    # the run list's columns: did the run read the document; the newest
 WAIT_WORDS = {"queued": "waiting to start"}            # an upload not yet started, where `intake.queue_state` says queued
-AUTOMATIC_ICON = ":material/cloud_upload:"
+ORIGIN_ICONS = {R.AUTOMATIC: ":material/cloud_upload:", R.STARTED_HERE: ":material/upload_file:"}  # how a run started
 WELL_LISTS = R.PLACES   # the form's switch, in the review's words for where a run writes: never dev or prd
 NEAR = ("Some names in this list differ only by case or by characters that don't show. The product keeps them apart: "
         "choose the exact one you mean.")
@@ -165,6 +162,11 @@ def plain(value) -> str:
 
 
 CONTACT = plain(hosted.contact())     # whom to tell or ask when something goes wrong, in every message that says so
+# A run that failed because its document is a scan.  The pipeline transcribes it by itself, and nothing tells the app
+# whether that worked, so this says the same whatever became of the transcription.
+IMAGE_ONLY = ("This document is a scan, so it has no text to read. The pipeline is transcribing it: the transcription "
+              "arrives as a new run in the list, usually within a few minutes, and you review that one. If no "
+              f"transcription has arrived within the hour, tell {CONTACT}.")
 
 
 def tech(what, error, key=None, trace=False) -> bool:
@@ -508,7 +510,11 @@ def list_rows(store) -> pd.DataFrame:
     return df
 
 
-def show_list(store):
+def show_list(store, opened=False):
+    """The run list.  `opened`: its page has just opened (`route`), so the store's cached reads are forgotten and the
+    list is read afresh; a rerun within the page keeps that read, and the sidebar's Refresh reads it again."""
+    if opened:
+        store.refresh()
     st.title("Design-document runs")
     st.write("Each run reads one ESP design document and proposes the well's pump string and design values, for an "
              "engineer to check against the document and confirm. Start one with **New run from a PDF**, or open a "
@@ -663,6 +669,15 @@ def by_hand_offer(run_id, record, go=False):
               help="Open the review with nothing read, and type each value from the document")
 
 
+def came_from(environment, how):
+    """Where a run came from, in its header: its wells and the product's system they belong to, then how it started in
+    the run list's words (`R.origin_words`), which say nothing here when the start is not recorded."""
+    line = st.container(horizontal=True, vertical_alignment="center", gap="small")
+    line.markdown(f"**{plain(R.place(environment))}**, {plain(R.SYSTEMS[environment])}.")
+    if how in ORIGIN_ICONS:                         # who uploaded is never shown
+        line.badge(how, icon=ORIGIN_ICONS[how], color="blue")
+
+
 def title_block(run_id, record, problem, labels=None, offer=False):
     """`labels`: in S3 mode the upload's, for a record that does not name its organisation and well yet.  `offer`:
     the run can be entered by hand (`R.by_hand`)."""
@@ -671,6 +686,8 @@ def title_block(run_id, record, problem, labels=None, offer=False):
         org, well = labels["organization-id"], labels["well-id"]
     with st.container(border=True):
         st.subheader(f"Run {plain(run_id)}")
+        if org is not None:
+            came_from(R.environment_for(org, labels), R.origin_words(labels))
         if dig(record, "route") == "generic":
             st.badge(GENERIC_BADGE, icon=":material/rate_review:", color="orange")
             st.caption(plain(generic_context(record)))
@@ -1300,7 +1317,7 @@ def review_state(store, run_id, record, entry) -> dict:
         typed = scan is not None and scan.problem is None
         entry = R.from_scan(entry) if typed else entry                    # an entry by hand stays as it is
         st.session_state[key] = {
-            "entry": entry, "kept": kept, "environment": environment, "scan": scan, "automatic": R.automatic(labels),
+            "entry": entry, "kept": kept, "environment": environment, "scan": scan, "how": R.origin_words(labels),
             "review": R.start(entry, record, version, at=now_text(), names=catalogue_names()[1], scan=typed),
             "version": version and {k: version.get(k) for k in ("confirmation_id", "confirmed_by", "confirmed_at")},
             "dates": R.design_dates(kept, run_id, store.current_entry(environment, org, well),
@@ -1319,7 +1336,7 @@ def context(store, run_id, record, state, page_key) -> SimpleNamespace:
                            review=state["review"], kept=state["kept"], env=state["environment"],
                            dates=state["dates"], version=state["version"], name=name, who=who,
                            offline=MODE == "local" and name is not None, sha=sha, pdf=pdf, page_key=page_key,
-                           models=models, names=names, scan=state["scan"], automatic=state["automatic"],
+                           models=models, names=names, scan=state["scan"], how=state["how"],
                            manual=R.manual(state["entry"]), store=store, just=state.get("just"))
 
 
@@ -1510,11 +1527,10 @@ def review_header(ctx, on, why):
                     st.markdown(plain(value) if label in names else f"**{plain(value)}**")
         if signs := wells.key([text(org), well]):
             st.caption(signs)
+        came_from(ctx.env, ctx.how)
         if not ctx.manual:                                  # entered by hand, BY_HAND below says what to do
             st.caption(REVIEW)
         notes = st.container(horizontal=True, vertical_alignment="center")
-        if ctx.automatic:                                   # who uploaded is never shown
-            notes.badge(R.AUTOMATIC, icon=AUTOMATIC_ICON, color="blue")
         if dig(ctx.record, "route") == "generic" and not ctx.manual:
             notes.badge(R.NOT_KNOWN, icon=":material/rate_review:", color="orange")
         if ctx.who and ctx.name is not None:                # with no one to confirm as, the line beside Write says why
@@ -1539,6 +1555,8 @@ def review_header(ctx, on, why):
                        disabled=not on, on_click=open_dialog, args=(ctx.run_id, "write"))
         if not on:
             buttons.caption(plain(why))
+        if MODE == "s3":                    # through the writer; local mode's own line (`ctx.who`) says what it does
+            st.caption(plain(R.write_words(org, ctx.env)))
 
 
 def value_line(ctx, key):
@@ -2083,7 +2101,8 @@ def write_dialog(ctx, on, why):
     @guarded
     def body():
         st.markdown(f"Writes to **{R.place(ctx.env)}**, organisation {plain(wells.marked(text(org)))}, well "  # names:
-                    f"{plain(wells.marked(well))}.")                                                    # no emphasis
+                    f"{plain(wells.marked(well))}."                                                     # no emphasis
+                    + (f" {plain(R.write_words(org, ctx.env))}" if MODE == "s3" else ""))   # as under Write
         if signs := wells.key([text(org), well]):
             st.caption(signs)
         named("Confirming as", ctx.name or NOBODY)
@@ -2122,6 +2141,8 @@ def confirmed_view(store, run_id, record, version, get, page_key):
     with st.container(border=True):
         st.markdown(f"**Confirmed**: written to **{R.place(version['environment'])}** on "
                     f"{plain(R.when_words(version['confirmed_at'], zone()))}.")
+        labels = store.intake_labels(run_id)
+        came_from(R.environment_for(record.get("organization_id"), labels), R.origin_words(labels))
         named("Confirmed by", text(version["confirmed_by"]))
         name = R.document_name(record, None if pdf is None else T.recognise(pdf))
         if version.get("entry_method") == C.MANUAL:
@@ -2496,6 +2517,8 @@ def watch_title(store, run_id, labels):
                            f"started {started_words(record, run_id)}"]))
     if signs := wells.key([n for n in (org, well) if n]):
         st.caption(signs)
+    if org:
+        came_from(R.environment_for(org, labels), R.origin_words(labels))
 
 
 def show_watch(store, run_id) -> bool:
@@ -2509,10 +2532,7 @@ def show_watch(store, run_id) -> bool:
 
 def watch(store, run_id, here=False) -> bool:
     """The run by name, then its state (`render_watch`), followed until it is final."""
-    labels = store.intake_labels(run_id)
-    watch_title(store, run_id, labels)
-    if R.automatic(labels):
-        st.badge(R.AUTOMATIC, icon=AUTOMATIC_ICON, color="blue")
+    watch_title(store, run_id, store.intake_labels(run_id))
     if watch_now(store, run_id)[0] in FINAL:
         render_watch(store, run_id, here)
         return True
@@ -2528,7 +2548,11 @@ def watch(store, run_id, here=False) -> bool:
 
 def route(store) -> bool | None:
     """Draws the page the query names.  True for an engineer's screen (the run list, the upload form, watching a run,
-    a run's review), whose sidebar says only when the runs were read."""
+    a run's review), whose sidebar says only when the runs were read.  The run list's page opens on a session's first
+    page (a new visit or a reload) and on coming back to it from another page of the app; any other run of the script
+    on it is a rerun within the page."""
+    listing = not ("upload" in st.query_params or st.query_params.get("watch") or st.query_params.get("run"))
+    opened, st.session_state["on-list"] = listing and not st.session_state.get("on-list"), listing
     if "upload" in st.query_params:
         show_upload(store)
         return True
@@ -2536,7 +2560,7 @@ def route(store) -> bool | None:
         return show_watch(store, st.query_params["watch"])
     if st.query_params.get("run"):
         return show_run(store, st.query_params["run"])
-    show_list(store)
+    show_list(store, opened)
     return True
 
 

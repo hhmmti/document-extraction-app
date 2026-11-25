@@ -998,6 +998,19 @@ def environment_problem(organization_id, environment) -> str | None:
     return None
 
 
+def write_words(organization_id, environment) -> str:
+    """Where Write sends the entry's values, under the Write button and in the Write pop-up.  The writer saves the
+    entry in data science; its write-back then sends the values to the well in the product's dev system, for Test wells
+    only and never for lab-check, which the product does not hold (extraction/write_back.py)."""
+    if environment != "dev":
+        return "Write saves the entry in data science. Nothing goes to the product."
+    if organization_id == LAB_CHECK:
+        return (f"Write saves the entry in data science. Nothing goes to the product: {LAB_CHECK} is data science's "
+                "own test organisation.")
+    return ("Write saves the entry in data science and sends its values to this well's settings in the product's dev "
+            "system.")
+
+
 def confirmer(mode, environ, store_root=None, caller=None, headers=None, technical=False) -> tuple[str | None, str]:
     """(the name confirmations go out under, or None; a note on it, or "").
 
@@ -1202,6 +1215,7 @@ def failed_words(run, *, entry_stored) -> str:
 # keeps all of them.
 
 PLACES = {"prd": "Live wells", "dev": "Test wells"}    # as the upload form's switch names them
+SYSTEMS = {"prd": "the product's production system", "dev": "the product's dev system"}  # a run's header, after PLACES
 KEPT_AS_READ = "kept as read"                           # a value nobody checked: never shown as settled
 REF_WORDS = "Write fills it in"                         # design_document_ref, before Write and after
 VENDORS = {"F1": "SpyGlass", "F2": "ChampionX", "F3": "SLB", "F4": "Endurance (ELS)", "F5": "Baker Hughes ProLift",

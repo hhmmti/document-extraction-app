@@ -386,6 +386,87 @@ def test_reads_are_cached_until_refresh_which_keeps_final_runs(fake, handler):
     assert ("GetObject", f"{RUNS}{done}/run.json") not in again                # final: kept
 
 
+# ---- the run list is read afresh each time its page opens ----
+
+def test_the_list_is_read_when_its_page_opens_a_rerun_keeps_that_read_and_refresh_reads_it_again(fake):
+    old, pushed, later = rid(1), rid(2), rid(3)
+    upload(fake, old, age=timedelta(hours=1))
+    stored_run(fake, old, record(old))
+    at = app()                                                                  # a visit
+    assert list(runs(at).index) == [old]
+    upload(fake, pushed, metadata=pushed_labels())                              # pushed while the page sits open
+    stored_run(fake, pushed, record(pushed))
+    seen = len(fake.calls)
+    at.run()                                                                    # a rerun within the page
+    assert len(fake.calls) == seen and list(runs(at).index) == [old]
+    at.sidebar.button[0].click().run()                                          # Refresh
+    assert ("ListObjectsV2", RUNS) in fake.calls[seen:] and list(runs(at).index) == [pushed, old]
+    upload(fake, later)
+    assert list(runs(app()).index) == [later, pushed, old]                      # the next visit, or a reload
+
+
+def test_coming_back_to_the_list_from_a_run_or_from_watching_a_new_one_reads_it_afresh(fake):
+    old, pushed = rid(1), rid(2)
+    upload(fake, old, age=timedelta(hours=1))
+    stored_run(fake, old, record(old))
+    at = app()
+    upload(fake, pushed, metadata=pushed_labels())                              # pushed while the list is open
+    at.query_params["run"] = old
+    at.run()                                                                    # the run's page, as Open opens it
+    next(b for b in at.button if b.label == "All runs").click().run()
+    assert list(runs(at).index) == [pushed, old]
+    at = form()                                                                 # a run started here
+    at.checkbox(key="new-confirm").check().run()
+    start_button(at).click().run()
+    [new] = [intake_run_id(INTAKE, k) for k, _ in fake.puts]
+    next(b for b in at.button if b.label == "All runs").click().run()           # from its watch page
+    assert set(runs(at).index) == {new, pushed, old} and runs(at).loc[new, "Run"] == "waiting to start"
+
+
+# ---- an upload's labels, once read, are kept for the process's life ----
+
+def heads(fake) -> list[str]:
+    """The runs whose upload's labels were read, a HEAD each."""
+    return [intake_run_id(INTAKE, key) for op, key in fake.calls if op == "HeadObject"]
+
+
+def test_an_open_reads_the_labels_only_of_an_upload_added_since_and_no_refresh_reads_them_again(fake):
+    old, running = rid(1), rid(2)
+    upload(fake, old, age=timedelta(hours=1), metadata=pushed_labels())
+    stored_run(fake, old, record(old))
+    app()                                                                       # the first open
+    assert heads(fake) == [old]
+    upload(fake, running)                                                       # added since
+    stored_run(fake, running, record(running, status="running", deadline_at="2999-01-01T00:00:00Z"))
+    fake.calls.clear()
+    at = app()                                                                  # the next open, or a reload
+    assert heads(fake) == [running] and runs(at)[ORIGIN].tolist() == ["not recorded", AUTOMATIC]
+    fake.calls.clear()
+    at.sidebar.button[0].click().run()                                          # Refresh
+    app(watch=running)                                                          # its watch page refreshes that run
+    assert {("ListObjectsV2", INTAKE), ("ListObjectsV2", f"{RUNS}{running}/")} <= set(fake.calls)
+    assert heads(fake) == [] and runs(at)[ORIGIN].tolist() == ["not recorded", AUTOMATIC]
+
+
+def test_a_label_read_that_fails_or_finds_nothing_is_tried_again_at_the_next_open_and_kept_once_read(fake):
+    pushed, bare = rid(1), rid(2)
+    upload(fake, pushed, metadata=pushed_labels())
+    upload(fake, bare, metadata={})                                             # read, it finds no labels
+    failing = ("HeadObject", intake_key(INTAKE, pushed))
+    fake.fail[failing] = TL.client_error(503, "SlowDown", "HeadObject")
+    at = app()
+    assert sorted(heads(fake)) == [pushed, bare] and runs(at).loc[pushed, ORIGIN] == "not recorded"
+    fake.calls.clear()
+    at.run()                                                                    # a rerun keeps its open's read
+    assert heads(fake) == []
+    del fake.fail[failing]
+    at = app()                                                                  # the next open tries both again
+    assert sorted(heads(fake)) == [pushed, bare] and runs(at).loc[pushed, ORIGIN] == AUTOMATIC
+    fake.calls.clear()
+    app()
+    assert heads(fake) == [bare]                                                # read, the labels are kept
+
+
 def test_the_store_reads_only_inside_its_prefixes(fake):
     run_id = rid(1)
     location = f"s3://{BUCKET}/{intake_key(INTAKE, run_id)}"

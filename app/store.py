@@ -230,7 +230,8 @@ FINAL = ("succeeded", "failed")
 
 class S3RunStore(RunStore):
     """The bucket the Lambda writes.  Reads are cached until `refresh`, so a Streamlit rerun lists and
-    reads nothing again; a final run's files never change, so a refresh keeps them."""
+    reads nothing again; a final run's files never change, nor do an upload's labels (an upload is create-only), so
+    a refresh keeps them."""
 
     def __init__(self, client, bucket: str, intake_prefix: str, runs_prefix: str):
         self.client, self.bucket = client, bucket
@@ -238,7 +239,7 @@ class S3RunStore(RunStore):
         self.objects = C.S3Objects(client, bucket)
         self._listing = None        # (listed at, {run id: its file names}, {run id: upload time})
         self._reads = {}            # (run id, file name) -> bytes
-        self._labels = {}           # run id -> the upload's labels, or None
+        self._labels = {}           # run id -> the upload's labels, kept; or None, until the next refresh
         self._pdfs = {}             # (location, sha256) -> bytes, or None when the content has another hash
         self._rows = None           # every confirmed row, as listed; None until listed, and after a refresh
 
@@ -327,12 +328,12 @@ class S3RunStore(RunStore):
         return self._rows
 
     def refresh(self, run_id: str | None = None) -> None:
-        """Forget what may have changed: the listings, and every read of a run that is not final.  With
-        `run_id`, only that run is listed and read again."""
+        """Forget what may have changed: the listings, every read of a run that is not final, and a label read
+        that failed or found nothing, so it is tried again.  With `run_id`, only that run is listed and read again."""
         if run_id is None:
             final = {r for r, name in self._reads if name == "run.json" and self._final(r)}
             self._listing = self._rows = None
-            self._labels.clear()
+            self._labels = {r: labels for r, labels in self._labels.items() if labels is not None}
             self._reads = {k: v for k, v in self._reads.items() if k[0] in final}
         elif self._listing is not None and not self._final(run_id):
             files = self._runs(f"{self.runs_prefix}{_plain(run_id)}/").get(run_id)
@@ -340,7 +341,8 @@ class S3RunStore(RunStore):
             if files:
                 self._listing[1][run_id] = files
             self._reads = {k: v for k, v in self._reads.items() if k[0] != run_id}
-            self._labels.pop(run_id, None)
+            if self._labels.get(run_id) is None:
+                self._labels.pop(run_id, None)
 
     def _final(self, run_id: str) -> bool:
         try:

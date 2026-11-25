@@ -51,7 +51,8 @@ PATTERNS = {
     "run or confirmation id": r"\b\d{8}T\d{6}Z\b",
     "hex hash": r"\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,}\b",
     "position": r"\bposition \d+",
-    "prd or dev": r"(?i)\b(?:prd|dev)\b",
+    "prd or dev": r"(?i)\bprd\b|(?<!product's )\bdev\b",   # dev only as "the product's dev system": a run's header,
+                                                            # and where Write sends a Test wells entry's values
     "object key or file": r"\b(?:confirmations|design-records|well-entries|runs|intake)/|environment=|\b[\w.-]+\."
                           r"(?:json|jsonl|parquet|md)\b",
     "ticket": r"#\d+",
@@ -274,8 +275,10 @@ def test_the_apps_own_messages_are_plain(tmp_path):
     notes = [R.confirmer("s3", {}, caller=broken)[1], R.confirmer("local", {}, tmp_path)[1],
              R.confirmer("local", {R.OFFLINE_ENV: "tester"}, tmp_path)[1],
              R.confirmer("local", {R.OFFLINE_ENV: "tester"}, Path(R.CLI.LAB) / "store")[1],
-             R.environment_problem(R.LAB_CHECK, "prd"), R.AUTOMATIC]
+             R.environment_problem(R.LAB_CHECK, "prd"), R.AUTOMATIC, R.STARTED_HERE]
     notes += [R.place(e) for e in C.ENVIRONMENTS]
+    notes += [f"{R.place(e)}, {R.SYSTEMS[e]}." for e in C.ENVIRONMENTS]        # where a run came from
+    notes += [R.write_words(o, e) for o in ("org-1", R.LAB_CHECK) for e in C.ENVIRONMENTS]   # where Write sends it
     notes += [R.report_words({"route": "template", "family": code}) for code in R.VENDORS]
     notes += [R.report_words({"route": "generic"}), R.report_words({"route": "generic", "forced": True}), R.NOT_KNOWN]
     notes += [R.run_problem_words({"error": {"code": c, "message": m}}) for c, m in (

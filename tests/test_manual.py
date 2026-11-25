@@ -20,6 +20,7 @@ import extraction.well_entries_schema as schema
 import lambda_function as L
 import test_app_s3 as TA
 import test_lambda as TL
+from app import hosted
 from extraction.assets_dir import ASSETS_ENV
 from extraction.intake import encode_labels
 from extraction.well_entry import (ENTERED_BY_HAND, KEYS, MANUAL, NOT_FROM_THE_DOCUMENT, SETTLED, TO_CHECK, empty_entry,
@@ -28,7 +29,7 @@ from test_confirm import AT, CATALOGUE, CID, DEADLINE, FUNCTION, ORG, PDF, RUN_I
 from test_editor import fresh_catalogue  # noqa: F401 - a fixture
 from test_intake import no_id_or_code, technical
 from test_review import VALIDATE, app, s3_mode  # noqa: F401 - s3_mode: a fixture
-from test_screens import exempt, unplain
+from test_screens import exempt, screen, unplain
 from test_transcription import made  # noqa: F401 - a fixture: a scan and its transcription
 from test_validate import report_text
 from test_viewer import texts
@@ -36,9 +37,9 @@ from test_viewer import texts
 IMAGE_ONLY = {"code": "IMAGE_ONLY", "stage": "detect", "details": {"page": 1, "n_chars": 0, "floor": 20},
               "message": "page 1 has no usable text layer (0 non-whitespace characters, floor 20); the document "
                          "cannot be extracted"}
-SCAN_WORDS = ("This document is a scan: its pages are pictures, with no text to read, so it cannot be read here. "
-              "Transcribe the scan with the transcribe-design-scan skill, then upload the transcription it makes as a "
-              "new run.")
+SCAN_WORDS = ("This document is a scan, so it has no text to read. The pipeline is transcribing it: the transcription "
+              "arrives as a new run in the list, usually within a few minutes, and you review that one. If no "
+              "transcription has arrived within the hour, tell whoever looks after this app.")
 SECOND = "20261029T120000Z-0123abce"
 PRESSURE = {"value": 2014.7, "unit": "psia", "source": "design_document", "note": 'printed "2,000 psig"'}
 DEPTH = {"value": 9641.0, "unit": "ft", "source": "design_document"}
@@ -358,6 +359,46 @@ def test_a_scan_offers_entry_by_hand_beside_its_message(offline):
         assert said and ("Uploading the document again" in said[0]) == retry and at.button(key=f"enter-{RUN_ID}")
     put_failed(offline, running(datetime.now(timezone.utc) + timedelta(hours=1)))
     assert not [b for b in app(run=RUN_ID).button if b.key == f"enter-{RUN_ID}"]       # not while it runs
+
+
+OLD_ASK = ("Transcribe the scan", "transcribe-design-scan", "upload the transcription it makes")   # the old message's
+
+
+@pytest.mark.parametrize("show", [True, False], ids=["technical", "engineer"])
+def test_only_a_scan_says_it_is_being_transcribed_its_offer_stays_and_nothing_asks_for_a_transcription(
+        offline, monkeypatch, show):
+    if not show:
+        monkeypatch.delenv(hosted.SHOW_ENV)
+    for error in (IMAGE_ONLY, *({"code": code, "stage": stage, "message": "x"} for code, stage in (
+            ("MODEL_TIMEOUT", "extract"), ("PREP_FAILED", "prep"), ("AMBIGUOUS_TEMPLATE", "detect"),
+            ("ASSET_INVALID", "assets")))):
+        put_failed(offline, failed(error=error))
+        scan = error is IMAGE_ONLY
+        for view in ({"run": RUN_ID}, {"watch": RUN_ID}):
+            at = app(**view)
+            said = " ".join(screen(at))
+            assert (SCAN_WORDS in texts(at.info), "transcrib" in said) == (scan, scan), (error["code"], view)
+            assert at.button(key=f"enter-{RUN_ID}").label == "Enter by hand" and (R.OFFER in texts(at.caption)) == scan
+            assert not [old for old in OLD_ASK if old in said]
+
+
+@pytest.mark.parametrize("show", [True, False], ids=["technical", "engineer"])
+@pytest.mark.parametrize("lacks", ["pdf", "organization_id", "well_id", "sha256"])
+def test_a_scan_with_no_offer_says_it_is_being_transcribed_and_nothing_of_entering_by_hand(
+        offline, monkeypatch, show, lacks):
+    if not show:
+        monkeypatch.delenv(hosted.SHOW_ENV)
+    run = failed(**{lacks: None} if lacks.endswith("_id") else {})
+    if lacks == "sha256":
+        del run["source"]["pdf"]["sha256"]
+    if lacks == "pdf":
+        offline.path(C.pdf_key(RUN_ID)).unlink()                        # its PDF not found
+    put_failed(offline, run, pdf=None if lacks == "pdf" else PDF)
+    for view in ({"run": RUN_ID}, {"watch": RUN_ID}):
+        at = app(**view)
+        assert SCAN_WORDS in texts(at.info), (lacks, view)
+        assert not [b for b in at.button if b.key == f"enter-{RUN_ID}"]
+        assert not [s for s in screen(at) if "by hand" in s.lower()], (lacks, view)
 
 
 def test_a_failed_upload_ends_on_a_plain_screen_whose_offer_opens_the_same_flow(offline):
